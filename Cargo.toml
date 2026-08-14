@@ -15,6 +15,7 @@ members = [
     "crates/platform-windows",
     "crates/platform-linux",
     "crates/protocol",
+    "crates/runtime",
     "crates/scheduler",
     "crates/session",
     "crates/socket-transport",
@@ -36,6 +37,10 @@ authors = ["LatencyDesk contributors"]
 
 [workspace.dependencies]
 getrandom = "0.2"
+quinn = { version = "=0.11.8", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
+sha2 = "0.10.8"
+tokio = { version = "=1.44.2", default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+zeroize = "1.8.2"
 [workspace.lints.rust]
 unsafe_code = "deny"
 

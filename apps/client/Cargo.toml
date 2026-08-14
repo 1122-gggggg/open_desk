@@ -17,5 +17,6 @@ latencydesk-session = { path = "../../crates/session" }
 latencydesk-socket-transport = { path = "../../crates/socket-transport" }
 latencydesk-test-codec = { path = "../../crates/test-codec" }
 latencydesk-transport = { path = "../../crates/transport" }
+latencydesk-runtime = { path = "../../crates/runtime" }
 [lints]
 workspace = true

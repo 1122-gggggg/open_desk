@@ -9,6 +9,8 @@ repository.workspace = true
 [dependencies]
 latencydesk-protocol = { path = "../protocol" }
 latencydesk-transport = { path = "../transport" }
+quinn = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

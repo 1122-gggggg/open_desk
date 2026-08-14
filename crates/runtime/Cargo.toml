@@ -1,0 +1,18 @@
+[package]
+name = "latencydesk-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+latencydesk-h264 = { path = "../h264" }
+latencydesk-input = { path = "../input" }
+latencydesk-media = { path = "../media" }
+latencydesk-platform = { path = "../platform" }
+latencydesk-session = { path = "../session" }
+latencydesk-socket-transport = { path = "../socket-transport" }
+
+[lints]
+workspace = true
