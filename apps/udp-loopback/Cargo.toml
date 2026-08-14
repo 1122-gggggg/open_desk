@@ -1,0 +1,17 @@
+[package]
+name = "latencydesk-udp-loopback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+latencydesk-frame = { path = "../../crates/frame" }
+latencydesk-protocol = { path = "../../crates/protocol" }
+latencydesk-socket-transport = { path = "../../crates/socket-transport" }
+latencydesk-test-codec = { path = "../../crates/test-codec" }
+latencydesk-transport = { path = "../../crates/transport" }
+
+[lints]
+workspace = true

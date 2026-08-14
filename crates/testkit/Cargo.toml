@@ -1,0 +1,18 @@
+[package]
+name = "latencydesk-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+latencydesk-frame = { path = "../frame" }
+latencydesk-input = { path = "../input" }
+latencydesk-protocol = { path = "../protocol" }
+latencydesk-telemetry = { path = "../telemetry" }
+latencydesk-test-codec = { path = "../test-codec" }
+latencydesk-transport = { path = "../transport" }
+
+[lints]
+workspace = true

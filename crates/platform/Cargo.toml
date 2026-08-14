@@ -1,0 +1,15 @@
+[package]
+name = "latencydesk-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+latencydesk-input = { path = "../input" }
+latencydesk-media = { path = "../media" }
+latencydesk-surface = { path = "../surface" }
+
+[lints]
+workspace = true

@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 scripts/static_validate.py
+      - run: python3 scripts/source_sanity.py
+      - run: python3 scripts/reference_lab.py --fuzz-iterations 100000
+
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-targets
+
+  native-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libx11-dev ffmpeg
+      - name: Configure
+        run: cmake -S . -B build/native -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build/native --parallel 2
+      - name: Native conformance tests
+        run: ctest --test-dir build/native --output-on-failure
+      - name: Runtime capability report
+        run: ./build/native/native/latencydesk_linux_capability_probe
+      - name: Low-delay H.264 correctness probe
+        run: python3 scripts/ffmpeg_h264_probe.py --encoder libx264 --frames 60
+
+  native-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create native evidence directory
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force artifacts/ci/windows-native | Out-Null
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build/native -A x64 2>&1 | Tee-Object -FilePath artifacts/ci/windows-native/configure.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build/native --config Release --parallel 2 2>&1 | Tee-Object -FilePath artifacts/ci/windows-native/build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Native conformance tests
+        shell: pwsh
+        run: |
+          ctest --test-dir build/native -C Release --output-on-failure 2>&1 | Tee-Object -FilePath artifacts/ci/windows-native/ctest.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload Windows native evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-native-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/ci/windows-native
+          if-no-files-found: warn
+          retention-days: 30

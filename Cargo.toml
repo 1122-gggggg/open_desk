@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/client",
+    "apps/host",
+    "apps/lab",
+    "apps/stress",
+    "apps/udp-loopback",
+    "crates/codec",
+    "crates/frame",
+    "crates/h264",
+    "crates/input",
+    "crates/media",
+    "crates/platform",
+    "crates/platform-windows",
+    "crates/platform-linux",
+    "crates/protocol",
+    "crates/scheduler",
+    "crates/session",
+    "crates/socket-transport",
+    "crates/surface",
+    "crates/telemetry",
+    "crates/test-codec",
+    "crates/testkit",
+    "crates/transport",
+]
+
+[workspace.package]
+version = "0.1.0-alpha.2"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/1122-gggggg/latencydesk"
+authors = ["LatencyDesk contributors"]
+
+
+[workspace.dependencies]
+getrandom = "0.2"
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "warn"

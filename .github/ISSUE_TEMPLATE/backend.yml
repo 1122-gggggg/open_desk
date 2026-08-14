@@ -1,0 +1,39 @@
+name: Platform or codec backend
+about: Propose or implement a capture, input, codec, decode, or render provider.
+title: "[backend] "
+labels: ["area: backend"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options: [Windows capture, Linux capture, Windows input, Linux input, Encoder, Decoder, Renderer]
+    validations:
+      required: true
+  - type: textarea
+    id: matrix
+    attributes:
+      label: Platform/GPU/driver matrix
+      description: Include exact OS, desktop/compositor, GPU, and driver assumptions.
+    validations:
+      required: true
+  - type: textarea
+    id: ownership
+    attributes:
+      label: Buffer ownership and synchronization
+      description: Explain lease lifetime, import/copy fallback, pool caps, and synchronization.
+    validations:
+      required: true
+  - type: textarea
+    id: gates
+    attributes:
+      label: Acceptance gates and tests
+    validations:
+      required: true
+  - type: checkboxes
+    id: provenance
+    attributes:
+      label: Provenance
+      options:
+        - label: I have disclosed implementation projects studied and will not copy incompatible code.
+          required: true

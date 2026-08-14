@@ -1,0 +1,18 @@
+[package]
+name = "latencydesk-platform-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+latencydesk-codec = { path = "../codec" }
+latencydesk-frame = { path = "../frame" }
+latencydesk-h264 = { path = "../h264" }
+latencydesk-input = { path = "../input" }
+latencydesk-media = { path = "../media" }
+latencydesk-platform = { path = "../platform" }
+latencydesk-surface = { path = "../surface" }
+[lints]
+workspace = true

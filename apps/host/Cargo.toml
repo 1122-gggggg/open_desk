@@ -1,0 +1,22 @@
+[package]
+name = "latencydesk-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+latencydesk-codec = { path = "../../crates/codec" }
+latencydesk-frame = { path = "../../crates/frame" }
+latencydesk-h264 = { path = "../../crates/h264" }
+latencydesk-input = { path = "../../crates/input" }
+latencydesk-media = { path = "../../crates/media" }
+latencydesk-protocol = { path = "../../crates/protocol" }
+latencydesk-scheduler = { path = "../../crates/scheduler" }
+latencydesk-session = { path = "../../crates/session" }
+latencydesk-socket-transport = { path = "../../crates/socket-transport" }
+latencydesk-test-codec = { path = "../../crates/test-codec" }
+latencydesk-transport = { path = "../../crates/transport" }
+[lints]
+workspace = true

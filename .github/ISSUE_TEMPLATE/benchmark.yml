@@ -1,0 +1,36 @@
+name: Benchmark result or regression
+about: Submit a reproducible latency, quality, bandwidth, or recovery result.
+title: "[benchmark] "
+labels: ["area: benchmark"]
+body:
+  - type: textarea
+    id: versions
+    attributes:
+      label: Commits and software versions
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Host/client/display/network hardware
+    validations:
+      required: true
+  - type: textarea
+    id: settings
+    attributes:
+      label: Resolution, refresh, codec, bitrate, workload, and network profile
+    validations:
+      required: true
+  - type: textarea
+    id: method
+    attributes:
+      label: Measurement method
+      description: Distinguish internal timing from optical input-to-photon/screen-to-screen.
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Raw results and p50/p95/p99
+    validations:
+      required: true
