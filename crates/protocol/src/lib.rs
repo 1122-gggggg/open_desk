@@ -6,6 +6,8 @@
 
 use core::fmt;
 
+pub mod quic;
+
 /// Current wire protocol version.
 pub const WIRE_VERSION: u8 = 1;
 /// Fixed media fragment header length in bytes.
@@ -1676,6 +1678,7 @@ pub enum ProtocolError {
     BadMagic,
     UnsupportedVersion(u8),
     UnknownMediaKind(u8),
+    UnknownStreamKind(u8),
     UnknownControlKind(u8),
     UnknownFlags(u16),
     UnknownControlFlags(u16),
@@ -1689,6 +1692,24 @@ pub enum ProtocolError {
         actual: usize,
     },
     ControlLength(u32),
+    StreamPayloadLength {
+        kind: quic::StreamKind,
+        limit: usize,
+        actual: usize,
+    },
+    StreamKindMismatch {
+        expected: quic::StreamKind,
+        actual: quic::StreamKind,
+    },
+    InvalidSessionStamp,
+    InactiveInputStamp,
+    InactiveMediaStamp,
+    InvalidMediaStreamId,
+    MediaEpochMismatch {
+        header_epoch: u32,
+        stamp_epoch: u32,
+    },
+    ExpiredMediaDatagram,
     KeyframeHasDependency,
     InvalidDependency {
         frame_id: u64,
