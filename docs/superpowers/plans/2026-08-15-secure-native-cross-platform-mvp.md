@@ -137,7 +137,7 @@ impl QuicConnection {
 }
 ```
 
-- [ ] **Step 1: Write loopback tests using ephemeral test certificates for full TLS authentication, independent reliable control/input order, DATAGRAM size rejection, expiry drop, connection close, and no 0-RTT admission.**
+- [x] **Step 1: Write loopback tests using ephemeral test certificates for full TLS authentication, independent reliable control/input order, DATAGRAM size rejection, expiry drop, connection close, and no 0-RTT admission.**
 
 ```rust
 #[tokio::test]
@@ -146,15 +146,15 @@ async fn expired_media_is_dropped_without_blocking_control() { /* fixed clock */
 async fn control_and_input_keep_independent_ordered_streams() { /* A/B records */ }
 ```
 
-- [ ] **Step 2: Run the tests; confirm the absent `QuicConnection` API fails to compile.**
+- [x] **Step 2: Run the tests; confirm the absent `QuicConnection` API fails to compile.**
 
-- [ ] **Step 3: Build `quinn::Endpoint` with address-family-specific bind configuration, fully await `Connecting`, create exactly one bounded send writer per reliable lane, and reject all messages before connection authentication.**
+- [x] **Step 3: Build `quinn::Endpoint` with address-family-specific bind configuration, fully await `Connecting`, create exactly one bounded send writer per reliable lane, and reject all messages before connection authentication.**
 
-- [ ] **Step 4: Map `SendDatagramError::{UnsupportedByPeer, Disabled, TooLarge, ConnectionLost}` to the explicit outcome/error policy. Do not retry, queue, or reroute expired media onto a stream.**
+- [x] **Step 4: Map `SendDatagramError::{UnsupportedByPeer, Disabled, TooLarge, ConnectionLost}` to the explicit outcome/error policy. Do not retry, queue, or reroute expired media onto a stream.**
 
-- [ ] **Step 5: Read every received stream with a protocol cap, decode before session dispatch, and close on malformed authenticated application data.**
+- [x] **Step 5: Read every received stream with a protocol cap, decode before session dispatch, and close on malformed authenticated application data.**
 
-- [ ] **Step 6: Run `cargo test -p latencydesk-socket-transport`; commit `feat(transport): add bounded QUIC lanes`.**
+- [x] **Step 6: Run `cargo test -p latencydesk-socket-transport`; commit `feat(transport): add bounded QUIC lanes`.**
 
 ## Task 4: Replace legacy pairing with pinned TLS device identity
 

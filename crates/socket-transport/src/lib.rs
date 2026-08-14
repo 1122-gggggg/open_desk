@@ -4,6 +4,8 @@
 //! anti-replay protection, monotonic epoch tracking, MTU fragmentation/reassembly,
 //! and adaptive congestion control.
 
+pub mod quic;
+
 use latencydesk_protocol::{
     AntiReplayFilter, AuthenticateMessage, ControlHeader, ControlKind, ControlPacket,
     HandshakeCompletedMessage, HelloAckMessage, HelloMessage, MediaKind, MediaPacket,
