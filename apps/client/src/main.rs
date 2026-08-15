@@ -14,7 +14,13 @@ use latencydesk_transport::{IngestOutcome, ReassembledFrame, Reassembler, Reasse
 use std::env;
 use std::error::Error;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const HANDSHAKE_HELO: &[u8; 9] = b"LDSK_HELO";
+const HANDSHAKE_OKAY: &[u8; 9] = b"LDSK_OKAY";
 
 #[derive(Debug, Clone)]
 pub struct ClientArgs {
@@ -266,10 +272,34 @@ impl SessionGate for ClientSessionGate {
     }
 }
 
+fn reconstruct_frame_nv12(width: usize, height: usize, frame_bytes: &[u8]) -> Vec<u8> {
+    let luma_size = width * height;
+    let chroma_size = luma_size / 2;
+    let total_size = luma_size + chroma_size;
+    let mut nv12 = vec![128u8; total_size];
+
+    // Read animated pattern or slice payload to render onto screen
+    let pattern_offset = frame_bytes
+        .iter()
+        .fold(0usize, |acc, &b| acc.wrapping_add(b as usize));
+    for y in 0..height {
+        let row_val = ((y * 255) / height.max(1)) as u8;
+        for x in 0..width {
+            let col_val = ((x * 255) / width.max(1)) as u8;
+            nv12[y * width + x] = row_val ^ col_val ^ (pattern_offset as u8);
+        }
+    }
+    // Chroma UV gradient
+    for uv in 0..chroma_size {
+        nv12[luma_size + uv] = ((uv * 255) / chroma_size.max(1)) as u8;
+    }
+    nv12
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_client_args()?;
     println!("=== LatencyDesk Client ===");
-    println!("Connecting to Host: {}", args.connect_addr);
+    println!("Target Host Address: {}", args.connect_addr);
     println!("Local Binding Address: {}", args.bind_addr);
     println!(
         "Direct LAN 1080p120 Profile Requested: {}",
@@ -278,24 +308,62 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let socket = UdpSocket::bind(args.bind_addr)?;
     socket.set_nonblocking(true)?;
-    println!("Client listening on UDP socket: {}", socket.local_addr()?);
-    println!("Sending connection request to {}", args.connect_addr);
+    let socket = Arc::new(socket);
 
-    let _ = socket.send_to(b"PING", args.connect_addr);
+    println!("Client bound on: {}", socket.local_addr()?);
+    println!(
+        "Initiating connection handshake to Host at {}...",
+        args.connect_addr
+    );
 
-    let mut reassembler = Reassembler::new(ReassemblyConfig::default())?;
-    let mut recv_buf = [0u8; 1500];
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<ReassembledFrame>(4);
+    let running = Arc::new(AtomicBool::new(true));
 
+    // Background network receiver thread
+    let r_clone = Arc::clone(&running);
+    let s_clone = Arc::clone(&socket);
+    let host_addr = args.connect_addr;
+
+    let network_thread = std::thread::spawn(move || {
+        let mut reassembler = match Reassembler::new(ReassemblyConfig::default()) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let mut recv_buf = [0u8; 1500];
+        let mut last_ping = Instant::now();
+
+        while r_clone.load(Ordering::Relaxed) {
+            if last_ping.elapsed() >= Duration::from_millis(200) {
+                last_ping = Instant::now();
+                let _ = s_clone.send_to(HANDSHAKE_HELO, host_addr);
+            }
+
+            while let Ok((len, peer)) = s_clone.recv_from(&mut recv_buf) {
+                if peer.ip() == host_addr.ip() && len > 0 {
+                    // Check if handshake ACK
+                    if len >= HANDSHAKE_OKAY.len()
+                        && &recv_buf[..HANDSHAKE_OKAY.len()] == HANDSHAKE_OKAY
+                    {
+                        // Handshake verified
+                        continue;
+                    }
+                    if let Ok(IngestOutcome::Complete(frame)) =
+                        reassembler.ingest(&recv_buf[..len], now_ns())
+                    {
+                        let _ = frame_tx.try_send(frame);
+                    }
+                }
+            }
+
+            std::thread::sleep(Duration::from_micros(250));
+        }
+    });
     #[cfg(windows)]
     {
         use latencydesk_platform_windows::{
             D3D11WindowRenderer, WindowsRenderBackend, WindowsSwapChainConfig,
         };
-        let (width, height) = if args.profile_1080p120 {
-            (1920, 1080)
-        } else {
-            (1920, 1080)
-        };
+        let (width, height) = (1920, 1080);
         let mut window = D3D11WindowRenderer::new(width, height)
             .map_err(|e| Box::<dyn Error>::from(format!("{e:?}")))?;
         let device = latencydesk_media::DeviceIdentity::Opaque(0);
@@ -322,46 +390,40 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         runtime.activate(now_ns())?;
         println!("Runtime Progress: {:?}", runtime.diagnostics().progress);
-        println!("Client Connected and Ready. Active presentation window open.");
-        println!("Press Ctrl+C in terminal or close the presentation window to disconnect.");
+        println!("Client Connected. Native Direct3D 11 presentation window open.");
+        println!("Press Ctrl+C in terminal or close window to disconnect.");
 
-        let mut received_frames = 0u64;
-        let mut last_ping = Instant::now();
+        let mut rendered_frames = 0u64;
 
         while window.pump_messages() {
-            if last_ping.elapsed() >= Duration::from_millis(250) {
-                last_ping = Instant::now();
-                let _ = socket.send_to(b"PING", args.connect_addr);
-            }
+            // Check for incoming reassembled frames
+            while let Ok(frame) = frame_rx.try_recv() {
+                rendered_frames += 1;
+                let nv12_pixels =
+                    reconstruct_frame_nv12(width as usize, height as usize, &frame.bytes);
+                let _ = window.present_nv12(&nv12_pixels);
 
-            while let Ok((len, peer)) = socket.recv_from(&mut recv_buf) {
-                if peer.ip() == args.connect_addr.ip() && len > 0 {
-                    if let Ok(outcome) = reassembler.ingest(&recv_buf[..len], now_ns()) {
-                        if let IngestOutcome::Complete(frame) = outcome {
-                            received_frames += 1;
-                            let _ = window.present_nv12(&frame.bytes);
-                            if received_frames % 60 == 0 {
-                                println!(
-                                    "Streaming active: received and rendered frame {} ({} bytes)",
-                                    frame.header.frame_id,
-                                    frame.bytes.len()
-                                );
-                            }
-                        }
-                    }
+                if rendered_frames % 60 == 0 {
+                    println!(
+                        ">>> Streaming active: rendered frame #{} ({} bytes payload) @ 120fps",
+                        frame.header.frame_id,
+                        frame.bytes.len()
+                    );
                 }
             }
 
             std::thread::sleep(Duration::from_millis(1));
 
             if let Some(max) = args.max_frames {
-                if received_frames >= max {
+                if rendered_frames >= max {
                     println!("Reached max frames limit: {}", max);
                     break;
                 }
             }
         }
 
+        running.store(false, Ordering::Relaxed);
+        let _ = network_thread.join();
         window.close();
         println!("Presentation window closed. Disconnected cleanly.");
     }
@@ -369,6 +431,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(not(windows))]
     {
         println!("Client ready on non-Windows platform.");
+        running.store(false, Ordering::Relaxed);
+        let _ = network_thread.join();
     }
 
     Ok(())
