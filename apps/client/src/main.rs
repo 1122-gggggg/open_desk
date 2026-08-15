@@ -278,11 +278,24 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     #[cfg(windows)]
     {
-        use latencydesk_platform_windows::{WindowsRenderBackend, WindowsSwapChainConfig};
+        use latencydesk_platform_windows::{
+            D3D11WindowRenderer, WindowsRenderBackend, WindowsSwapChainConfig,
+        };
+        let (width, height) = if args.profile_1080p120 {
+            (1920, 1080)
+        } else {
+            (1920, 1080)
+        };
+        let mut window = D3D11WindowRenderer::new(width, height)
+            .map_err(|e| Box::<dyn Error>::from(format!("{e:?}")))?;
         let device = latencydesk_media::DeviceIdentity::Opaque(0);
         let renderer = WindowsRenderBackend::new(
             device,
-            WindowsSwapChainConfig::default(),
+            WindowsSwapChainConfig {
+                width,
+                height,
+                ..Default::default()
+            },
             CursorMode::Metadata,
         );
         let decoder = PassthroughDecoder::new();
@@ -299,7 +312,23 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         runtime.activate(now_ns())?;
         println!("Runtime Progress: {:?}", runtime.diagnostics().progress);
-        println!("Client Connected and Ready. Active presentation surface running.");
+        println!("Client Connected and Ready. Active presentation window open.");
+        println!("Press Ctrl+C in terminal or close the presentation window to disconnect.");
+
+        let mut frame_count = 0u64;
+        while window.pump_messages() {
+            std::thread::sleep(std::time::Duration::from_millis(8));
+            frame_count += 1;
+            if let Some(max) = args.max_frames {
+                if frame_count >= max {
+                    println!("Reached max frames limit: {}", max);
+                    break;
+                }
+            }
+        }
+
+        window.close();
+        println!("Presentation window closed. Disconnected cleanly.");
     }
 
     #[cfg(not(windows))]

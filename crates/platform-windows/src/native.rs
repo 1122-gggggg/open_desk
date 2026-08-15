@@ -210,6 +210,11 @@ pub(crate) mod ffi {
         fn encoder_update_bitrate(encoder: Pin<&mut Encoder>, target_bitrate_bps: u32) -> u32;
         fn encoder_drain(encoder: Pin<&mut Encoder>) -> u32;
         fn encoder_quiesce(encoder: Pin<&mut Encoder>) -> u32;
+        fn make_d3d11_renderer(width: u32, height: u32, status: &mut u32) -> UniquePtr<Renderer>;
+        fn renderer_pump_messages(renderer: Pin<&mut Renderer>) -> bool;
+        fn renderer_present(renderer: Pin<&mut Renderer>, surface: &Surface) -> u32;
+        fn renderer_is_open(renderer: &Renderer) -> bool;
+        fn renderer_close(renderer: Pin<&mut Renderer>);
     }
 }
 
@@ -221,6 +226,8 @@ unsafe impl Send for ffi::Capture {}
 unsafe impl Send for ffi::Surface {}
 #[allow(unsafe_code)]
 unsafe impl Send for ffi::Encoder {}
+#[allow(unsafe_code)]
+unsafe impl Send for ffi::Renderer {}
 impl fmt::Debug for ffi::Encoder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Encoder").finish_non_exhaustive()

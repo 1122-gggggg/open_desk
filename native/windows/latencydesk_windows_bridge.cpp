@@ -235,6 +235,149 @@ BridgeStatus Encoder::update_bitrate(std::uint32_t target_bitrate_bps) { return 
 BridgeStatus Encoder::drain() { return impl_->drain(); }
 BridgeStatus Encoder::quiesce() noexcept { return impl_->quiesce(); }
 
+class RendererImpl final {
+ public:
+  RendererImpl(std::uint32_t width, std::uint32_t height)
+      : width_(width == 0 ? 1920 : width), height_(height == 0 ? 1080 : height), open_(true) {
+    initialize();
+  }
+
+  ~RendererImpl() {
+    close();
+  }
+
+  [[nodiscard]] bool pump_messages() {
+    MSG msg{};
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+      if (msg.message == WM_QUIT) {
+        open_ = false;
+        return false;
+      }
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+    return open_ && (window_ != nullptr) && IsWindow(window_);
+  }
+
+  [[nodiscard]] BridgeStatus present(const Surface& surface) {
+    if (!open_ || !swap_chain_ || !context_) {
+      return BridgeStatus::InvalidState;
+    }
+    if (surface.impl_ == nullptr || surface.impl_->texture() == nullptr) {
+      return BridgeStatus::InvalidArgument;
+    }
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> back_buffer;
+    HRESULT hr = swap_chain_->GetBuffer(0, IID_PPV_ARGS(&back_buffer));
+    if (FAILED(hr) || !back_buffer) {
+      return BridgeStatus::DeviceLost;
+    }
+    context_->CopyResource(back_buffer.Get(), surface.impl_->texture());
+    hr = swap_chain_->Present(0, 0);
+    if (FAILED(hr)) {
+      if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+        return BridgeStatus::DeviceLost;
+      }
+      return BridgeStatus::InternalFailure;
+    }
+    return BridgeStatus::Ok;
+  }
+
+  [[nodiscard]] bool is_open() const noexcept {
+    return open_ && (window_ != nullptr) && IsWindow(window_);
+  }
+
+  void close() noexcept {
+    open_ = false;
+    swap_chain_ = nullptr;
+    context_ = nullptr;
+    device_ = nullptr;
+    if (window_ != nullptr) {
+      DestroyWindow(window_);
+      window_ = nullptr;
+    }
+  }
+
+ private:
+  void initialize() {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+    wc.lpszClassName = L"LatencyDeskRendererWindowClass";
+    RegisterClassW(&wc);
+
+    RECT client_rect{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
+    AdjustWindowRectEx(&client_rect, WS_OVERLAPPEDWINDOW, FALSE, 0);
+
+    window_ = CreateWindowExW(
+        0, L"LatencyDeskRendererWindowClass", L"LatencyDesk Remote Desktop (1080p120)",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
+        client_rect.right - client_rect.left, client_rect.bottom - client_rect.top,
+        nullptr, nullptr, wc.hInstance, nullptr);
+    if (window_ == nullptr) {
+      throw std::runtime_error("failed to create Win32 presentation window");
+    }
+
+    ShowWindow(window_, SW_SHOW);
+    UpdateWindow(window_);
+
+    Microsoft::WRL::ComPtr<IDXGIFactory2> factory;
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) {
+      throw std::runtime_error("CreateDXGIFactory1 failed");
+    }
+
+    constexpr D3D_FEATURE_LEVEL feature_levels[] = {
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+    };
+    D3D_FEATURE_LEVEL selected_level{};
+    hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                           D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                           feature_levels, ARRAYSIZE(feature_levels),
+                           D3D11_SDK_VERSION, &device_, &selected_level, &context_);
+    if (FAILED(hr)) {
+      throw std::runtime_error("D3D11CreateDevice failed for presentation renderer");
+    }
+
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    desc.Width = width_;
+    desc.Height = height_;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.Stereo = FALSE;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = 2;
+    desc.Scaling = DXGI_SCALING_STRETCH;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    desc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+
+    hr = factory->CreateSwapChainForHwnd(device_.Get(), window_, &desc, nullptr, nullptr, &swap_chain_);
+    if (FAILED(hr)) {
+      throw std::runtime_error("CreateSwapChainForHwnd failed");
+    }
+  }
+
+  std::uint32_t width_;
+  std::uint32_t height_;
+  bool open_{};
+  HWND window_{};
+  Microsoft::WRL::ComPtr<ID3D11Device> device_;
+  Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
+  Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain_;
+};
+
+Renderer::Renderer(std::uint32_t width, std::uint32_t height)
+    : impl_(std::make_unique<RendererImpl>(width, height)) {}
+
+Renderer::~Renderer() = default;
+
+bool Renderer::pump_messages() { return impl_->pump_messages(); }
+BridgeStatus Renderer::present(const Surface& surface) { return impl_->present(surface); }
+bool Renderer::is_open() const noexcept { return impl_->is_open(); }
+void Renderer::close() noexcept { impl_->close(); }
+
 class CaptureImpl final {
  public:
   CaptureImpl(std::uint32_t adapter_index, std::uint32_t output_index)
@@ -542,5 +685,37 @@ std::uint32_t encoder_drain(Encoder& encoder) noexcept {
 
 std::uint32_t encoder_quiesce(Encoder& encoder) noexcept {
   return invoke_status([&] { return encoder.quiesce(); });
+}
+std::unique_ptr<Renderer> make_d3d11_renderer(
+    std::uint32_t width, std::uint32_t height, std::uint32_t& status) noexcept {
+  try {
+    status = status_code(BridgeStatus::Ok);
+    return std::make_unique<Renderer>(width, height);
+  } catch (const std::invalid_argument&) {
+    status = status_code(BridgeStatus::InvalidArgument);
+  } catch (const std::bad_alloc&) {
+    status = status_code(BridgeStatus::QueueFull);
+  } catch (const std::runtime_error&) {
+    status = status_code(BridgeStatus::Unsupported);
+  } catch (...) {
+    status = status_code(BridgeStatus::InternalFailure);
+  }
+  return nullptr;
+}
+
+bool renderer_pump_messages(Renderer& renderer) noexcept {
+  return renderer.pump_messages();
+}
+
+std::uint32_t renderer_present(Renderer& renderer, const Surface& surface) noexcept {
+  return invoke_status([&] { return renderer.present(surface); });
+}
+
+bool renderer_is_open(const Renderer& renderer) noexcept {
+  return renderer.is_open();
+}
+
+void renderer_close(Renderer& renderer) noexcept {
+  renderer.close();
 }
 }  // namespace latencydesk::windows_bridge

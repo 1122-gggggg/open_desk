@@ -28,6 +28,42 @@ use std::sync::{Arc, Condvar, Mutex};
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
+#[cfg(windows)]
+pub struct D3D11WindowRenderer {
+    inner: cxx::UniquePtr<native::ffi::Renderer>,
+}
+
+#[cfg(windows)]
+impl D3D11WindowRenderer {
+    pub fn new(width: u32, height: u32) -> Result<Self, WindowsBackendError> {
+        let mut status = native::STATUS_OK;
+        let renderer = native::ffi::make_d3d11_renderer(width, height, &mut status);
+        if status != native::STATUS_OK || renderer.is_null() {
+            return Err(WindowsBackendError::Unsupported);
+        }
+        Ok(Self { inner: renderer })
+    }
+
+    pub fn pump_messages(&mut self) -> bool {
+        if self.inner.is_null() {
+            return false;
+        }
+        native::ffi::renderer_pump_messages(self.inner.pin_mut())
+    }
+
+    pub fn is_open(&self) -> bool {
+        if self.inner.is_null() {
+            return false;
+        }
+        native::ffi::renderer_is_open(&self.inner)
+    }
+
+    pub fn close(&mut self) {
+        if !self.inner.is_null() {
+            native::ffi::renderer_close(self.inner.pin_mut());
+        }
+    }
+}
 pub(crate) use native::DesktopDuplicationCaptureSource;
 
 /// Windows capture API selected for one display session.

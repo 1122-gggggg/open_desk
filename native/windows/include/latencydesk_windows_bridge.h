@@ -103,6 +103,7 @@ class Surface final {
  private:
   friend class CaptureImpl;
   friend class EncoderImpl;
+  friend class RendererImpl;
 
   explicit Surface(std::unique_ptr<SurfaceImpl> impl);
 
@@ -134,7 +135,25 @@ class Encoder final {
   std::unique_ptr<EncoderImpl> impl_;
 };
 
-class Renderer;
+class RendererImpl;
+
+class Renderer final {
+ public:
+  Renderer(std::uint32_t width, std::uint32_t height);
+  ~Renderer();
+  Renderer(const Renderer&) = delete;
+  Renderer& operator=(const Renderer&) = delete;
+  Renderer(Renderer&&) = delete;
+  Renderer& operator=(Renderer&&) = delete;
+
+  [[nodiscard]] bool pump_messages();
+  [[nodiscard]] BridgeStatus present(const Surface& surface);
+  [[nodiscard]] bool is_open() const noexcept;
+  void close() noexcept;
+
+ private:
+  std::unique_ptr<RendererImpl> impl_;
+};
 class Input;
 
 [[nodiscard]] std::uint32_t bridge_abi_version() noexcept;
@@ -191,5 +210,12 @@ class Input;
 [[nodiscard]] std::uint32_t encoder_request_idr(Encoder& encoder) noexcept;
 [[nodiscard]] std::uint32_t encoder_update_bitrate(Encoder& encoder, std::uint32_t target_bitrate_bps) noexcept;
 [[nodiscard]] std::uint32_t encoder_drain(Encoder& encoder) noexcept;
+[[nodiscard]] std::unique_ptr<Renderer> make_d3d11_renderer(
+    std::uint32_t width, std::uint32_t height, std::uint32_t& status) noexcept;
+
+[[nodiscard]] bool renderer_pump_messages(Renderer& renderer) noexcept;
+[[nodiscard]] std::uint32_t renderer_present(Renderer& renderer, const Surface& surface) noexcept;
+[[nodiscard]] bool renderer_is_open(const Renderer& renderer) noexcept;
+void renderer_close(Renderer& renderer) noexcept;
 [[nodiscard]] std::uint32_t encoder_quiesce(Encoder& encoder) noexcept;
 }  // namespace latencydesk::windows_bridge
