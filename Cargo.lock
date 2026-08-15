@@ -332,8 +332,11 @@ dependencies = [
  "latencydesk-input",
  "latencydesk-media",
  "latencydesk-platform",
+ "latencydesk-protocol",
  "latencydesk-session",
  "latencydesk-socket-transport",
+ "latencydesk-surface",
+ "latencydesk-transport",
 ]
 
 [[package]]

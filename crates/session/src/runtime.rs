@@ -108,6 +108,7 @@ pub enum AuthorityError {
     InvalidDispatchStamp,
     SessionMismatch,
     InvalidDeadline,
+    ViewNotGranted,
     InputNotGranted,
     Expired,
     StaleDispatch,
@@ -121,6 +122,32 @@ impl fmt::Display for AuthorityError {
 }
 
 impl std::error::Error for AuthorityError {}
+
+/// Failure while applying a protocol-validated input message through an active
+/// session authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionInputError {
+    Authority(AuthorityError),
+    Input(InputError),
+}
+
+impl fmt::Display for SessionInputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Authority(error) => write!(formatter, "authority rejected input: {error}"),
+            Self::Input(error) => write!(formatter, "input reconciliation failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionInputError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Authority(error) => Some(error),
+            Self::Input(error) => Some(error),
+        }
+    }
+}
 
 /// Result of closing a session authority. The independent release deadline is
 /// deliberately not constrained by the session-dispatch deadline.
@@ -148,6 +175,26 @@ impl fmt::Debug for ClosedAuthority {
             .field("release_deadline_ns", &self.release_deadline_ns)
             .finish_non_exhaustive()
     }
+}
+
+/// Authority operations required by a role runtime.
+///
+/// The runtime receives no direct access to the input ledger or authenticated
+/// session material. It can only acquire and recheck a dispatch permit, route a
+/// validated input message, and close through this interface.
+pub trait SessionGate {
+    fn acquire_dispatch(&self, now_ns: u64) -> Result<DispatchPermit, AuthorityError>;
+    fn recheck(
+        &self,
+        permit: &DispatchPermit,
+        now_ns: u64,
+    ) -> Result<DispatchStamp, AuthorityError>;
+    fn apply_input(
+        &mut self,
+        message: InputMessage,
+        now_ns: u64,
+    ) -> Result<ReconcileOutcome, SessionInputError>;
+    fn close(&mut self) -> Result<ClosedAuthority, AuthorityError>;
 }
 
 /// Per-session gate around an accepted TLS-pinned pairing and an owned input
@@ -204,6 +251,28 @@ impl SessionAuthority {
         Ok(self.stamp)
     }
 
+    /// Reconciles a validated remote input message while this authority is
+    /// dispatchable. Native injection remains the runtime's responsibility and
+    /// must follow a final permit recheck.
+    pub fn apply_input(
+        &mut self,
+        message: InputMessage,
+        now_ns: u64,
+    ) -> Result<ReconcileOutcome, SessionInputError> {
+        self.ensure_dispatchable(now_ns)
+            .map_err(SessionInputError::Authority)?;
+        if !self.accepted.capabilities().contains(Capability::Input) {
+            return Err(SessionInputError::Authority(
+                AuthorityError::InputNotGranted,
+            ));
+        }
+        self.input_ledger
+            .as_mut()
+            .ok_or(SessionInputError::Authority(AuthorityError::Closed))?
+            .apply(message)
+            .map_err(SessionInputError::Input)
+    }
+
     /// Closes dispatch access and transfers the current key/button state to an
     /// independent, deadline-bound release action.
     pub fn close(&mut self) -> Result<ClosedAuthority, AuthorityError> {
@@ -231,10 +300,36 @@ impl SessionAuthority {
         if now_ns >= self.session_deadline_ns {
             return Err(AuthorityError::Expired);
         }
-        if !self.accepted.capabilities().contains(Capability::Input) {
-            return Err(AuthorityError::InputNotGranted);
+        if !self.accepted.capabilities().contains(Capability::View) {
+            return Err(AuthorityError::ViewNotGranted);
         }
         Ok(())
+    }
+}
+
+impl SessionGate for SessionAuthority {
+    fn acquire_dispatch(&self, now_ns: u64) -> Result<DispatchPermit, AuthorityError> {
+        Self::acquire_dispatch(self, now_ns)
+    }
+
+    fn recheck(
+        &self,
+        permit: &DispatchPermit,
+        now_ns: u64,
+    ) -> Result<DispatchStamp, AuthorityError> {
+        Self::recheck(self, permit, now_ns)
+    }
+
+    fn apply_input(
+        &mut self,
+        message: InputMessage,
+        now_ns: u64,
+    ) -> Result<ReconcileOutcome, SessionInputError> {
+        Self::apply_input(self, message, now_ns)
+    }
+
+    fn close(&mut self) -> Result<ClosedAuthority, AuthorityError> {
+        Self::close(self)
     }
 }
 
@@ -268,20 +363,29 @@ mod tests {
             CapabilitySet::view_and_input(),
         );
         let stamp = DispatchStamp::new(session_id, 3, 4, 5, 6).expect("stamp");
-        let mut ledger = InputLedger::default();
-        ledger
-            .apply(InputMessage {
-                session_epoch: 6,
-                sequence: 1,
-                event: InputEvent::Key {
-                    code: 42,
-                    pressed: true,
-                },
-            })
-            .expect("input applies");
+        let ledger = InputLedger::default();
 
         let mut authority =
             SessionAuthority::new(accepted, stamp, ledger, 900, 800).expect("authority");
+        assert_eq!(
+            authority
+                .apply_input(
+                    InputMessage {
+                        session_epoch: 6,
+                        sequence: 1,
+                        event: InputEvent::Key {
+                            code: 42,
+                            pressed: true,
+                        },
+                    },
+                    700,
+                )
+                .expect("authority routes input"),
+            ReconcileOutcome::Applied(vec![AppliedInput::Key {
+                code: 42,
+                pressed: true,
+            }])
+        );
         let permit = authority.acquire_dispatch(700).expect("dispatch permit");
         assert_eq!(authority.recheck(&permit, 700), Ok(stamp));
         assert_eq!(permit.stamp(), stamp);
@@ -297,6 +401,40 @@ mod tests {
                 code: 42,
                 pressed: false,
             }]
+        );
+    }
+
+    #[test]
+    fn view_only_authority_dispatches_media_but_rejects_input() {
+        let session_id = SessionId::new(7).expect("session id");
+        let accepted = AcceptedSession::test_only(
+            session_id,
+            [1; 32],
+            PeerPin::from_tls_spki_fingerprint([2; 32]).expect("peer pin"),
+            CapabilitySet::view_only(),
+        );
+        let stamp = DispatchStamp::new(session_id, 3, 4, 5, 6).expect("stamp");
+        let mut authority =
+            SessionAuthority::new(accepted, stamp, InputLedger::default(), 900, 800)
+                .expect("authority");
+
+        let permit = authority.acquire_dispatch(700).expect("view dispatch");
+        assert_eq!(authority.recheck(&permit, 700), Ok(stamp));
+        assert_eq!(
+            authority.apply_input(
+                InputMessage {
+                    session_epoch: 6,
+                    sequence: 1,
+                    event: InputEvent::Key {
+                        code: 42,
+                        pressed: true,
+                    },
+                },
+                700,
+            ),
+            Err(SessionInputError::Authority(
+                AuthorityError::InputNotGranted
+            ))
         );
     }
 
