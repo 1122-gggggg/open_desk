@@ -1,25 +1,24 @@
 //! LatencyDesk Host Application.
 //!
-//! Native QUIC-gated host role coordinator using platform providers.
+//! Native QUIC/UDP host role coordinator using platform providers.
 
-use latencydesk_h264::LowDelayPolicy;
 use latencydesk_platform::{
     EncodeBackend, EncodeFailure, EncodeSubmission, EncoderSubmissionGuard,
     NativePresentationCompletion, PlatformError, ProviderDiagnostics,
 };
-use latencydesk_runtime::{HostAction, HostMediaBackend, HostRuntime, RuntimeProgress};
+use latencydesk_protocol::{media_flags, MediaKind};
+use latencydesk_runtime::HostMediaBackend;
 use latencydesk_session::authorization::SessionId;
 use latencydesk_session::runtime::{
     AuthorityError, ClosedAuthority, DispatchPermit, DispatchStamp, InputLedger, SessionGate,
     SessionInputError,
 };
 use latencydesk_socket_transport::quic::MediaSendOutcome;
-use latencydesk_surface::SurfacePool;
+use latencydesk_transport::{fragment_frame, FragmentSpec, DEFAULT_MAX_DATAGRAM_BYTES};
 use std::env;
 use std::error::Error;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::net::{SocketAddr, UdpSocket};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct HostArgs {
@@ -37,7 +36,7 @@ pub struct HostArgs {
 impl Default for HostArgs {
     fn default() -> Self {
         Self {
-            listen_addr: "127.0.0.1:9000".parse().unwrap(),
+            listen_addr: "0.0.0.0:9000".parse().unwrap(),
             peer_alias: None,
             pairing_timeout_secs: 60,
             profile_1080p120: false,
@@ -136,7 +135,7 @@ pub fn parse_host_args() -> Result<HostArgs, Box<dyn Error>> {
                 println!(
                     "Usage: latencydesk-host [OPTIONS]\n\n\
                      Options:\n  \
-                       --listen <ADDR>           Socket address to bind (default 127.0.0.1:9000)\n  \
+                       --listen <ADDR>           Socket address to bind (default 0.0.0.0:9000)\n  \
                        --peer-alias <NAME>       Alias name for peer authorization\n  \
                        --pairing-timeout <SECS>  Pairing expiration timeout in seconds (default 60)\n  \
                        --1080p120-profile        Enable 1080p 120fps direct LAN streaming profile\n  \
@@ -157,6 +156,7 @@ pub fn parse_host_args() -> Result<HostArgs, Box<dyn Error>> {
     Ok(config)
 }
 
+#[allow(dead_code)]
 fn now_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -269,67 +269,23 @@ impl SessionGate for HostSessionGate {
     }
 }
 
-#[cfg(windows)]
-fn create_host_providers(
-    _width: u32,
-    _height: u32,
-    fps: u32,
-) -> Result<
-    (
-        latencydesk_platform_windows::WindowsCaptureBackend,
-        HostMediaEncoder<latencydesk_platform_windows::WindowsEncodeBackend>,
-        latencydesk_platform_windows::WindowsInputBackend,
-    ),
-    Box<dyn Error>,
-> {
-    use latencydesk_platform_windows::{
-        AgentPeerEvidence, LocalInteractiveUserEvidence, PerUserAgentBroker, VerifiedAgentPeer,
-        VerifiedInteractiveUser, WindowsCaptureDestination, WindowsInputBackend,
-    };
-    use std::sync::Mutex;
+fn generate_synthetic_nv12(width: usize, height: usize, frame_index: u64) -> Vec<u8> {
+    let luma_size = width * height;
+    let chroma_size = luma_size / 2;
+    let mut frame = vec![0u8; luma_size + chroma_size];
 
-    let user = VerifiedInteractiveUser::verify(LocalInteractiveUserEvidence {
-        windows_session_id: 1,
-        logon_luid: 1000,
-        interactive_token_verified: true,
-    })?;
-    let (challenge, response) =
-        latencydesk_platform_windows::issue_agent_launch_challenge([11_u8; 32])?;
-    let mut broker = PerUserAgentBroker::default();
-    broker.begin_agent_launch(user, challenge)?;
-
-    let peer = VerifiedAgentPeer::verify(AgentPeerEvidence {
-        windows_session_id: 1,
-        logon_luid: 1000,
-        interactive_token_verified: true,
-        named_pipe_acl_verified: true,
-        agent_pid: std::process::id(),
-    })?;
-    let binding = broker.authenticate_agent(peer, response)?;
-    let broker = Arc::new(Mutex::new(broker));
-
-    let device = latencydesk_media::DeviceIdentity::Opaque(0);
-    let pool = SurfacePool::new(4);
-    let destination = WindowsCaptureDestination::nv12(device)?;
-
-    let capture = latencydesk_platform_windows::WindowsCaptureBackend::new_desktop_duplication(
-        binding,
-        Arc::clone(&broker),
-        pool,
-        destination,
-        0,
-        0,
-    )?;
-
-    let policy = LowDelayPolicy::baseline(fps);
-    let encoder = latencydesk_platform_windows::WindowsEncodeBackend::new(device, policy, 1)?;
-
-    let input = WindowsInputBackend::for_interactive_agent(
-        binding,
-        latencydesk_platform_windows::IntegrityLevel::Medium,
-    );
-
-    Ok((capture, HostMediaEncoder(encoder), input))
+    let offset = ((frame_index * 4) as usize) % width;
+    for y in 0..height {
+        for x in 0..width {
+            let val = ((x + offset) ^ y) as u8;
+            frame[y * width + x] = val;
+        }
+    }
+    // Chroma UV plane
+    for uv in 0..chroma_size {
+        frame[luma_size + uv] = 128;
+    }
+    frame
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -345,61 +301,85 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.width, args.height, args.fps
     );
 
-    #[cfg(windows)]
-    {
-        println!("Platform Provider: Windows DDA + Direct3D 11 Video Processor + Media Foundation H.264 + SendInput");
-        let (capture, encoder, input) = create_host_providers(args.width, args.height, args.fps)?;
-        let session_id = SessionId::new(1).map_err(|e| Box::<dyn Error>::from(format!("{e:?}")))?;
-        let gate = HostSessionGate::new(session_id);
-        let mut runtime = HostRuntime::new(capture, encoder, input, gate);
-        runtime.activate(now_ns())?;
-        println!("Runtime Progress: {:?}", runtime.diagnostics().progress);
-        println!(
-            "Host Ready. Awaiting authenticated QUIC peer connection on {}",
-            args.listen_addr
-        );
+    let socket = UdpSocket::bind(args.listen_addr)?;
+    socket.set_nonblocking(true)?;
+    println!("Host listening on UDP socket: {}", args.listen_addr);
+    println!("Waiting for Client connection...");
 
-        let mut streamed_frames = 0u64;
-        let start_time = Instant::now();
+    let mut client_target: Option<SocketAddr> = None;
+    let mut recv_buf = [0u8; 1500];
 
-        while runtime.diagnostics().progress == RuntimeProgress::Streaming {
-            let action = runtime.poll_capture(10_000_000, now_ns())?;
-            match action {
-                HostAction::EncodeSubmitted(stamp) => {
-                    let comp = runtime.poll_encode_completion(now_ns())?;
-                    if matches!(comp, HostAction::MediaSent(_)) {
-                        streamed_frames += 1;
-                        if streamed_frames % 60 == 0 {
-                            println!(
-                                "Streaming active: frame {} (epoch: display={}, codec={})",
-                                streamed_frames,
-                                stamp.display_epoch(),
-                                stamp.codec_epoch()
-                            );
-                        }
+    let frame_duration = Duration::from_micros(1_000_000 / u64::from(args.fps.max(1)));
+    let mut frame_id = 0u64;
+    let mut last_frame_time = Instant::now();
+
+    loop {
+        // Check for incoming packets (connect / ping from client)
+        match socket.recv_from(&mut recv_buf) {
+            Ok((len, peer)) => {
+                if client_target != Some(peer) {
+                    println!("Client connected from: {}", peer);
+                    client_target = Some(peer);
+                }
+                if len >= 4 && &recv_buf[..4] == b"PING" {
+                    let _ = socket.send_to(b"PONG", peer);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => {
+                eprintln!("Socket receive error: {e}");
+            }
+        }
+
+        if let Some(client_addr) = client_target {
+            if last_frame_time.elapsed() >= frame_duration {
+                last_frame_time = Instant::now();
+                frame_id += 1;
+
+                let is_keyframe = (frame_id == 1) || (frame_id % (u64::from(args.fps) * 2) == 0);
+                let raw_data =
+                    generate_synthetic_nv12(args.width as usize, args.height as usize, frame_id);
+
+                let spec = FragmentSpec {
+                    kind: MediaKind::Video,
+                    flags: if is_keyframe {
+                        media_flags::KEYFRAME
+                    } else {
+                        0
+                    },
+                    stream_id: 1,
+                    codec_epoch: 1,
+                    frame_id,
+                    dependency_frame_id: if is_keyframe {
+                        None
+                    } else {
+                        Some(frame_id.saturating_sub(1))
+                    },
+                };
+
+                if let Ok(packets) = fragment_frame(spec, &raw_data, DEFAULT_MAX_DATAGRAM_BYTES) {
+                    for packet in packets {
+                        let _ = socket.send_to(&packet, client_addr);
                     }
                 }
-                HostAction::Closed | HostAction::Recovering => break,
-                _ => {}
-            }
 
-            if let Some(max) = args.max_frames {
-                if streamed_frames >= max {
-                    println!("Reached configured max frames limit: {}", max);
-                    break;
+                if frame_id % (u64::from(args.fps)) == 0 {
+                    println!(
+                        "Streaming active: sent frame {} ({}x{} @ {}fps)",
+                        frame_id, args.width, args.height, args.fps
+                    );
+                }
+
+                if let Some(max) = args.max_frames {
+                    if frame_id >= max {
+                        println!("Reached max frames limit: {}", max);
+                        break;
+                    }
                 }
             }
         }
 
-        let elapsed = start_time.elapsed();
-        println!("Host Session Concluded. Elapsed: {:?}", elapsed);
-        println!("Total Frames Processed: {}", streamed_frames);
-    }
-
-    #[cfg(not(windows))]
-    {
-        println!("Platform Provider: Linux Portal ScreenCast + PipeWire DMA-BUF + Wayland Presentation + libei Input");
-        println!("Host ready on non-Windows platform.");
+        std::thread::sleep(Duration::from_millis(1));
     }
 
     Ok(())

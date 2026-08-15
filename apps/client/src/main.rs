@@ -1,6 +1,6 @@
 //! LatencyDesk Client Application.
 //!
-//! Native QUIC-gated client role coordinator using platform providers.
+//! Native QUIC/UDP client role coordinator using platform providers.
 
 use latencydesk_media::ContinuityAction;
 use latencydesk_platform::{CursorMode, PlatformError, PresentableFrame, ProviderDiagnostics};
@@ -10,11 +10,11 @@ use latencydesk_session::runtime::{
     AuthorityError, ClosedAuthority, DispatchPermit, DispatchStamp, InputLedger, SessionGate,
     SessionInputError,
 };
-use latencydesk_transport::{ReassembledFrame, ReassemblyConfig};
+use latencydesk_transport::{IngestOutcome, ReassembledFrame, Reassembler, ReassemblyConfig};
 use std::env;
 use std::error::Error;
-use std::net::SocketAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::net::{SocketAddr, UdpSocket};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct ClientArgs {
@@ -276,6 +276,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.profile_1080p120
     );
 
+    let socket = UdpSocket::bind(args.bind_addr)?;
+    socket.set_nonblocking(true)?;
+    println!("Client listening on UDP socket: {}", socket.local_addr()?);
+    println!("Sending connection request to {}", args.connect_addr);
+
+    let _ = socket.send_to(b"PING", args.connect_addr);
+
+    let mut reassembler = Reassembler::new(ReassemblyConfig::default())?;
+    let mut recv_buf = [0u8; 1500];
+
     #[cfg(windows)]
     {
         use latencydesk_platform_windows::{
@@ -315,12 +325,36 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("Client Connected and Ready. Active presentation window open.");
         println!("Press Ctrl+C in terminal or close the presentation window to disconnect.");
 
-        let mut frame_count = 0u64;
+        let mut received_frames = 0u64;
+        let mut last_ping = Instant::now();
+
         while window.pump_messages() {
-            std::thread::sleep(std::time::Duration::from_millis(8));
-            frame_count += 1;
+            if last_ping.elapsed() >= Duration::from_secs(1) {
+                last_ping = Instant::now();
+                let _ = socket.send_to(b"PING", args.connect_addr);
+            }
+
+            while let Ok((len, peer)) = socket.recv_from(&mut recv_buf) {
+                if peer == args.connect_addr && len > 0 {
+                    if let Ok(outcome) = reassembler.ingest(&recv_buf[..len], now_ns()) {
+                        if let IngestOutcome::Complete(frame) = outcome {
+                            received_frames += 1;
+                            if received_frames % 60 == 0 {
+                                println!(
+                                    "Streaming active: received frame {} ({} bytes)",
+                                    frame.header.frame_id,
+                                    frame.bytes.len()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            std::thread::sleep(Duration::from_millis(1));
+
             if let Some(max) = args.max_frames {
-                if frame_count >= max {
+                if received_frames >= max {
                     println!("Reached max frames limit: {}", max);
                     break;
                 }
