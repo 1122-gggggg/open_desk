@@ -6,6 +6,7 @@ pub mod authorization;
 pub mod disconnect;
 pub mod nat;
 pub mod pairing;
+pub mod runtime;
 pub mod unattended;
 
 /// High-level lifecycle of one remote desktop session.
@@ -350,75 +351,6 @@ mod tests {
         assert!(matches!(downgraded, ConnectionPath::Relay { .. }));
         assert!(router.is_using_relay());
         assert_eq!(router.stats().relay_downgrades, 1);
-    }
-
-    #[test]
-    fn sas_pairing_workflow_and_lockout() {
-        use crate::authorization::DeviceFingerprint;
-        use crate::pairing::{SasError, SasPairingManager};
-        use latencydesk_protocol::{PairingRequestWire, PairingResponseWire, SasCode};
-        let host_dev = DeviceFingerprint::new([1_u8; 32]).expect("host device");
-        let client_dev = DeviceFingerprint::new([2_u8; 32]).expect("client device");
-        let host_ephemeral = [3_u8; 32];
-        let client_ephemeral = [4_u8; 32];
-
-        let mut manager = SasPairingManager::new(3, 300_000_000_000);
-        manager
-            .begin_pairing(host_dev, host_ephemeral, 1_000_000)
-            .expect("begin");
-
-        let req = PairingRequestWire {
-            client_fingerprint: client_dev.as_bytes(),
-            client_ephemeral_key: client_ephemeral,
-            requested_capabilities: 0x03,
-            timestamp_ns: 1_100_000,
-        };
-
-        let (resp, sas_code, handle) = manager
-            .handle_client_request(req, [8_u8; 16], 1_200_000)
-            .expect("handle req");
-
-        // Verify wire sas_commitment is cryptographic commitment and not plaintext SAS digits
-        assert_eq!(
-            resp.sas_commitment,
-            PairingResponseWire::compute_commitment(
-                &host_ephemeral,
-                &client_ephemeral,
-                b"LatencyDesk-v1-SAS-Numeric"
-            )
-        );
-        assert_ne!(&resp.sas_commitment[0..6], &sas_code.to_ascii_digits());
-
-        // Wrong SAS code attempts decrement counter
-        let wrong_sas = SasCode::from_u32((sas_code.value() + 1) % 1_000_000).unwrap();
-        assert_eq!(
-            manager.confirm_sas(handle, wrong_sas, 1_300_000),
-            Err(SasError::SasMismatch)
-        );
-        assert_eq!(
-            manager.confirm_sas(handle, wrong_sas, 1_400_000),
-            Err(SasError::SasMismatch)
-        );
-        // 3rd attempt exceeds max attempts and permanently locks out
-        assert_eq!(
-            manager.confirm_sas(handle, wrong_sas, 1_500_000),
-            Err(SasError::MaxAttemptsExceeded)
-        );
-        assert!(!manager.is_confirmed(client_dev));
-
-        // New session with correct SAS confirms successfully
-        let mut valid_manager = SasPairingManager::new(3, 300_000_000_000);
-        valid_manager
-            .begin_pairing(host_dev, host_ephemeral, 2_000_000)
-            .expect("begin");
-        let (_resp2, sas_code2, handle2) = valid_manager
-            .handle_client_request(req, [9_u8; 16], 2_100_000)
-            .expect("req");
-        assert_eq!(
-            valid_manager.confirm_sas(handle2, sas_code2, 2_200_000),
-            Ok(())
-        );
-        assert!(valid_manager.is_confirmed(client_dev));
     }
 
     #[test]

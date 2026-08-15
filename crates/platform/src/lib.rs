@@ -14,6 +14,103 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+const MAX_PEER_ALIAS_BYTES: usize = 64;
+
+/// Public view of a persistent TLS device identity.
+///
+/// The platform store retains private key material in OS user-secret storage;
+/// the safe core receives only the immutable SPKI fingerprint needed to bind a
+/// pairing attempt to the authenticated TLS peer.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeviceIdentity {
+    spki_fingerprint: [u8; 32],
+}
+
+impl DeviceIdentity {
+    /// Constructs the public identity view from a verified TLS SPKI fingerprint.
+    pub fn from_tls_spki_fingerprint(fingerprint: [u8; 32]) -> Result<Self, PlatformError> {
+        if fingerprint.iter().all(|byte| *byte == 0) {
+            return Err(PlatformError::InvalidIdentity);
+        }
+        Ok(Self {
+            spki_fingerprint: fingerprint,
+        })
+    }
+
+    #[must_use]
+    pub const fn spki_fingerprint(self) -> [u8; 32] {
+        self.spki_fingerprint
+    }
+}
+
+impl fmt::Debug for DeviceIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DeviceIdentity(<redacted>)")
+    }
+}
+
+/// Locally selected label for one persistent peer identity.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct PeerAlias(String);
+
+impl PeerAlias {
+    pub fn new(alias: impl Into<String>) -> Result<Self, PlatformError> {
+        let alias = alias.into();
+        if alias.is_empty()
+            || alias.len() > MAX_PEER_ALIAS_BYTES
+            || alias.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(PlatformError::InvalidPeerAlias);
+        }
+        Ok(Self(alias))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for PeerAlias {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PeerAlias(<redacted>)")
+    }
+}
+
+/// Persistent pin for one peer TLS SPKI fingerprint.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerPin([u8; 32]);
+
+impl PeerPin {
+    pub fn from_tls_spki_fingerprint(fingerprint: [u8; 32]) -> Result<Self, PlatformError> {
+        if fingerprint.iter().all(|byte| *byte == 0) {
+            return Err(PlatformError::InvalidPeerPin);
+        }
+        Ok(Self(fingerprint))
+    }
+
+    #[must_use]
+    pub const fn spki_fingerprint(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl fmt::Debug for PeerPin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PeerPin(<redacted>)")
+    }
+}
+
+/// Platform-owned persistent identity and peer-pin storage.
+///
+/// Implementations must use OS user-secret facilities for private identity
+/// material. This contract deliberately offers no filesystem fallback.
+pub trait DeviceIdentityStore: Send + Sync {
+    fn load_or_create_identity(&self) -> Result<DeviceIdentity, PlatformError>;
+    fn load_peer_pin(&self, alias: &PeerAlias) -> Result<Option<PeerPin>, PlatformError>;
+    fn store_peer_pin(&self, alias: &PeerAlias, pin: PeerPin) -> Result<(), PlatformError>;
+}
+
 /// Runtime provider lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderState {
@@ -1314,6 +1411,9 @@ fn scale_coordinate(value: u32, source: u32, target: u32) -> u32 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlatformError {
+    InvalidIdentity,
+    InvalidPeerAlias,
+    InvalidPeerPin,
     InvalidState,
     InvalidSurface,
     InvalidDeadline,

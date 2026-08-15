@@ -62,6 +62,13 @@ impl DeviceFingerprint {
 pub struct SessionId(u64);
 
 impl SessionId {
+    pub fn new(value: u64) -> Result<Self, AccessError> {
+        if value == 0 {
+            return Err(AccessError::InvalidSessionId);
+        }
+        Ok(Self(value))
+    }
+
     #[must_use]
     pub const fn value(self) -> u64 {
         self.0
