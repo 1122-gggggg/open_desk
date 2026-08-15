@@ -14,4 +14,6 @@ __pycache__/
 
 # Local CMake/native build outputs
 build/
+build-native/
+/build-native/
 /.worktrees/

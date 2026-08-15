@@ -377,6 +377,7 @@ where
                 Ok(HostAction::EncodeSubmitted(stamp))
             }
             CaptureEvent::Reconfigure { .. }
+            | CaptureEvent::ProtectedContent { .. }
             | CaptureEvent::AccessLost
             | CaptureEvent::PermissionRevoked => {
                 self.enter_recovery(now_ns)?;

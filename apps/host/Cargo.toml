@@ -7,17 +7,26 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bytes = "1"
 latencydesk-codec = { path = "../../crates/codec" }
-latencydesk-frame = { path = "../../crates/frame" }
 latencydesk-h264 = { path = "../../crates/h264" }
 latencydesk-input = { path = "../../crates/input" }
 latencydesk-media = { path = "../../crates/media" }
+latencydesk-platform = { path = "../../crates/platform" }
 latencydesk-protocol = { path = "../../crates/protocol" }
+latencydesk-runtime = { path = "../../crates/runtime" }
 latencydesk-scheduler = { path = "../../crates/scheduler" }
 latencydesk-session = { path = "../../crates/session" }
 latencydesk-socket-transport = { path = "../../crates/socket-transport" }
-latencydesk-test-codec = { path = "../../crates/test-codec" }
+latencydesk-surface = { path = "../../crates/surface" }
 latencydesk-transport = { path = "../../crates/transport" }
-latencydesk-runtime = { path = "../../crates/runtime" }
+tokio = { version = "1", features = ["full"] }
+
+[target.'cfg(windows)'.dependencies]
+latencydesk-platform-windows = { path = "../../crates/platform-windows" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+latencydesk-platform-linux = { path = "../../crates/platform-linux" }
+
 [lints]
 workspace = true

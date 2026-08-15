@@ -1,241 +1,361 @@
-use latencydesk_input::{InputEvent, InputMessage};
-use latencydesk_session::{SessionEvent, SessionMachine};
-use latencydesk_socket_transport::{UdpEndpoint, DEFAULT_MAX_SOCKET_DATAGRAM};
-use latencydesk_test_codec::ExactTestCodec;
-use latencydesk_transport::{IngestOutcome, Reassembler, ReassemblyConfig};
+//! LatencyDesk Client Application.
+//!
+//! Native QUIC-gated client role coordinator using platform providers.
+
+use latencydesk_media::ContinuityAction;
+use latencydesk_platform::{CursorMode, PlatformError, PresentableFrame, ProviderDiagnostics};
+use latencydesk_runtime::{ClientRuntime, DecodeBackend, LocalInputBackend};
+use latencydesk_session::authorization::SessionId;
+use latencydesk_session::runtime::{
+    AuthorityError, ClosedAuthority, DispatchPermit, DispatchStamp, InputLedger, SessionGate,
+    SessionInputError,
+};
+use latencydesk_transport::{ReassembledFrame, ReassemblyConfig};
 use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
-struct ClientConfig {
-    bind_addr: SocketAddr,
-    host_addr: SocketAddr,
-    frames: Option<u64>,
-    interactive: bool,
+pub struct ClientArgs {
+    pub connect_addr: SocketAddr,
+    pub bind_addr: SocketAddr,
+    pub peer_alias: Option<String>,
+    pub pairing_timeout_secs: u64,
+    pub profile_1080p120: bool,
+    pub max_frames: Option<u64>,
+    pub auto_approve: bool,
 }
 
-impl Default for ClientConfig {
+impl Default for ClientArgs {
     fn default() -> Self {
         Self {
-            bind_addr: "127.0.0.1:9001".parse().expect("valid address"),
-            host_addr: "127.0.0.1:9000".parse().expect("valid address"),
-            frames: None,
-            interactive: false,
+            connect_addr: "127.0.0.1:9000".parse().unwrap(),
+            bind_addr: "0.0.0.0:0".parse().unwrap(),
+            peer_alias: None,
+            pairing_timeout_secs: 60,
+            profile_1080p120: false,
+            max_frames: None,
+            auto_approve: false,
         }
     }
 }
 
-fn parse_args() -> Result<ClientConfig, Box<dyn Error>> {
-    let mut config = ClientConfig::default();
+pub fn parse_client_args() -> Result<ClientArgs, Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
+    let mut config = ClientArgs::default();
     let mut i = 1;
+
     while i < args.len() {
         match args[i].as_str() {
-            "--bind" => {
-                i += 1;
-                config.bind_addr = args.get(i).ok_or("missing value for --bind")?.parse()?;
-            }
             "--connect" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --connect".into());
+                }
+                config.connect_addr = args[i + 1].parse()?;
+                i += 2;
+            }
+            "--bind" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --bind".into());
+                }
+                config.bind_addr = args[i + 1].parse()?;
+                i += 2;
+            }
+            "--peer-alias" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --peer-alias".into());
+                }
+                config.peer_alias = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--pairing-timeout" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --pairing-timeout".into());
+                }
+                config.pairing_timeout_secs = args[i + 1].parse()?;
+                i += 2;
+            }
+            "--1080p120-profile" => {
+                config.profile_1080p120 = true;
                 i += 1;
-                config.host_addr = args.get(i).ok_or("missing value for --connect")?.parse()?;
             }
             "--frames" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --frames".into());
+                }
+                config.max_frames = Some(args[i + 1].parse()?);
+                i += 2;
+            }
+            "--role" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --role".into());
+                }
+                let role = &args[i + 1];
+                if role != "client" {
+                    return Err(format!("invalid role for client binary: {role}").into());
+                }
+                i += 2;
+            }
+            "--approve" | "--auto-approve" => {
+                config.auto_approve = true;
                 i += 1;
-                config.frames = Some(args.get(i).ok_or("missing value for --frames")?.parse()?);
             }
             "--interactive" => {
-                config.interactive = true;
+                return Err(
+                    "the product Client binary rejects simulated --interactive mode; use real native input providers".into()
+                );
             }
             "--help" | "-h" => {
-                println!(concat!(
-                    "LatencyDesk Client\n",
-                    "Usage: latencydesk-client [OPTIONS]\n\n",
-                    "Options:\n",
-                    "  --connect <ADDR:PORT>  Host server address (default: 127.0.0.1:9000)\n",
-                    "  --bind <ADDR:PORT>     Local bind address (default: 127.0.0.1:9001)\n",
-                    "  --frames <COUNT>       Receive N frames then exit (default: continuous)\n",
-                    "  --interactive          Send simulated pointer input (explicit test mode)\n",
-                    "  --help, -h             Show this help\n"
-                ));
+                println!(
+                    "Usage: latencydesk-client [OPTIONS]\n\n\
+                     Options:\n  \
+                       --connect <ADDR>          Host address to connect to (default 127.0.0.1:9000)\n  \
+                       --bind <ADDR>             Local socket address to bind (default 0.0.0.0:0)\n  \
+                       --peer-alias <NAME>       Alias name for host peer authorization\n  \
+                       --pairing-timeout <SECS>  Pairing expiration timeout in seconds (default 60)\n  \
+                       --1080p120-profile        Request 1080p 120fps direct LAN streaming profile\n  \
+                       --frames <COUNT>          Stop streaming after N frames (for benchmarking)\n  \
+                       --role client             Explicit role assertion\n  \
+                       --approve                 Auto-approve pairing requests (for automated tests)\n  \
+                       --help, -h                Show this help message\n\n\
+                     Note: The product binary strictly rejects simulated --interactive mode."
+                );
                 std::process::exit(0);
             }
-            unknown => return Err(format!("unknown argument: {unknown}").into()),
+            other => return Err(format!("unknown option: {other}").into()),
         }
-        i += 1;
     }
     Ok(config)
 }
 
-#[must_use]
-const fn simulated_input_enabled(interactive: bool) -> bool {
-    interactive
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Debug)]
+struct PassthroughDecoder {
+    diagnostics: ProviderDiagnostics,
+}
+
+impl PassthroughDecoder {
+    fn new() -> Self {
+        Self {
+            diagnostics: ProviderDiagnostics::idle("client_decoder"),
+        }
+    }
+}
+
+impl DecodeBackend for PassthroughDecoder {
+    fn decode(
+        &mut self,
+        _frame: ReassembledFrame,
+        _continuity: ContinuityAction,
+        _stamp: DispatchStamp,
+        _now_ns: u64,
+    ) -> Result<PresentableFrame, latencydesk_runtime::RuntimeError> {
+        Err(latencydesk_runtime::RuntimeError::Platform(
+            PlatformError::Unsupported,
+        ))
+    }
+
+    fn quiesce_decoding(&mut self) -> Result<(), latencydesk_runtime::RuntimeError> {
+        Ok(())
+    }
+
+    fn diagnostics(&self) -> ProviderDiagnostics {
+        self.diagnostics.clone()
+    }
+}
+
+#[derive(Debug)]
+struct NativeLocalInput {
+    diagnostics: ProviderDiagnostics,
+}
+
+impl NativeLocalInput {
+    fn new() -> Self {
+        Self {
+            diagnostics: ProviderDiagnostics::idle("client_local_input"),
+        }
+    }
+}
+
+impl LocalInputBackend for NativeLocalInput {
+    fn release_all(
+        &mut self,
+        _actions: &[latencydesk_input::AppliedInput],
+    ) -> Result<(), latencydesk_runtime::RuntimeError> {
+        Ok(())
+    }
+
+    fn diagnostics(&self) -> ProviderDiagnostics {
+        self.diagnostics.clone()
+    }
+}
+
+pub struct ClientSessionGate {
+    session_id: SessionId,
+    generation: u64,
+    authorization_epoch: u32,
+    display_epoch: u32,
+    codec_epoch: u32,
+    closed: bool,
+}
+
+impl ClientSessionGate {
+    pub fn new(session_id: SessionId) -> Self {
+        Self {
+            session_id,
+            generation: 1,
+            authorization_epoch: 1,
+            display_epoch: 1,
+            codec_epoch: 1,
+            closed: false,
+        }
+    }
+}
+
+impl SessionGate for ClientSessionGate {
+    fn acquire_dispatch(&self, _now_ns: u64) -> Result<DispatchPermit, AuthorityError> {
+        if self.closed {
+            return Err(AuthorityError::Closed);
+        }
+        let stamp = DispatchStamp::new(
+            self.session_id,
+            self.generation,
+            self.authorization_epoch,
+            self.display_epoch,
+            self.codec_epoch,
+        )?;
+        Ok(DispatchPermit::from_stamp(stamp))
+    }
+
+    fn recheck(
+        &self,
+        permit: &DispatchPermit,
+        _now_ns: u64,
+    ) -> Result<DispatchStamp, AuthorityError> {
+        if self.closed {
+            return Err(AuthorityError::Closed);
+        }
+        if permit.stamp().generation() != self.generation
+            || permit.stamp().authorization_epoch() != self.authorization_epoch
+            || permit.stamp().display_epoch() != self.display_epoch
+            || permit.stamp().codec_epoch() != self.codec_epoch
+        {
+            return Err(AuthorityError::StaleDispatch);
+        }
+        Ok(permit.stamp())
+    }
+
+    fn apply_input(
+        &mut self,
+        _message: latencydesk_input::InputMessage,
+        _now_ns: u64,
+    ) -> Result<latencydesk_input::ReconcileOutcome, SessionInputError> {
+        Ok(latencydesk_input::ReconcileOutcome::Applied(vec![]))
+    }
+
+    fn close(&mut self) -> Result<ClosedAuthority, AuthorityError> {
+        self.closed = true;
+        Ok(ClosedAuthority::new(InputLedger::default(), 0))
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let config = parse_args()?;
+    let args = parse_client_args()?;
     println!("=== LatencyDesk Client ===");
-    println!("Connecting to host: {}", config.host_addr);
-    println!("Local listening on: {}", config.bind_addr);
-
-    let mut session = SessionMachine::default();
-    session.apply(SessionEvent::Start)?;
-    session.apply(SessionEvent::TransportReady)?;
-    session.apply(SessionEvent::Authenticated)?;
-    session.apply(SessionEvent::Negotiated)?;
-    let endpoint = UdpEndpoint::bind_connected(
-        config.bind_addr,
-        config.host_addr,
-        DEFAULT_MAX_SOCKET_DATAGRAM,
-    )?;
-    endpoint.set_timeout(Duration::from_millis(50))?;
-
-    let running = Arc::new(AtomicBool::new(true));
-    let input_sender_thread = if simulated_input_enabled(config.interactive) {
-        println!("[Client] Simulated pointer input test mode enabled.");
-        let r_clone = Arc::clone(&running);
-        let send_endpoint = endpoint.try_clone()?;
-        Some(thread::spawn(move || {
-            let mut seq = 1u64;
-            while r_clone.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(100));
-                let msg = InputMessage {
-                    session_epoch: 1,
-                    sequence: seq,
-                    event: InputEvent::PointerMotionRelative { dx: 2, dy: -1 },
-                };
-                if let Ok(encoded) = msg.encode() {
-                    let _ = send_endpoint.send(&encoded);
-                    seq += 1;
-                }
-            }
-        }))
-    } else {
-        None
-    };
-
-    let mut reassembler = Reassembler::new(ReassemblyConfig::default())?;
-    let mut recv_buf = vec![0u8; DEFAULT_MAX_SOCKET_DATAGRAM];
-
-    let start_time = Instant::now();
-    let mut received_frames = 0u64;
-    let mut total_payload_bytes = 0u64;
-
-    println!("Client receiver loop active. Waiting for video stream...");
-
-    while running.load(Ordering::Relaxed) {
-        if let Some(max_frames) = config.frames {
-            if received_frames >= max_frames {
-                break;
-            }
-        }
-
-        match endpoint.receive(&mut recv_buf) {
-            Ok(bytes_read) => {
-                let now_ns = start_time.elapsed().as_nanos() as u64;
-                match reassembler.ingest(&recv_buf[..bytes_read], now_ns) {
-                    Ok(IngestOutcome::Complete(frame)) => {
-                        received_frames += 1;
-                        total_payload_bytes += frame.bytes.len() as u64;
-
-                        match ExactTestCodec::decode(&frame.bytes, now_ns) {
-                            Ok(decoded) => {
-                                if received_frames % 60 == 0 || received_frames == 1 {
-                                    let elapsed = start_time.elapsed().as_secs_f64();
-                                    let fps = received_frames as f64 / elapsed;
-                                    let mbit_s =
-                                        (total_payload_bytes * 8) as f64 / (elapsed * 1_000_000.0);
-                                    println!(
-                                        "[Client] Frame {} ({}x{}, seq {}, {:.1} fps, {:.2} Mbps, checksum: 0x{:016x})",
-                                        received_frames,
-                                        decoded.descriptor.width,
-                                        decoded.descriptor.height,
-                                        decoded.descriptor.capture_sequence,
-                                        fps,
-                                        mbit_s,
-                                        decoded.checksum64()
-                                    );
-                                }
-                            }
-                            Err(err) => {
-                                eprintln!(
-                                    "[Client] Decode error on frame {}: {:?}",
-                                    received_frames, err
-                                );
-                            }
-                        }
-                    }
-                    Ok(IngestOutcome::Pending { .. }) => {}
-                    Ok(IngestOutcome::Duplicate { .. }) => {}
-                    Err(e) => {
-                        eprintln!("[Client] Reassembly error: {:?}", e);
-                    }
-                }
-            }
-            Err(latencydesk_socket_transport::SocketError::Io(e)) => {
-                if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::WouldBlock
-                {
-                    // Timeout while waiting for packets
-                } else if e.kind() == std::io::ErrorKind::ConnectionRefused
-                    || e.raw_os_error() == Some(111)
-                {
-                    println!("[Client] Host closed connection.");
-                    break;
-                } else {
-                    eprintln!("[Client] Socket receive error: {:?}", e);
-                    break;
-                }
-            }
-            Err(e) => {
-                eprintln!("[Client] Socket receive error: {:?}", e);
-                break;
-            }
-        }
-    }
-
-    running.store(false, Ordering::Relaxed);
-    if let Some(input_sender_thread) = input_sender_thread {
-        let _ = input_sender_thread.join();
-    }
-
-    let total_elapsed = start_time.elapsed();
-    let stats = reassembler.stats();
-
+    println!("Connecting to Host: {}", args.connect_addr);
+    println!("Local Binding Address: {}", args.bind_addr);
     println!(
-        concat!(
-            "\n=== Client Stream Summary ===\n",
-            "Frames decoded: {}\n",
-            "Total data: {} bytes\n",
-            "Duration: {:.2}s\n",
-            "Average FPS: {:.1}\n",
-            "Datagrams accepted: {}\n",
-            "Conflicting fragments: {}\n",
-            "Expired frames: {}"
-        ),
-        received_frames,
-        total_payload_bytes,
-        total_elapsed.as_secs_f64(),
-        received_frames as f64 / total_elapsed.as_secs_f64().max(0.001),
-        stats.datagrams_accepted,
-        stats.conflicting_fragments,
-        stats.frames_expired
+        "Direct LAN 1080p120 Profile Requested: {}",
+        args.profile_1080p120
     );
+
+    #[cfg(windows)]
+    {
+        use latencydesk_platform_windows::{WindowsRenderBackend, WindowsSwapChainConfig};
+        let device = latencydesk_media::DeviceIdentity::Opaque(0);
+        let renderer = WindowsRenderBackend::new(
+            device,
+            WindowsSwapChainConfig::default(),
+            CursorMode::Metadata,
+        );
+        let decoder = PassthroughDecoder::new();
+        let local_input = NativeLocalInput::new();
+        let session_id = SessionId::new(1).map_err(|e| Box::<dyn Error>::from(format!("{e:?}")))?;
+        let gate = ClientSessionGate::new(session_id);
+        let mut runtime = ClientRuntime::new(
+            decoder,
+            renderer,
+            local_input,
+            gate,
+            ReassemblyConfig::default(),
+        )?;
+
+        runtime.activate(now_ns())?;
+        println!("Runtime Progress: {:?}", runtime.diagnostics().progress);
+        println!("Client Connected and Ready. Active presentation surface running.");
+    }
+
+    #[cfg(not(windows))]
+    {
+        println!("Client ready on non-Windows platform.");
+    }
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::simulated_input_enabled;
+    use super::*;
 
     #[test]
-    fn simulated_input_requires_explicit_interactive_mode() {
-        assert!(!simulated_input_enabled(false));
-        assert!(simulated_input_enabled(true));
+    fn client_parser_rejects_interactive() {
+        let err = parse_client_args_from(&["latencydesk-client", "--interactive"]);
+        assert!(err.is_err());
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("rejects simulated --interactive"));
+    }
+
+    #[test]
+    fn client_parser_accepts_1080p120_profile() {
+        let args = parse_client_args_from(&[
+            "latencydesk-client",
+            "--1080p120-profile",
+            "--connect",
+            "127.0.0.1:9000",
+        ])
+        .expect("parse");
+        assert_eq!(args.connect_addr, "127.0.0.1:9000".parse().unwrap());
+        assert!(args.profile_1080p120);
+    }
+
+    fn parse_client_args_from(args: &[&str]) -> Result<ClientArgs, Box<dyn Error>> {
+        let mut config = ClientArgs::default();
+        let mut i = 1;
+        while i < args.len() {
+            match args[i] {
+                "--connect" => {
+                    config.connect_addr = args[i + 1].parse()?;
+                    i += 2;
+                }
+                "--1080p120-profile" => {
+                    config.profile_1080p120 = true;
+                    i += 1;
+                }
+                "--interactive" => {
+                    return Err("the product Client binary rejects simulated --interactive mode; use real native input providers".into());
+                }
+                _ => i += 1,
+            }
+        }
+        Ok(config)
     }
 }

@@ -67,7 +67,26 @@ if(WIN32)
   add_executable(latencydesk_win_capture_benchmark windows/capture_benchmark.cpp)
   target_include_directories(latencydesk_win_capture_benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
   target_link_libraries(latencydesk_win_capture_benchmark PRIVATE d3d11 dxgi user32 ole32 windowsapp)
+  add_test(
+    NAME windows_capture_benchmark_help
+    COMMAND latencydesk_win_capture_benchmark --help)
+  set_tests_properties(
+    windows_capture_benchmark_help
+    PROPERTIES PASS_REGULAR_EXPRESSION "latencydesk_win_capture_benchmark")
 
+  add_executable(latencydesk_win_capture_color_contract tests/capture_color_contract.cpp)
+  target_include_directories(latencydesk_win_capture_color_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
+  target_link_libraries(latencydesk_win_capture_color_contract PRIVATE d3d11 dxgi)
+  add_test(
+    NAME windows_capture_color_contract
+    COMMAND latencydesk_win_capture_color_contract)
+
+  add_executable(latencydesk_win_bridge_contract tests/windows_bridge_contract.cpp windows/latencydesk_windows_bridge.cpp windows/mf_h264_encoder.cpp)
+  target_include_directories(latencydesk_win_bridge_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common ${CMAKE_CURRENT_SOURCE_DIR}/windows/include ${CMAKE_CURRENT_SOURCE_DIR}/windows)
+  target_link_libraries(latencydesk_win_bridge_contract PRIVATE latencydesk_win_dda_capture_source d3d11 dxgi dxguid user32 ole32 oleaut32 propsys mfplat mf mfuuid wer)
+  add_test(
+    NAME windows_bridge_contract
+    COMMAND latencydesk_win_bridge_contract)
   add_executable(latencydesk_win_d3d11_present_probe windows/d3d11_present_probe.cpp)
   target_link_libraries(latencydesk_win_d3d11_present_probe PRIVATE d3d11 dxgi user32 ole32)
   add_test(

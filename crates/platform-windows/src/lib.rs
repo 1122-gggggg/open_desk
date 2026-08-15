@@ -12,17 +12,23 @@ use latencydesk_media::{
     CopyLedger, DeviceIdentity, EncodedFrameMeta, FrameDescriptor, MemoryDomain, SurfaceLayout,
 };
 use latencydesk_platform::{
-    CaptureBackend, CaptureEvent, CaptureFramePublisher, CursorMode, CursorUpdate, EncodeBackend,
-    EncodeFailure, EncodeSubmission, EncoderSubmissionGuard, InputBackend,
-    NativePresentationCompletion, PlatformError, PresentSubmission, PresentationSubmissionGuard,
-    ProviderDiagnostics, ProviderState, RenderBackend, RenderFailure,
+    CaptureBackend, CaptureEvent, CaptureFramePublisher, EncodeBackend, EncodeFailure,
+    EncodeSubmission, EncoderSubmissionGuard, InputBackend, NativePresentationCompletion,
+    PlatformError, PresentSubmission, PresentationSubmissionGuard, ProviderDiagnostics,
+    ProviderState, RenderBackend, RenderFailure,
 };
+pub use latencydesk_platform::{CursorMode, CursorUpdate};
 use latencydesk_surface::{
     CaptureLease, DestinationSurfaceSpec, OwnedSurface, SurfaceError, SurfacePayload, SurfacePool,
 };
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+
+#[cfg(windows)]
+mod native;
+#[cfg(windows)]
+pub(crate) use native::DesktopDuplicationCaptureSource;
 
 /// Windows capture API selected for one display session.
 ///
@@ -84,15 +90,14 @@ pub enum WindowsCaptureTarget {
 
 /// Data-only description of the encoder-owned D3D11 destination family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct WindowsCaptureDestination {
+pub struct WindowsCaptureDestination {
     device: DeviceIdentity,
     format_fourcc: u32,
     plane_count: u8,
 }
 
 impl WindowsCaptureDestination {
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn new(
+    pub fn new(
         device: DeviceIdentity,
         format_fourcc: u32,
         plane_count: u8,
@@ -108,6 +113,9 @@ impl WindowsCaptureDestination {
             format_fourcc,
             plane_count,
         })
+    }
+    pub fn nv12(device: DeviceIdentity) -> Result<Self, WindowsBackendError> {
+        Self::new(device, u32::from_le_bytes(*b"NV12"), 2)
     }
 
     fn reserve_for(
@@ -259,9 +267,9 @@ impl CaptureSelector {
 
     /// Records a provider failure and returns the next deterministic action.
     ///
-    /// `ProtectedContent` is different: DDA has already masked the source, so
-    /// capture remains live while the caller clears any stale reconstruction
-    /// history before it forwards that frame.
+    /// `ProtectedContent` keeps DDA live, but it invalidates every prior
+    /// display epoch so no reservation or reconstruction history can survive
+    /// the masked frame.
     pub fn fail(
         &mut self,
         failure: CaptureFailure,
@@ -272,7 +280,16 @@ impl CaptureSelector {
             self.diagnostics.last_error = Some(format!("{failure:?}"));
         }
         match failure {
-            CaptureFailure::ProtectedContent => Ok(CaptureRecoveryAction::SurfaceProtectedContent),
+            CaptureFailure::ProtectedContent => {
+                if let Err(error) = self.advance_epoch() {
+                    self.clear(
+                        ProviderState::Failed,
+                        Some("capture display generation exhausted".into()),
+                    );
+                    return Err(error);
+                }
+                Ok(CaptureRecoveryAction::SurfaceProtectedContent)
+            }
             CaptureFailure::PermissionDenied => {
                 self.active = None;
                 self.state = ProviderState::Revoked;
@@ -544,38 +561,54 @@ fn import_capture_frame(
     source_observed_epoch: u32,
     metadata: DesktopMetadata,
     payload: Option<Box<dyn SurfacePayload>>,
-) -> Result<ImportedWindowsFrame, WindowsBackendError> {
+) -> Result<ImportedWindowsFrame, (WindowsBackendError, CaptureLease)> {
     if source_descriptor.memory_domain != MemoryDomain::D3D11
         || destination.descriptor().memory_domain != MemoryDomain::D3D11
         || destination.layout().memory_domain != MemoryDomain::D3D11
     {
-        return Err(WindowsBackendError::MemoryDomain);
+        return Err((WindowsBackendError::MemoryDomain, lease));
     }
-    if lease.descriptor().map_err(WindowsBackendError::Surface)? != destination.descriptor()
-        || ledger.destination_device != destination.device()
+    match lease.descriptor().map_err(WindowsBackendError::Surface) {
+        Ok(desc) if desc == destination.descriptor() => {}
+        _ => return Err((WindowsBackendError::DestinationMismatch, lease)),
+    }
+    if ledger.destination_device != destination.device()
         || ledger.destination_layout != destination.layout()
+        || source_descriptor.width != destination.descriptor().width
+        || source_descriptor.height != destination.descriptor().height
+        || source_descriptor.capture_sequence != destination.descriptor().capture_sequence
+        || source_descriptor.capture_timestamp_ns != destination.descriptor().capture_timestamp_ns
     {
-        return Err(WindowsBackendError::DestinationMismatch);
+        return Err((WindowsBackendError::DestinationMismatch, lease));
     }
     if ledger.source_lease.provider_epoch != source_observed_epoch {
-        return Err(WindowsBackendError::LedgerEpoch);
+        return Err((WindowsBackendError::LedgerEpoch, lease));
     }
     if ledger.path == latencydesk_media::ImportPath::DirectAlias {
-        return Err(WindowsBackendError::BorrowedDirectAlias);
+        return Err((WindowsBackendError::BorrowedDirectAlias, lease));
     }
-    metadata.validate(
+    if let Err(err) = metadata.validate(
         source_descriptor.width,
         source_descriptor.height,
         MetadataLimits::default(),
-    )?;
+    ) {
+        return Err((err, lease));
+    }
+    if source_descriptor.validate().is_err() {
+        return Err((WindowsBackendError::FrameDescriptor, lease));
+    }
+    if let Err(err) = ledger.validate_capture_source(source_descriptor) {
+        return Err((
+            WindowsBackendError::Surface(SurfaceError::CopyLedger(err)),
+            lease,
+        ));
+    }
     let surface = match payload {
         Some(payload) => lease.import_from_capture_with_payload(source_descriptor, ledger, payload),
         None => lease.import_from_capture(source_descriptor, ledger),
     }
-    .map_err(WindowsBackendError::Surface)?;
-    if surface.descriptor().map_err(WindowsBackendError::Surface)? != destination.descriptor() {
-        return Err(WindowsBackendError::DestinationMismatch);
-    }
+    .map_err(WindowsBackendError::Surface)
+    .expect("pre-validated import_from_capture");
     Ok(ImportedWindowsFrame {
         surface,
         copy_ledger: ledger,
@@ -583,7 +616,6 @@ fn import_capture_frame(
         metadata,
     })
 }
-
 /// Windows integrity level relevant to SendInput/UIPI decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IntegrityLevel {
@@ -661,22 +693,22 @@ impl InteractiveUserIdentity {
 /// derived the interactive identity from a local token.
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct LocalInteractiveUserEvidence {
-    windows_session_id: u32,
-    logon_luid: u64,
-    interactive_token_verified: bool,
+pub struct LocalInteractiveUserEvidence {
+    pub windows_session_id: u32,
+    pub logon_luid: u64,
+    pub interactive_token_verified: bool,
 }
 
 /// One-shot authority to launch an agent for the locally verified user.
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct VerifiedInteractiveUser {
+pub struct VerifiedInteractiveUser {
     identity: InteractiveUserIdentity,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl VerifiedInteractiveUser {
-    fn verify(evidence: LocalInteractiveUserEvidence) -> Result<Self, WindowsBackendError> {
+    pub fn verify(evidence: LocalInteractiveUserEvidence) -> Result<Self, WindowsBackendError> {
         if !evidence.interactive_token_verified {
             return Err(WindowsBackendError::AgentIdentity);
         }
@@ -694,12 +726,12 @@ impl VerifiedInteractiveUser {
 /// intentionally has no public constructor or fields.
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct AgentPeerEvidence {
-    windows_session_id: u32,
-    logon_luid: u64,
-    agent_pid: u32,
-    named_pipe_acl_verified: bool,
-    interactive_token_verified: bool,
+pub struct AgentPeerEvidence {
+    pub windows_session_id: u32,
+    pub logon_luid: u64,
+    pub agent_pid: u32,
+    pub named_pipe_acl_verified: bool,
+    pub interactive_token_verified: bool,
 }
 
 /// Opaque proof for a Windows adapter that has checked the IPC peer. Remote
@@ -712,7 +744,7 @@ pub struct VerifiedAgentPeer {
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl VerifiedAgentPeer {
-    fn verify(evidence: AgentPeerEvidence) -> Result<Self, WindowsBackendError> {
+    pub fn verify(evidence: AgentPeerEvidence) -> Result<Self, WindowsBackendError> {
         if !evidence.named_pipe_acl_verified
             || !evidence.interactive_token_verified
             || evidence.agent_pid == 0
@@ -747,7 +779,7 @@ impl fmt::Debug for AgentLaunchChallenge {
 
 /// One-shot response accepted only for its matching launch attempt.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct AgentChallengeResponse {
+pub struct AgentChallengeResponse {
     attempt: u64,
     bytes: [u8; 32],
 }
@@ -755,7 +787,7 @@ pub(crate) struct AgentChallengeResponse {
 static NEXT_AGENT_LAUNCH_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[allow(dead_code)]
-fn issue_agent_launch_challenge(
+pub fn issue_agent_launch_challenge(
     bytes: [u8; 32],
 ) -> Result<(AgentLaunchChallenge, AgentChallengeResponse), WindowsBackendError> {
     if bytes.iter().all(|byte| *byte == 0) {
@@ -836,7 +868,7 @@ impl Default for PerUserAgentBroker {
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl PerUserAgentBroker {
-    pub(crate) fn begin_agent_launch(
+    pub fn begin_agent_launch(
         &mut self,
         user: VerifiedInteractiveUser,
         challenge: AgentLaunchChallenge,
@@ -851,7 +883,7 @@ impl PerUserAgentBroker {
         Ok(())
     }
 
-    pub(crate) fn authenticate_agent(
+    pub fn authenticate_agent(
         &mut self,
         peer: VerifiedAgentPeer,
         challenge_response: AgentChallengeResponse,
@@ -1247,6 +1279,7 @@ struct NativePublicationGateState {
     exact_abort_completed: bool,
     global_abort_started: bool,
     global_abort_completed: bool,
+    presentation_authorization: Arc<AtomicBool>,
 }
 
 /// Shared linearization gate joining native cancellation with Rust frame
@@ -1256,7 +1289,6 @@ struct NativePublicationGateState {
 struct NativePublicationGate {
     state: Mutex<NativePublicationGateState>,
     abort_completed: Condvar,
-    presentation_authorization: Arc<AtomicBool>,
 }
 
 impl NativePublicationGate {
@@ -1268,9 +1300,9 @@ impl NativePublicationGate {
                 exact_abort_completed: false,
                 global_abort_started: false,
                 global_abort_completed: false,
+                presentation_authorization: Arc::new(AtomicBool::new(true)),
             }),
             abort_completed: Condvar::new(),
-            presentation_authorization: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -1291,8 +1323,22 @@ impl NativePublicationGate {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.open = false;
-        self.presentation_authorization
+        state
+            .presentation_authorization
             .store(false, Ordering::Release);
+    }
+
+    fn invalidate_retained_presentation(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .presentation_authorization
+            .store(false, Ordering::Release);
+        if state.open {
+            state.presentation_authorization = Arc::new(AtomicBool::new(true));
+        }
     }
 
     fn mark_native_quiesced(&self) {
@@ -1303,17 +1349,18 @@ impl NativePublicationGate {
         state.open = false;
         state.exact_abort_started = true;
         state.exact_abort_completed = true;
-        self.presentation_authorization
+        state
+            .presentation_authorization
             .store(false, Ordering::Release);
         self.abort_completed.notify_all();
     }
 
     fn try_publish(&self) -> Option<Arc<AtomicBool>> {
         let state = self.state.lock().ok()?;
-        if !state.open || !self.presentation_authorization.load(Ordering::Acquire) {
+        if !state.open || !state.presentation_authorization.load(Ordering::Acquire) {
             return None;
         }
-        Some(Arc::clone(&self.presentation_authorization))
+        Some(Arc::clone(&state.presentation_authorization))
     }
 
     fn abort_exact_and_wait(
@@ -1425,6 +1472,10 @@ impl fmt::Debug for NativeSessionControl {
 }
 
 impl NativeSessionControl {
+    fn invalidate_retained_presentation(&self) {
+        self.gate.invalidate_retained_presentation();
+    }
+
     fn abort_exact_and_wait(&self) {
         self.gate
             .abort_exact_and_wait(self.abort.as_ref(), self.session);
@@ -1659,6 +1710,10 @@ pub(crate) enum NativeCaptureSourceEvent {
         descriptor: FrameDescriptor,
         metadata: DesktopMetadata,
     },
+    ProtectedContentMasked {
+        identity: NativeCaptureEventIdentity,
+        status: NativeCaptureStatus,
+    },
     DisplayChanged {
         identity: NativeCaptureEventIdentity,
         descriptor: FrameDescriptor,
@@ -1690,6 +1745,7 @@ impl NativeCaptureSourceEvent {
     const fn identity(&self) -> NativeCaptureEventIdentity {
         match self {
             Self::FrameAvailable { identity, .. }
+            | Self::ProtectedContentMasked { identity, .. }
             | Self::DisplayChanged { identity, .. }
             | Self::AccessLost { identity, .. }
             | Self::PermissionRevoked { identity, .. }
@@ -1769,6 +1825,23 @@ impl NativeFrameDetachRequest {
     const fn reservation_id(&self) -> NativeDestinationReservationId {
         self.reservation
     }
+    #[must_use]
+    pub(crate) fn fail_native(self, failure: NativeCaptureFailure) -> NativeFrameDetachError {
+        NativeFrameDetachError::Native {
+            failure,
+            reservation: self.reservation,
+            lease: self.lease,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn fail_contract(self, error: WindowsBackendError) -> NativeFrameDetachError {
+        NativeFrameDetachError::Contract {
+            error,
+            reservation: self.reservation,
+            lease: self.lease,
+        }
+    }
 
     fn complete(
         self,
@@ -1792,19 +1865,37 @@ impl NativeFrameDetachRequest {
         ledger: CopyLedger,
         payload: Option<Box<dyn SurfacePayload>>,
     ) -> Result<NativeFrameDetachResult, NativeFrameDetachError> {
-        let imported = import_capture_frame(
-            self.lease,
-            self.source_descriptor,
-            self.destination,
+        let identity = self.identity;
+        let frame = self.frame;
+        let reservation = self.reservation;
+        let source_descriptor = self.source_descriptor;
+        let destination = self.destination;
+        let source_observed_epoch = self.source_observed_epoch;
+        let metadata = self.metadata;
+        let lease = self.lease;
+
+        let imported = match import_capture_frame(
+            lease,
+            source_descriptor,
+            destination,
             ledger,
-            self.source_observed_epoch,
-            self.metadata,
+            source_observed_epoch,
+            metadata,
             payload,
-        )?;
+        ) {
+            Ok(imported) => imported,
+            Err((error, lease)) => {
+                return Err(NativeFrameDetachError::Contract {
+                    error,
+                    reservation,
+                    lease,
+                });
+            }
+        };
         Ok(NativeFrameDetachResult {
-            identity: self.identity,
-            frame: self.frame,
-            reservation: self.reservation,
+            identity,
+            frame,
+            reservation,
             imported,
         })
     }
@@ -1820,21 +1911,31 @@ pub(crate) struct NativeFrameDetachResult {
     imported: ImportedWindowsFrame,
 }
 
+/// Failure outcome of a frame detach request.
+///
+/// Retains the exact destination reservation and capture lease until synchronous
+/// native quiescence has completed, preventing early reuse of the pool slot while
+/// GPU/native operations could still be touching native memory.
 #[derive(Debug)]
 pub(crate) enum NativeFrameDetachError {
-    Native(NativeCaptureFailure),
-    Contract(WindowsBackendError),
+    Native {
+        failure: NativeCaptureFailure,
+        reservation: NativeDestinationReservationId,
+        lease: CaptureLease,
+    },
+    Contract {
+        error: WindowsBackendError,
+        reservation: NativeDestinationReservationId,
+        lease: CaptureLease,
+    },
 }
-
-impl From<NativeCaptureFailure> for NativeFrameDetachError {
-    fn from(error: NativeCaptureFailure) -> Self {
-        Self::Native(error)
-    }
-}
-
-impl From<WindowsBackendError> for NativeFrameDetachError {
-    fn from(error: WindowsBackendError) -> Self {
-        Self::Contract(error)
+impl NativeFrameDetachError {
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) const fn reservation(&self) -> NativeDestinationReservationId {
+        match self {
+            Self::Native { reservation, .. } | Self::Contract { reservation, .. } => *reservation,
+        }
     }
 }
 
@@ -1880,7 +1981,7 @@ impl NativeCaptureStopReceipt {
     }
 }
 
-mod native_capture_source_seal {
+pub(crate) mod native_capture_source_seal {
     pub trait Sealed {}
 }
 
@@ -1935,6 +2036,27 @@ pub struct WindowsCaptureBackend {
 }
 
 impl WindowsCaptureBackend {
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(windows)]
+    pub fn new_desktop_duplication(
+        binding: AgentBinding,
+        broker: Arc<Mutex<PerUserAgentBroker>>,
+        pool: SurfacePool,
+        destination: WindowsCaptureDestination,
+        adapter_index: u32,
+        output_index: u32,
+    ) -> Result<Self, WindowsBackendError> {
+        let source = DesktopDuplicationCaptureSource::new(adapter_index, output_index)?;
+        Ok(Self::new_desktop_output(
+            true,
+            binding,
+            broker,
+            pool,
+            destination,
+            Box::new(source),
+        ))
+    }
+
     #[must_use]
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new_desktop_output(
@@ -2391,6 +2513,113 @@ impl WindowsCaptureBackend {
         self.record_native_failure(failure);
         platform
     }
+    fn abort_exact_and_wait(&mut self) {
+        if let Some(control) = &self.active_control {
+            control.abort_exact_and_wait();
+        } else if let Some(identity) = self.active_session {
+            self.source.abort_handle().abort(Some(identity.session));
+        }
+    }
+
+    fn quiesce_generation_with_request(
+        &mut self,
+        permit: &AgentOperationPermit,
+        request: NativeFrameDetachRequest,
+    ) -> Result<(), PlatformError> {
+        let result = self.quiesce_generation_with_permit(permit);
+        if result.is_err() {
+            self.abort_exact_and_wait();
+            self.finish_source_quiescence(ProviderState::Stopped);
+        }
+        drop(request);
+        result
+    }
+
+    fn revoke_wgc_with_request(
+        &mut self,
+        request: NativeFrameDetachRequest,
+    ) -> Result<Option<CaptureEvent>, PlatformError> {
+        let result = self.revoke_wgc_with_permit();
+        if result.is_err() {
+            self.abort_exact_and_wait();
+            self.finish_source_quiescence(ProviderState::Revoked);
+            self.wgc_authorization = None;
+            self.selector.diagnostics.last_error = Some("WGC authorization revoked".into());
+        }
+        drop(request);
+        result
+    }
+
+    fn fail_detach_native_with_permit(
+        &mut self,
+        failure: NativeCaptureFailure,
+        lease: CaptureLease,
+    ) -> PlatformError {
+        let platform = failure.platform_error();
+        self.record_native_failure(failure);
+        let terminal = match failure.kind {
+            NativeCaptureFailureKind::AccessLost => {
+                let Some(observed_at_ns) = failure.observed_at_ns else {
+                    if self.stop_source_with_permit(ProviderState::Failed).is_err() {
+                        self.abort_exact_and_wait();
+                        self.finish_source_quiescence(ProviderState::Failed);
+                    }
+                    self.selector.diagnostics.last_error =
+                        Some("native access loss omitted observation time".into());
+                    drop(lease);
+                    return PlatformError::InvalidState;
+                };
+                match self
+                    .selector
+                    .fail(CaptureFailure::AccessLost, observed_at_ns)
+                {
+                    Ok(CaptureRecoveryAction::RecreateAfter { retry_at_ns }) => {
+                        self.recovery_deadline_ns = Some(retry_at_ns);
+                        ProviderState::Reconfiguring
+                    }
+                    _ => ProviderState::Failed,
+                }
+            }
+            NativeCaptureFailureKind::DeviceLost => {
+                let _ = self.selector.fail(CaptureFailure::DeviceRemoved, 0);
+                ProviderState::Failed
+            }
+            NativeCaptureFailureKind::PermissionDenied
+            | NativeCaptureFailureKind::PermissionRevoked => ProviderState::Revoked,
+            _ => ProviderState::Failed,
+        };
+        if self.stop_source_with_permit(terminal).is_err() {
+            self.abort_exact_and_wait();
+            self.finish_source_quiescence(terminal);
+        }
+        self.record_native_failure(failure);
+        drop(lease);
+        platform
+    }
+
+    fn fail_detach_contract_with_permit(
+        &mut self,
+        error: WindowsBackendError,
+        lease: CaptureLease,
+    ) -> PlatformError {
+        let platform = platform_error_for_windows_backend(&error);
+        if self.stop_source_with_permit(ProviderState::Failed).is_err() {
+            self.abort_exact_and_wait();
+            self.finish_source_quiescence(ProviderState::Failed);
+        }
+        self.selector.diagnostics.last_error = Some(match error {
+            WindowsBackendError::DestinationMismatch => {
+                "native frame destination mismatch".to_string()
+            }
+            WindowsBackendError::LedgerEpoch => "native frame ledger epoch mismatch".to_string(),
+            WindowsBackendError::BorrowedDirectAlias => {
+                "native frame rejected direct alias import".to_string()
+            }
+            _ => "native frame detachment contract violation".to_string(),
+        });
+        drop(lease);
+        platform
+    }
 
     fn discard_pending_frame(
         &mut self,
@@ -2487,21 +2716,19 @@ impl WindowsCaptureBackend {
                     Err(error) => return Err(self.fail_contract_with_permit(error)),
                 };
                 if !permit.is_current() {
-                    drop(request);
-                    self.quiesce_generation_with_permit(permit)?;
+                    let _ = self.quiesce_generation_with_request(permit, request);
                     return Err(PlatformError::PermissionRevoked);
                 }
                 if !self.wgc_liveness_is_current() {
-                    drop(request);
-                    return self.revoke_wgc_with_permit();
+                    return self.revoke_wgc_with_request(request);
                 }
                 let result = match self.source.detach_frame(request) {
                     Ok(result) => result,
-                    Err(NativeFrameDetachError::Native(failure)) => {
-                        return Err(self.fail_native_with_permit(failure));
+                    Err(NativeFrameDetachError::Native { failure, lease, .. }) => {
+                        return Err(self.fail_detach_native_with_permit(failure, lease));
                     }
-                    Err(NativeFrameDetachError::Contract(error)) => {
-                        return Err(self.fail_contract_with_permit(error));
+                    Err(NativeFrameDetachError::Contract { error, lease, .. }) => {
+                        return Err(self.fail_detach_contract_with_permit(error, lease));
                     }
                 };
                 if !permit.is_current() {
@@ -2567,6 +2794,34 @@ impl WindowsCaptureBackend {
                     return self.revoke_wgc_with_permit();
                 }
                 Ok(Some(CaptureEvent::Frame(frame)))
+            }
+            NativeCaptureSourceEvent::ProtectedContentMasked { status, .. } => {
+                if self.selector.active() != Some(WindowsCaptureApi::DesktopDuplication) {
+                    return Err(self.fail_native_with_permit(NativeCaptureFailure::new(
+                        NativeCaptureFailureKind::InvalidState,
+                        status,
+                    )));
+                }
+                if let Some(control) = &self.active_control {
+                    control.invalidate_retained_presentation();
+                }
+                self.record_status(status);
+                let CaptureRecoveryAction::SurfaceProtectedContent = self
+                    .selector
+                    .fail(CaptureFailure::ProtectedContent, 0)
+                    .map_err(|error| self.fail_contract_with_permit(error))?
+                else {
+                    return Err(self.fail_contract_with_permit(WindowsBackendError::InvalidState));
+                };
+                if !permit.is_current() {
+                    self.quiesce_generation_with_permit(permit)?;
+                    return Err(PlatformError::PermissionRevoked);
+                }
+                self.selector.diagnostics.last_error =
+                    Some("native capture protected content masked".into());
+                Ok(Some(CaptureEvent::ProtectedContent {
+                    display_epoch: self.selector.display_epoch(),
+                }))
             }
             NativeCaptureSourceEvent::DisplayChanged {
                 descriptor, status, ..
@@ -2919,6 +3174,9 @@ pub struct WindowsEncodeBackend {
     policy: LowDelayPolicy,
     device: DeviceIdentity,
     planner: ContinuityPlanner,
+    native_encoder: Option<cxx::UniquePtr<native::ffi::Encoder>>,
+    output_meta: Option<EncodedFrameMeta>,
+    output_bytes: Vec<u8>,
     completed: bool,
     diagnostics: ProviderDiagnostics,
 }
@@ -2934,6 +3192,9 @@ impl WindowsEncodeBackend {
             policy,
             device,
             planner: ContinuityPlanner::new(codec_epoch, 1),
+            native_encoder: None,
+            output_meta: None,
+            output_bytes: Vec::new(),
             completed: true,
             diagnostics: ProviderDiagnostics::idle("windows_mf_h264_encoder"),
         })
@@ -2946,8 +3207,20 @@ impl WindowsEncodeBackend {
     pub fn device(&self) -> DeviceIdentity {
         self.device
     }
+
     pub fn note_output_drop(&mut self) {
         self.planner.note_output_drop();
+    }
+
+    pub fn request_recovery_point(&mut self) -> Result<(), WindowsBackendError> {
+        self.planner.note_output_drop();
+        if let Some(encoder) = self.native_encoder.as_mut() {
+            let status = native::ffi::encoder_request_idr(encoder.pin_mut());
+            if status != native::STATUS_OK {
+                return Err(WindowsBackendError::InvalidState);
+            }
+        }
+        Ok(())
     }
 
     pub fn reconfigure_epoch(&mut self, codec_epoch: u32) -> Result<(), WindowsBackendError> {
@@ -2966,6 +3239,12 @@ impl WindowsEncodeBackend {
             .accept(annex_b_bytes)
             .map_err(WindowsBackendError::H264)
     }
+
+    pub fn take_output(&mut self) -> Option<(EncodedFrameMeta, Vec<u8>)> {
+        let meta = self.output_meta.take()?;
+        let bytes = std::mem::take(&mut self.output_bytes);
+        Some((meta, bytes))
+    }
 }
 
 impl EncodeBackend for WindowsEncodeBackend {
@@ -2983,7 +3262,54 @@ impl EncodeBackend for WindowsEncodeBackend {
         {
             return Err(submission.reject(PlatformError::InvalidSurface));
         }
+
+        if self.native_encoder.is_none()
+            && preflight.descriptor.memory_domain == MemoryDomain::D3D11
+        {
+            let mut status = native::STATUS_OK;
+            let adapter_index = match self.device {
+                DeviceIdentity::Opaque(idx) => idx as u32,
+                _ => 0,
+            };
+            let encoder = native::ffi::make_mf_h264_encoder(
+                adapter_index,
+                preflight.descriptor.width,
+                preflight.descriptor.height,
+                5_000_000,
+                30,
+                self.policy.max_provider_queue as u32,
+                &mut status,
+            );
+            if status == native::STATUS_OK && !encoder.is_null() {
+                self.native_encoder = Some(encoder);
+            }
+        }
+
         let sub = submission.submit()?;
+
+        if let Some(encoder) = self.native_encoder.as_mut() {
+            if let Some(cxx_surface) = sub
+                .frame()
+                .surface()
+                .payload::<crate::native::CxxSurfacePayload>()
+            {
+                let status = native::ffi::encoder_encode(
+                    encoder.pin_mut(),
+                    cxx_surface.surface(),
+                    preflight.descriptor.capture_sequence,
+                    preflight.descriptor.capture_timestamp_ns,
+                );
+                if status == native::STATUS_QUEUE_FULL {
+                    return Err(sub.reject(PlatformError::QueueFull));
+                }
+                if status != native::STATUS_OK {
+                    return Err(sub.reject(PlatformError::InvalidSurface));
+                }
+                self.completed = false;
+                return Ok(sub);
+            }
+        }
+
         self.completed = true;
         Ok(sub)
     }
@@ -2993,13 +3319,48 @@ impl EncodeBackend for WindowsEncodeBackend {
         _submission: &EncodeSubmission,
     ) -> Result<NativePresentationCompletion, PlatformError> {
         if self.completed {
-            Ok(NativePresentationCompletion::Complete)
-        } else {
-            Ok(NativePresentationCompletion::Pending)
+            return Ok(NativePresentationCompletion::Complete);
         }
+        if let Some(encoder) = self.native_encoder.as_mut() {
+            let mut output_buf = vec![0u8; 2 * 1024 * 1024];
+            let mut output_size = 0usize;
+            let mut is_keyframe = false;
+            let mut capture_sequence = 0u64;
+            let mut timestamp_ns = 0u64;
+
+            let status = native::ffi::encoder_poll_output(
+                encoder.pin_mut(),
+                &mut output_buf,
+                &mut output_size,
+                &mut is_keyframe,
+                &mut capture_sequence,
+                &mut timestamp_ns,
+            );
+
+            if status == native::STATUS_NO_FRAME {
+                return Ok(NativePresentationCompletion::Pending);
+            }
+            if status != native::STATUS_OK {
+                self.completed = true;
+                return Err(PlatformError::InvalidSurface);
+            }
+
+            output_buf.truncate(output_size);
+            if let Ok(meta) = self.planner.accept(&output_buf) {
+                self.output_meta = Some(meta);
+                self.output_bytes = output_buf;
+            }
+            self.completed = true;
+            return Ok(NativePresentationCompletion::Complete);
+        }
+        self.completed = true;
+        Ok(NativePresentationCompletion::Complete)
     }
 
     fn quiesce_encoding(&mut self) -> Result<(), PlatformError> {
+        if let Some(encoder) = self.native_encoder.as_mut() {
+            let _ = native::ffi::encoder_quiesce(encoder.pin_mut());
+        }
         self.completed = true;
         Ok(())
     }
@@ -3748,14 +4109,16 @@ mod tests {
     }
 
     #[test]
-    fn masked_protected_content_keeps_capture_running_and_does_not_back_off() {
+    fn masked_protected_content_invalidates_active_epoch_without_backoff() {
         let mut selector = CaptureSelector::new(WindowsCaptureTarget::DesktopOutput, true, false);
         selector.start(0).expect("start");
+        let old_epoch = selector.display_epoch();
 
         assert_eq!(
             selector.fail(CaptureFailure::ProtectedContent, 10),
             Ok(CaptureRecoveryAction::SurfaceProtectedContent)
         );
+        assert!(selector.display_epoch() > old_epoch);
         assert_eq!(selector.state(), ProviderState::Running);
         assert_eq!(
             selector.active(),
@@ -3935,8 +4298,13 @@ mod tests {
             .expect_err("ledger epoch mismatch");
         assert!(matches!(
             error,
-            NativeFrameDetachError::Contract(WindowsBackendError::LedgerEpoch)
+            NativeFrameDetachError::Contract {
+                error: WindowsBackendError::LedgerEpoch,
+                ..
+            }
         ));
+        assert_eq!(pool.in_use(), 1);
+        drop(error);
         assert_eq!(pool.in_use(), 0);
     }
 
@@ -4859,6 +5227,7 @@ mod lifecycle_review_regressions {
         WrongReservation,
         WrongDestination,
         DirectAlias,
+        FailNativeAfterSubmit,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4888,7 +5257,6 @@ mod lifecycle_review_regressions {
         }
     }
 
-    #[derive(Debug)]
     struct ReviewSourceState {
         starts: Vec<ReviewStartRecord>,
         active_start: Option<NativeCaptureStart>,
@@ -4906,6 +5274,8 @@ mod lifecycle_review_regressions {
         drain_during_start: Option<(Arc<Mutex<PerUserAgentBroker>>, AgentBinding)>,
         drain_during_poll: Option<(Arc<Mutex<PerUserAgentBroker>>, AgentBinding)>,
         finish_during_call: Option<Result<(), WindowsBackendError>>,
+        stop_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+        abort_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     impl Default for ReviewSourceState {
@@ -4927,7 +5297,21 @@ mod lifecycle_review_regressions {
                 drain_during_start: None,
                 drain_during_poll: None,
                 finish_during_call: None,
+                stop_hook: None,
+                abort_hook: None,
             }
+        }
+    }
+    impl fmt::Debug for ReviewSourceState {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("ReviewSourceState")
+                .field("starts", &self.starts)
+                .field("stops", &self.stops)
+                .field("aborts", &self.aborts)
+                .field("discards", &self.discards)
+                .field("detaches", &self.detaches)
+                .field("detach_mode", &self.detach_mode)
+                .finish_non_exhaustive()
         }
     }
 
@@ -4965,6 +5349,11 @@ mod lifecycle_review_regressions {
                 let _ = notify.send(session);
             }
             state.active_start = None;
+            let hook = state.abort_hook.clone();
+            drop(state);
+            if let Some(hook) = hook {
+                hook();
+            }
         }
     }
 
@@ -5054,6 +5443,12 @@ mod lifecycle_review_regressions {
                 state.detaches = state.detaches.saturating_add(1);
                 (state.detach_mode, state.revoke_during_detach.take())
             };
+            if mode == DetachMode::FailNativeAfterSubmit {
+                return Err(request.fail_native(NativeCaptureFailure::new(
+                    NativeCaptureFailureKind::DeviceLost,
+                    status(NativeCaptureOperation::ImportFrame, 0x887A_0005),
+                )));
+            }
             let path = if mode == DetachMode::DirectAlias {
                 ImportPath::DirectAlias
             } else {
@@ -5093,6 +5488,10 @@ mod lifecycle_review_regressions {
         ) -> Result<NativeCaptureStopReceipt, NativeCaptureFailure> {
             let mut state = self.state.lock().expect("source state");
             state.stops = state.stops.saturating_add(1);
+            let hook = state.stop_hook.clone();
+            if let Some(hook) = hook {
+                hook();
+            }
             match state
                 .stop_results
                 .pop_front()
@@ -5838,6 +6237,144 @@ mod lifecycle_review_regressions {
         assert_eq!(source_state.discards, 1);
         assert_eq!(source_state.detaches, 0);
         assert_eq!(backend.state(), ProviderState::Running);
+    }
+
+    #[test]
+    fn masked_native_frame_invalidates_epoch_without_stopping_dda() {
+        let (broker, binding) = authenticated_broker();
+        let source = ReviewNativeSource::new();
+        let state = Arc::clone(&source.state);
+        let mut backend = WindowsCaptureBackend::new_desktop_output(
+            true,
+            binding,
+            broker,
+            SurfacePool::new(1),
+            destination(),
+            Box::new(source),
+        );
+        backend.start().expect("start");
+        let identity = started_identity(&state);
+        let old_epoch = backend.display_epoch();
+        state
+            .lock()
+            .expect("source state")
+            .events
+            .push_back(Ok(Some(NativeCaptureSourceEvent::ProtectedContentMasked {
+                identity,
+                status: status(NativeCaptureOperation::AcquireFrame, 0),
+            })));
+
+        let masked_epoch = match backend.poll(0).expect("masked frame") {
+            Some(CaptureEvent::ProtectedContent { display_epoch }) => display_epoch,
+            event => panic!("unexpected masked-frame event: {event:?}"),
+        };
+        assert!(masked_epoch > old_epoch);
+        state
+            .lock()
+            .expect("source state")
+            .events
+            .push_back(Ok(Some(frame_event(identity, masked_epoch, 2))));
+        assert!(matches!(
+            backend.poll(0).expect("post-mask frame"),
+            Some(CaptureEvent::Frame(_))
+        ));
+        assert_eq!(backend.state(), ProviderState::Running);
+        let source_state = state.lock().expect("source state");
+        assert_eq!(source_state.stops, 0);
+        assert_eq!(source_state.detaches, 1);
+    }
+
+    #[test]
+    fn protected_content_invalidates_retained_presentation_and_keeps_dda_live() {
+        let (broker, binding) = authenticated_broker();
+        let source = ReviewNativeSource::new();
+        let state = Arc::clone(&source.state);
+        let pool = SurfacePool::new(2);
+        let destination = destination();
+
+        let mut backend = WindowsCaptureBackend::new_desktop_output(
+            true,
+            binding,
+            broker,
+            pool,
+            destination,
+            Box::new(source),
+        );
+
+        backend.start().expect("start backend");
+        let identity = started_identity(&state);
+        let epoch = backend.display_epoch();
+
+        // 1. Publish a frame before protected content event
+        state
+            .lock()
+            .expect("source state")
+            .events
+            .push_back(Ok(Some(frame_event(identity, epoch, 1))));
+
+        let mut publisher = CaptureFramePublisher::new();
+        let frame = match backend
+            .poll_with_publisher(0, &mut publisher)
+            .expect("poll frame")
+        {
+            Some(CaptureEvent::Frame(frame)) => frame,
+            other => panic!("expected frame, got {other:?}"),
+        };
+
+        // 2. Deliver ProtectedContentMasked event
+        state
+            .lock()
+            .expect("source state")
+            .events
+            .push_back(Ok(Some(NativeCaptureSourceEvent::ProtectedContentMasked {
+                identity,
+                status: status(NativeCaptureOperation::AcquireFrame, 0),
+            })));
+
+        let masked_event = backend
+            .poll_with_publisher(0, &mut publisher)
+            .expect("poll protected content");
+        assert!(matches!(
+            masked_event,
+            Some(CaptureEvent::ProtectedContent { .. })
+        ));
+
+        // 3. Old retained frame must fail presentation authorization
+        assert_rejected_before_presentation(frame, 1);
+
+        // 4. DDA backend is still running
+        assert_eq!(backend.state(), ProviderState::Running);
+
+        // 5. Subsequent post-mask frame can be published and presented
+        let new_epoch = backend.display_epoch();
+        assert!(new_epoch > epoch);
+        state
+            .lock()
+            .expect("source state")
+            .events
+            .push_back(Ok(Some(frame_event(identity, new_epoch, 2))));
+
+        let post_mask_frame = match backend
+            .poll_with_publisher(0, &mut publisher)
+            .expect("poll post-mask frame")
+        {
+            Some(CaptureEvent::Frame(frame)) => frame,
+            other => panic!("expected frame, got {other:?}"),
+        };
+
+        let mut queue = PresentationQueue::new(1);
+        let push_result = queue.push(
+            PresentableFrame {
+                surface: post_mask_frame,
+                codec_epoch: 1,
+                frame_id: 2,
+                ready_ns: 1,
+                deadline_ns: 100,
+                recovery_point: true,
+            },
+            2,
+        );
+        assert!(push_result.is_ok(), "post-mask frame must be presentable");
     }
 
     #[test]
@@ -6664,5 +7201,102 @@ mod lifecycle_review_regressions {
 
         coordinator.submit(presentable, 10).expect("submit");
         assert_eq!(coordinator.present_next(10), Err(PlatformError::DeviceLost));
+    }
+
+    #[test]
+    fn detach_error_after_native_submit_prevents_early_reservation_reuse() {
+        let (broker, binding) = authenticated_broker();
+        let source = ReviewNativeSource::new();
+        let state = Arc::clone(&source.state);
+        let pool = SurfacePool::new(1);
+        let pool_clone = pool.clone();
+        state.lock().expect("source state").detach_mode = DetachMode::FailNativeAfterSubmit;
+        state.lock().expect("source state").stop_hook = Some(Arc::new(move || {
+            // While synchronous native quiescence is underway, the reservation MUST STILL be held.
+            assert_eq!(pool_clone.in_use(), 1);
+            // Attempting to reserve from the pool during native quiescence MUST fail with PoolExhausted.
+            assert!(matches!(
+                pool_clone.reserve_destination(destination().reserve_for(descriptor(1)).unwrap()),
+                Err(SurfaceError::PoolExhausted)
+            ));
+        }));
+
+        let mut backend = WindowsCaptureBackend::new_desktop_output(
+            true,
+            binding,
+            broker,
+            pool.clone(),
+            destination(),
+            Box::new(source),
+        );
+        backend.start().expect("start");
+        let identity = started_identity(&state);
+        state
+            .lock()
+            .expect("source state")
+            .events
+            .push_back(Ok(Some(frame_event(identity, 1, 1))));
+
+        assert!(matches!(backend.poll(0), Err(PlatformError::DeviceLost)));
+
+        // After synchronous native quiescence is complete, the reservation is released.
+        assert_eq!(pool.in_use(), 0);
+        assert_eq!(backend.active_api(), None);
+
+        // The reservation is now reusable only AFTER native quiescence has finished.
+        let lease = pool.reserve_destination(destination().reserve_for(descriptor(1)).unwrap());
+        assert!(lease.is_ok());
+        assert_eq!(pool.in_use(), 1);
+    }
+
+    #[test]
+    fn detach_error_with_stop_failure_aborts_and_retains_reservation_until_quiesced() {
+        let (broker, binding) = authenticated_broker();
+        let source = ReviewNativeSource::new();
+        let state = Arc::clone(&source.state);
+        let pool = SurfacePool::new(1);
+        let pool_clone = pool.clone();
+        state.lock().expect("source state").detach_mode = DetachMode::FailNativeAfterSubmit;
+        state
+            .lock()
+            .expect("source state")
+            .stop_results
+            .push_back(Err(NativeCaptureFailure::new(
+                NativeCaptureFailureKind::DeviceLost,
+                status(NativeCaptureOperation::Stop, 0x887A_0005),
+            )));
+        state.lock().expect("source state").abort_hook = Some(Arc::new(move || {
+            assert_eq!(pool_clone.in_use(), 1);
+            assert!(matches!(
+                pool_clone.reserve_destination(destination().reserve_for(descriptor(1)).unwrap()),
+                Err(SurfaceError::PoolExhausted)
+            ));
+        }));
+
+        let mut backend = WindowsCaptureBackend::new_desktop_output(
+            true,
+            binding,
+            broker,
+            pool.clone(),
+            destination(),
+            Box::new(source),
+        );
+        backend.start().expect("start");
+        let identity = started_identity(&state);
+        state
+            .lock()
+            .expect("source state")
+            .events
+            .push_back(Ok(Some(frame_event(identity, 1, 1))));
+
+        assert!(matches!(backend.poll(0), Err(PlatformError::DeviceLost)));
+
+        assert_eq!(state.lock().expect("source state").aborts, 1);
+        assert_eq!(pool.in_use(), 0);
+        assert_eq!(backend.active_api(), None);
+
+        let lease = pool.reserve_destination(destination().reserve_for(descriptor(1)).unwrap());
+        assert!(lease.is_ok());
+        assert_eq!(pool.in_use(), 1);
     }
 }

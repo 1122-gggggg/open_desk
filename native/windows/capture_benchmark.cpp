@@ -1,5 +1,8 @@
 #define _WIN32_WINNT 0x0A00
 #define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -12,10 +15,9 @@
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 #include <winrt/base.h>
 
+#include "capture_color_contract.hpp"
 #include "capture_detach.hpp"
-
 #include "callback_gate.hpp"
-
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -33,8 +35,7 @@
 using Microsoft::WRL::ComPtr;
 namespace Capture = winrt::Windows::Graphics::Capture;
 namespace Direct3D11 = winrt::Windows::Graphics::DirectX::Direct3D11;
-namespace DirectX = winrt::Windows::Graphics::DirectX;
-
+namespace WinRTDirectX = winrt::Windows::Graphics::DirectX;
 namespace {
 constexpr std::uint64_t kCompletionTimeoutSeconds = 30;
 
@@ -204,11 +205,11 @@ class OwnedNv12Pool final {
     content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
     check(video_device_->CreateVideoProcessorEnumerator(&content, &enumerator_),
           "CreateVideoProcessorEnumerator");
+    latencydesk::check_video_processor_format_support(enumerator_.Get());
     check(video_device_->CreateVideoProcessor(enumerator_.Get(), 0, &processor_),
           "CreateVideoProcessor");
-    video_context_->VideoProcessorSetStreamFrameFormat(processor_.Get(), 0,
-                                                        D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
-
+    latencydesk::configure_video_processor_sdr_color_space(
+        video_context_.Get(), processor_.Get(), capture_desc_.Width, capture_desc_.Height);
     slots_.reserve(kOwnedPoolSlots);
     for (std::size_t index = 0; index < kOwnedPoolSlots; ++index) {
       slots_.push_back(create_slot());
@@ -264,7 +265,7 @@ class OwnedNv12Pool final {
     slot.in_flight = true;
     ++metrics_->submitted;
     metrics_->availability_to_submit_ticks.push_back(clock_->now() - available_ticks);
-    metrics_->max_in_flight = std::max(metrics_->max_in_flight, in_flight_count());
+    metrics_->max_in_flight = (std::max)(metrics_->max_in_flight, in_flight_count());
   }
 
   void wait_for_completion(std::size_t slot_index, std::uint64_t timeout_ticks) {
@@ -400,6 +401,7 @@ struct DeviceBundle {
   ComPtr<IDXGIAdapter1> adapter;
   ComPtr<IDXGIOutput> output;
   DXGI_OUTPUT_DESC output_desc{};
+  DXGI_COLOR_SPACE_TYPE display_color_space{DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709};
   ComPtr<ID3D11Device> device;
   ComPtr<ID3D11DeviceContext> context;
   D3D_FEATURE_LEVEL feature_level{};
@@ -412,6 +414,9 @@ DeviceBundle create_device(UINT adapter_index, UINT output_index) {
   check(factory->EnumAdapters1(adapter_index, &bundle.adapter), "EnumAdapters1");
   check(bundle.adapter->EnumOutputs(output_index, &bundle.output), "EnumOutputs");
   check(bundle.output->GetDesc(&bundle.output_desc), "IDXGIOutput::GetDesc");
+  latencydesk::validate_output_rotation(bundle.output_desc.Rotation);
+  bundle.display_color_space = latencydesk::query_output_color_space(bundle.output.Get());
+  latencydesk::validate_display_color_space(bundle.display_color_space);
   UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 #ifndef NDEBUG
   flags |= D3D11_CREATE_DEVICE_DEBUG;
@@ -447,6 +452,7 @@ std::uint64_t run_desktop_duplication(const DeviceBundle& device,
   check(device.output.As(&output1), "Query IDXGIOutput1");
   ComPtr<IDXGIOutputDuplication> duplication;
   check(output1->DuplicateOutput(device.device.Get(), &duplication), "DuplicateOutput");
+  latencydesk::validate_duplication(duplication.Get());
   const std::uint64_t begin_ticks = clock.now();
   const std::uint64_t deadline = wall_deadline(clock, begin_ticks, options);
   while (!should_stop(*metrics, clock, begin_ticks, options)) {
@@ -531,7 +537,7 @@ Capture::GraphicsCaptureItem create_monitor_item(HMONITOR monitor) {
 }
 
 ComPtr<ID3D11Texture2D> unwrap_surface(const Direct3D11::IDirect3DSurface& surface) {
-  auto access = surface.as<IDirect3DDxgiInterfaceAccess>();
+  auto access = surface.as<Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
   ComPtr<ID3D11Texture2D> texture;
   check(access->GetInterface(IID_PPV_ARGS(&texture)), "IDirect3DDxgiInterfaceAccess::GetInterface");
   return texture;
@@ -550,7 +556,7 @@ std::uint64_t run_windows_graphics_capture(const DeviceBundle& device,
   if (size.Width <= 0 || size.Height <= 0) throw std::runtime_error("WGC item has invalid size");
   const auto graphics_device = wrap_device(device.device.Get());
   auto frame_pool = Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
-      graphics_device, DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+      graphics_device, WinRTDirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
       static_cast<int>(kOwnedPoolSlots), size);
   auto session = frame_pool.CreateCaptureSession(item);
   latencydesk::CallbackGate callback_gate;
@@ -643,9 +649,10 @@ std::uint64_t run_windows_graphics_capture(const DeviceBundle& device,
 
 void emit_report(Backend backend,
                  const Options& options,
+                 const DeviceBundle& device,
                  const Clock& clock,
                  const Metrics& metrics,
-                 const OwnedNv12Pool& pool,
+                 OwnedNv12Pool& pool,
                  std::uint64_t elapsed_ticks) {
   const auto p50 = clock.microseconds(percentile(metrics.availability_to_submit_ticks, 50));
   const auto p95 = clock.microseconds(percentile(metrics.availability_to_submit_ticks, 95));
@@ -658,9 +665,13 @@ void emit_report(Backend backend,
                               metrics.dropped_pool_full == 0 && metrics.max_in_flight <= kOwnedPoolSlots;
   std::cout << "{\"experiment\":\"EXP-01\",\"backend\":\"" << backend_name(backend)
             << "\",\"adapter\":" << options.adapter << ",\"output\":" << options.output
+            << ",\"rotation\":\"" << latencydesk::rotation_to_string(device.output_desc.Rotation) << "\""
+            << ",\"display_color_space\":\"" << latencydesk::color_space_to_string(device.display_color_space) << "\""
             << ",\"owned_pool_slots\":" << kOwnedPoolSlots
             << ",\"owned_pool_format\":\"NV12\",\"same_adapter\":true"
             << ",\"copy_path\":\"CopyResource BGRA then D3D11 VideoProcessorBlt NV12\""
+            << ",\"input_colorspace\":\"RGB_Full_0_255\""
+            << ",\"output_colorspace\":\"NV12_Studio_BT709\""
             << ",\"capture_lease_release_proof\":\"D3D11_QUERY_EVENT completion before frame release\""
             << ",\"acquired_frames\":" << metrics.acquired;
   if (backend == Backend::kDesktopDuplication) {
@@ -697,7 +708,7 @@ int wmain(int argc, wchar_t** argv) try {
                                           ? run_desktop_duplication(device, options, clock, &metrics, &pool)
                                           : run_windows_graphics_capture(device, options, clock, &metrics, &pool);
   if (!pool || metrics.completed == 0) throw std::runtime_error("benchmark completed without an owned NV12 frame");
-  emit_report(options.backend, options, clock, metrics, *pool, elapsed_ticks);
+  emit_report(options.backend, options, device, clock, metrics, *pool, elapsed_ticks);
   return EXIT_SUCCESS;
 } catch (const winrt::hresult_error& error) {
   std::wcerr << error.message().c_str() << L'\n';

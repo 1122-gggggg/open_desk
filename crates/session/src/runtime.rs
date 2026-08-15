@@ -76,6 +76,11 @@ pub struct DispatchPermit {
 
 impl DispatchPermit {
     #[must_use]
+    pub const fn from_stamp(stamp: DispatchStamp) -> Self {
+        Self { stamp }
+    }
+
+    #[must_use]
     pub const fn stamp(self) -> DispatchStamp {
         self.stamp
     }
@@ -157,6 +162,14 @@ pub struct ClosedAuthority {
 }
 
 impl ClosedAuthority {
+    #[must_use]
+    pub fn new(input_ledger: InputLedger, release_deadline_ns: u64) -> Self {
+        Self {
+            input_ledger,
+            release_deadline_ns,
+        }
+    }
+
     #[must_use]
     pub const fn release_deadline_ns(&self) -> u64 {
         self.release_deadline_ns

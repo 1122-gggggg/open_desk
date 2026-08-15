@@ -136,6 +136,11 @@ pub enum CaptureEvent {
         descriptor: FrameDescriptor,
     },
     AccessLost,
+    /// The capture API masked protected pixels. The affected display epoch is
+    /// invalidated; the caller must recover before encoding another frame.
+    ProtectedContent {
+        display_epoch: u32,
+    },
     PermissionRevoked,
     EndOfStream,
 }

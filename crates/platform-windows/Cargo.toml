@@ -13,5 +13,11 @@ latencydesk-media = { path = "../media" }
 latencydesk-platform = { path = "../platform" }
 latencydesk-surface = { path = "../surface" }
 
+[target.'cfg(windows)'.dependencies]
+cxx = "=1.0.175"
+
+[build-dependencies]
+cxx-build = "=1.0.175"
+
 [lints]
 workspace = true

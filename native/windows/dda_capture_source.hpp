@@ -77,17 +77,35 @@ class DdaCaptureSource final {
 
   void start();
   [[nodiscard]] std::optional<DdaFrameAvailable> poll(UINT timeout_ms);
-  [[nodiscard]] D3d11OwnedFrame detach_owned();
+  [[nodiscard]] D3d11OwnedFrame detach_owned(UINT destination_format = 0U,
+                                             UINT destination_width = 0U,
+                                             UINT destination_height = 0U);
   void discard_pending();
   void stop() noexcept;
 
+  [[nodiscard]] static D3D11_TEXTURE2D_DESC make_nv12_description(UINT width,
+                                                                  UINT height) noexcept;
+  [[nodiscard]] static D3D11_TEXTURE2D_DESC make_intermediate_description(
+      const D3D11_TEXTURE2D_DESC& description) noexcept;
+
   [[nodiscard]] ID3D11Device* device() const noexcept { return device_.Get(); }
   [[nodiscard]] ID3D11DeviceContext* context() const noexcept { return context_.Get(); }
+  [[nodiscard]] bool is_copy_started() const noexcept { return copy_started_; }
+  [[nodiscard]] bool is_copy_completed() const noexcept { return copy_completed_; }
+  [[nodiscard]] const D3D11_TEXTURE2D_DESC& intermediate_description() const noexcept {
+    return intermediate_description_;
+  }
+  [[nodiscard]] bool is_unusable() const noexcept { return unusable_; }
 
  private:
   void release_pending();
   void require_started() const;
   [[nodiscard]] DdaFrameMetadata read_metadata(const DXGI_OUTDUPL_FRAME_INFO& info) const;
+  void ensure_video_processor(DXGI_FORMAT input_format, DXGI_FORMAT output_format,
+                              UINT width, UINT height);
+  void ensure_intermediate_input(const D3D11_TEXTURE2D_DESC& description);
+  void destroy_unusable() noexcept;
+
 
   UINT adapter_index_;
   UINT output_index_;
@@ -99,6 +117,17 @@ class DdaCaptureSource final {
   D3D11_TEXTURE2D_DESC pending_description_{};
   bool copy_started_{};
   bool copy_completed_{};
+  bool unusable_{};
+  Microsoft::WRL::ComPtr<ID3D11VideoDevice> video_device_;
+  Microsoft::WRL::ComPtr<ID3D11VideoContext> video_context_;
+  Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> video_enumerator_;
+  Microsoft::WRL::ComPtr<ID3D11VideoProcessor> video_processor_;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> intermediate_input_texture_;
+  D3D11_TEXTURE2D_DESC intermediate_description_{};
+  DXGI_FORMAT video_processor_input_format_{};
+  DXGI_FORMAT video_processor_output_format_{};
+  UINT video_processor_width_{};
+  UINT video_processor_height_{};
 };
 
 }  // namespace latencydesk
