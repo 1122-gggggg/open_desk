@@ -296,6 +296,19 @@ fn reconstruct_frame_nv12(width: usize, height: usize, frame_bytes: &[u8]) -> Ve
     nv12
 }
 
+const MAX_FRAMES_PER_PUMP: usize = 4;
+
+fn take_latest_frame<T>(receiver: &mpsc::Receiver<T>) -> Option<T> {
+    let mut latest = None;
+    for _ in 0..MAX_FRAMES_PER_PUMP {
+        match receiver.try_recv() {
+            Ok(frame) => latest = Some(frame),
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
+    latest
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_client_args()?;
     println!("=== LatencyDesk Client ===");
@@ -316,7 +329,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.connect_addr
     );
 
-    let (frame_tx, frame_rx) = mpsc::sync_channel::<ReassembledFrame>(4);
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<ReassembledFrame>(MAX_FRAMES_PER_PUMP);
     let running = Arc::new(AtomicBool::new(true));
 
     // Background network receiver thread
@@ -396,8 +409,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut rendered_frames = 0u64;
 
         while window.pump_messages() {
-            // Check for incoming reassembled frames
-            while let Ok(frame) = frame_rx.try_recv() {
+            if let Some(frame) = take_latest_frame(&frame_rx) {
                 rendered_frames += 1;
                 let nv12_pixels =
                     reconstruct_frame_nv12(width as usize, height as usize, &frame.bytes);
@@ -463,6 +475,17 @@ mod tests {
         .expect("parse");
         assert_eq!(args.connect_addr, "127.0.0.1:9000".parse().unwrap());
         assert!(args.profile_1080p120);
+    }
+
+    #[test]
+    fn bounded_latest_frame_drain_leaves_frames_arriving_during_render_for_next_pump() {
+        let (sender, receiver) = mpsc::sync_channel(5);
+        for frame in 1_u8..=5 {
+            sender.send(frame).expect("queue accepts test frame");
+        }
+
+        assert_eq!(take_latest_frame(&receiver), Some(4));
+        assert_eq!(receiver.try_recv().ok(), Some(5));
     }
 
     fn parse_client_args_from(args: &[&str]) -> Result<ClientArgs, Box<dyn Error>> {
