@@ -399,7 +399,10 @@ class RendererImpl final {
       throw std::runtime_error("failed to create Win32 presentation window");
     }
 
-    ShowWindow(window_, SW_SHOW);
+    ShowWindow(window_, SW_SHOWNORMAL);
+    SetForegroundWindow(window_);
+    BringWindowToTop(window_);
+    SetWindowPos(window_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     UpdateWindow(window_);
 
     Microsoft::WRL::ComPtr<IDXGIFactory2> factory;
