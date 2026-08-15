@@ -213,6 +213,7 @@ pub(crate) mod ffi {
         fn make_d3d11_renderer(width: u32, height: u32, status: &mut u32) -> UniquePtr<Renderer>;
         fn renderer_pump_messages(renderer: Pin<&mut Renderer>) -> bool;
         fn renderer_present(renderer: Pin<&mut Renderer>, surface: &Surface) -> u32;
+        fn renderer_present_nv12(renderer: Pin<&mut Renderer>, pixels: &[u8]) -> u32;
         fn renderer_is_open(renderer: &Renderer) -> bool;
         fn renderer_close(renderer: Pin<&mut Renderer>);
     }

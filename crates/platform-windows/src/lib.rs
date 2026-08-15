@@ -57,6 +57,16 @@ impl D3D11WindowRenderer {
         }
         native::ffi::renderer_is_open(&self.inner)
     }
+    pub fn present_nv12(&mut self, pixels: &[u8]) -> Result<(), WindowsBackendError> {
+        if self.inner.is_null() {
+            return Err(WindowsBackendError::InvalidState);
+        }
+        let status = native::ffi::renderer_present_nv12(self.inner.pin_mut(), pixels);
+        if status != native::STATUS_OK {
+            return Err(WindowsBackendError::InvalidState);
+        }
+        Ok(())
+    }
 
     pub fn close(&mut self) {
         if !self.inner.is_null() {

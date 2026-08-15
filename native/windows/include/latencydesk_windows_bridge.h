@@ -148,6 +148,7 @@ class Renderer final {
 
   [[nodiscard]] bool pump_messages();
   [[nodiscard]] BridgeStatus present(const Surface& surface);
+  [[nodiscard]] BridgeStatus present_nv12(rust::Slice<const std::uint8_t> pixels);
   [[nodiscard]] bool is_open() const noexcept;
   void close() noexcept;
 
@@ -215,6 +216,7 @@ class Input;
 
 [[nodiscard]] bool renderer_pump_messages(Renderer& renderer) noexcept;
 [[nodiscard]] std::uint32_t renderer_present(Renderer& renderer, const Surface& surface) noexcept;
+[[nodiscard]] std::uint32_t renderer_present_nv12(Renderer& renderer, rust::Slice<const std::uint8_t> pixels) noexcept;
 [[nodiscard]] bool renderer_is_open(const Renderer& renderer) noexcept;
 void renderer_close(Renderer& renderer) noexcept;
 [[nodiscard]] std::uint32_t encoder_quiesce(Encoder& encoder) noexcept;

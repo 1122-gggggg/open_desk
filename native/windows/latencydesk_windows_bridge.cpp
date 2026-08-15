@@ -282,6 +282,87 @@ class RendererImpl final {
     return BridgeStatus::Ok;
   }
 
+  [[nodiscard]] BridgeStatus present_nv12(rust::Slice<const std::uint8_t> pixels) {
+    if (!open_ || !swap_chain_ || !context_ || !device_) {
+      return BridgeStatus::InvalidState;
+    }
+    const std::size_t luma_size = static_cast<std::size_t>(width_) * height_;
+    const std::size_t expected_size = luma_size + luma_size / 2;
+    if (pixels.data() == nullptr || pixels.size() < expected_size) {
+      return BridgeStatus::InvalidArgument;
+    }
+
+    if (!dynamic_bgra_texture_) {
+      D3D11_TEXTURE2D_DESC desc{};
+      desc.Width = width_;
+      desc.Height = height_;
+      desc.MipLevels = 1;
+      desc.ArraySize = 1;
+      desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      desc.SampleDesc.Count = 1;
+      desc.SampleDesc.Quality = 0;
+      desc.Usage = D3D11_USAGE_DYNAMIC;
+      desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+      desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+      HRESULT hr = device_->CreateTexture2D(&desc, nullptr, &dynamic_bgra_texture_);
+      if (FAILED(hr)) {
+        return BridgeStatus::DeviceLost;
+      }
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    HRESULT hr = context_->Map(dynamic_bgra_texture_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(hr)) {
+      return BridgeStatus::DeviceLost;
+    }
+
+    const std::uint8_t* src_y = pixels.data();
+    const std::uint8_t* src_uv = pixels.data() + luma_size;
+    std::uint8_t* dst = static_cast<std::uint8_t*>(mapped.pData);
+
+    for (UINT y = 0; y < height_; ++y) {
+      const UINT uv_y = y / 2;
+      const std::uint8_t* row_y = src_y + y * width_;
+      const std::uint8_t* row_uv = src_uv + uv_y * width_;
+      std::uint8_t* row_dst = dst + y * mapped.RowPitch;
+
+      for (UINT x = 0; x < width_; ++x) {
+        const int y_val = static_cast<int>(row_y[x]);
+        const UINT uv_x = (x / 2) * 2;
+        const int u_val = static_cast<int>(row_uv[uv_x]) - 128;
+        const int v_val = static_cast<int>(row_uv[uv_x + 1]) - 128;
+
+        const int r = std::clamp(y_val + static_cast<int>(1.402f * v_val), 0, 255);
+        const int g = std::clamp(y_val - static_cast<int>(0.344136f * u_val + 0.714136f * v_val), 0, 255);
+        const int b = std::clamp(y_val + static_cast<int>(1.772f * u_val), 0, 255);
+
+        const std::size_t px = x * 4;
+        row_dst[px] = static_cast<std::uint8_t>(b);
+        row_dst[px + 1] = static_cast<std::uint8_t>(g);
+        row_dst[px + 2] = static_cast<std::uint8_t>(r);
+        row_dst[px + 3] = 255;
+      }
+    }
+
+    context_->Unmap(dynamic_bgra_texture_.Get(), 0);
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> back_buffer;
+    hr = swap_chain_->GetBuffer(0, IID_PPV_ARGS(&back_buffer));
+    if (FAILED(hr) || !back_buffer) {
+      return BridgeStatus::DeviceLost;
+    }
+
+    context_->CopyResource(back_buffer.Get(), dynamic_bgra_texture_.Get());
+    hr = swap_chain_->Present(0, 0);
+    if (FAILED(hr)) {
+      if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+        return BridgeStatus::DeviceLost;
+      }
+      return BridgeStatus::InternalFailure;
+    }
+    return BridgeStatus::Ok;
+  }
+
   [[nodiscard]] bool is_open() const noexcept {
     return open_ && (window_ != nullptr) && IsWindow(window_);
   }
@@ -366,6 +447,7 @@ class RendererImpl final {
   Microsoft::WRL::ComPtr<ID3D11Device> device_;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
   Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain_;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> dynamic_bgra_texture_;
 };
 
 Renderer::Renderer(std::uint32_t width, std::uint32_t height)
@@ -375,6 +457,7 @@ Renderer::~Renderer() = default;
 
 bool Renderer::pump_messages() { return impl_->pump_messages(); }
 BridgeStatus Renderer::present(const Surface& surface) { return impl_->present(surface); }
+BridgeStatus Renderer::present_nv12(rust::Slice<const std::uint8_t> pixels) { return impl_->present_nv12(pixels); }
 bool Renderer::is_open() const noexcept { return impl_->is_open(); }
 void Renderer::close() noexcept { impl_->close(); }
 
@@ -709,6 +792,10 @@ bool renderer_pump_messages(Renderer& renderer) noexcept {
 
 std::uint32_t renderer_present(Renderer& renderer, const Surface& surface) noexcept {
   return invoke_status([&] { return renderer.present(surface); });
+}
+
+std::uint32_t renderer_present_nv12(Renderer& renderer, rust::Slice<const std::uint8_t> pixels) noexcept {
+  return invoke_status([&] { return renderer.present_nv12(pixels); });
 }
 
 bool renderer_is_open(const Renderer& renderer) noexcept {

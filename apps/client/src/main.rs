@@ -329,19 +329,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut last_ping = Instant::now();
 
         while window.pump_messages() {
-            if last_ping.elapsed() >= Duration::from_secs(1) {
+            if last_ping.elapsed() >= Duration::from_millis(250) {
                 last_ping = Instant::now();
                 let _ = socket.send_to(b"PING", args.connect_addr);
             }
 
             while let Ok((len, peer)) = socket.recv_from(&mut recv_buf) {
-                if peer == args.connect_addr && len > 0 {
+                if peer.ip() == args.connect_addr.ip() && len > 0 {
                     if let Ok(outcome) = reassembler.ingest(&recv_buf[..len], now_ns()) {
                         if let IngestOutcome::Complete(frame) = outcome {
                             received_frames += 1;
+                            let _ = window.present_nv12(&frame.bytes);
                             if received_frames % 60 == 0 {
                                 println!(
-                                    "Streaming active: received frame {} ({} bytes)",
+                                    "Streaming active: received and rendered frame {} ({} bytes)",
                                     frame.header.frame_id,
                                     frame.bytes.len()
                                 );
