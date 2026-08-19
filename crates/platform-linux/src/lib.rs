@@ -26,6 +26,19 @@ use latencydesk_surface::{OwnedSurface, SurfaceError, SurfacePool};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+mod desktop_convert;
+pub use desktop_convert::{
+    bgra_to_nv12_bt601_limited, even_dimension, letterbox_geom, letterbox_scale_bgra,
+    map_letterboxed_pointer, nv12_len, pack_nv12_access_unit, parse_nv12_access_unit, ConvertError,
+    LetterboxGeom,
+};
+
+#[cfg(target_os = "linux")]
+mod x11_desktop;
+#[cfg(target_os = "linux")]
+pub use x11_desktop::{X11DesktopError, X11DesktopSession};
+
 /// Product mode selected before creating an XDG portal session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinuxCaptureMode {

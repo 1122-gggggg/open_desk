@@ -14,5 +14,9 @@ latencydesk-input = { path = "../input" }
 latencydesk-media = { path = "../media" }
 latencydesk-platform = { path = "../platform" }
 latencydesk-surface = { path = "../surface" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13.2", default-features = false, features = ["xtest"] }
+
 [lints]
 workspace = true

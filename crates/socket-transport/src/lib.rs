@@ -24,6 +24,11 @@ use std::time::Duration;
 
 pub const DEFAULT_MAX_SOCKET_DATAGRAM: usize = DEFAULT_MAX_DATAGRAM_BYTES;
 
+/// Deterministic 32-byte shared secret for `--approve` LAN/test sessions.
+/// Used only when product binaries omit `--shared-secret`. Not a production credential.
+pub const APPROVE_LAN_TEST_SECRET: [u8; 32] = *b"LatencyDeskApproveLanTestSecret1";
+
+
 #[derive(Debug)]
 pub struct UdpEndpoint {
     socket: UdpSocket,
@@ -69,6 +74,41 @@ impl UdpEndpoint {
         })
     }
 
+    pub fn bind(local: SocketAddr, max_datagram: usize) -> Result<Self, SocketError> {
+        validate_max(max_datagram)?;
+        let socket = UdpSocket::bind(local).map_err(SocketError::Io)?;
+        Ok(Self {
+            socket,
+            peer: unspecified_peer(local),
+            max_datagram,
+        })
+    }
+
+    pub fn recv_from(&self, buffer: &mut [u8]) -> Result<(usize, SocketAddr), SocketError> {
+        if buffer.len() < self.max_datagram {
+            return Err(SocketError::ReceiveBuffer {
+                required: self.max_datagram,
+                actual: buffer.len(),
+            });
+        }
+        let (read, peer) = self.socket.recv_from(buffer).map_err(SocketError::Io)?;
+        if read == 0 || read > self.max_datagram {
+            return Err(SocketError::DatagramSize(read));
+        }
+        Ok((read, peer))
+    }
+
+    pub fn connect(&mut self, peer: SocketAddr) -> Result<(), SocketError> {
+        self.socket.connect(peer).map_err(SocketError::Io)?;
+        self.peer = peer;
+        Ok(())
+    }
+
+    pub fn local_addr(&self) -> Result<SocketAddr, SocketError> {
+        self.socket.local_addr().map_err(SocketError::Io)
+    }
+
+
     pub fn set_timeout(&self, timeout: Duration) -> Result<(), SocketError> {
         self.socket
             .set_read_timeout(Some(timeout))
@@ -77,6 +117,13 @@ impl UdpEndpoint {
             .set_write_timeout(Some(timeout))
             .map_err(SocketError::Io)
     }
+
+    pub fn set_read_timeout(&self, timeout: Duration) -> Result<(), SocketError> {
+        self.socket
+            .set_read_timeout(Some(timeout))
+            .map_err(SocketError::Io)
+    }
+
 
     pub fn send(&self, datagram: &[u8]) -> Result<usize, SocketError> {
         if datagram.is_empty() || datagram.len() > self.max_datagram {
@@ -126,6 +173,14 @@ fn validate_max(max_datagram: usize) -> Result<(), SocketError> {
     }
     Ok(())
 }
+
+fn unspecified_peer(local: SocketAddr) -> SocketAddr {
+    match local {
+        SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+        SocketAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)),
+    }
+}
+
 
 /// Role in a remote desktop transport session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -556,6 +611,33 @@ impl AuthenticatedDatagramEndpoint {
         Ok(outcome)
     }
 
+    /// Receives one datagram without interpreting handshake or media framing.
+    pub fn receive_raw(&self, buffer: &mut [u8]) -> Result<usize, SocketError> {
+        self.endpoint.receive(buffer)
+    }
+
+
+    /// Sends one datagram only after the session handshake is Active.
+    ///
+    /// Intended for unreliable input envelopes (`LDIN`). This is not the
+    /// reliable LDC1 control path ([`Self::send_control`]).
+    pub fn send_raw(&self, datagram: &[u8]) -> Result<usize, SocketError> {
+        if self.handshake_state != HandshakeState::Active {
+            return Err(SocketError::SessionNotActive);
+        }
+        self.endpoint.send(datagram)
+    }
+
+    pub fn set_timeout(&self, timeout: Duration) -> Result<(), SocketError> {
+        self.endpoint.set_timeout(timeout)
+    }
+
+
+    pub fn set_read_timeout(&self, timeout: Duration) -> Result<(), SocketError> {
+        self.endpoint.set_read_timeout(timeout)
+    }
+
+
     /// Sends a reliable control message with session identity.
     pub fn send_control(
         &mut self,
@@ -940,4 +1022,169 @@ mod tests {
         assert!(dec.target_fps >= 15);
         assert!(dec.target_fps <= 120);
     }
+
+    #[test]
+    fn bind_recv_from_connect_round_trips() {
+        let mut server = UdpEndpoint::bind("127.0.0.1:0".parse().unwrap(), 1_200).expect("bind");
+        server.set_timeout(Duration::from_secs(1)).expect("timeout");
+        let server_addr = server.local_addr().expect("server addr");
+
+        let mut client = UdpEndpoint::bind("127.0.0.1:0".parse().unwrap(), 1_200).expect("bind");
+        client.set_timeout(Duration::from_secs(1)).expect("timeout");
+        client.connect(server_addr).expect("connect");
+        client.send(b"hello-peer").expect("send");
+
+        let mut buffer = vec![0; 1_200];
+        let (read, peer) = server.recv_from(&mut buffer).expect("recv_from");
+        assert_eq!(&buffer[..read], b"hello-peer");
+        server.connect(peer).expect("connect peer");
+        assert_eq!(server.peer(), peer);
+        server.send(b"ack").expect("ack");
+
+        let read = client.receive(&mut buffer).expect("receive");
+        assert_eq!(&buffer[..read], b"ack");
+    }
+
+    #[test]
+    fn receive_raw_completes_authenticated_handshake() {
+        let mut host_udp =
+            UdpEndpoint::bind("127.0.0.1:0".parse().unwrap(), 1_400).expect("host bind");
+        host_udp.set_timeout(Duration::from_secs(1)).expect("to");
+        let host_addr = host_udp.local_addr().expect("host addr");
+
+        let mut client_udp =
+            UdpEndpoint::bind("127.0.0.1:0".parse().unwrap(), 1_400).expect("client bind");
+        client_udp.set_timeout(Duration::from_secs(1)).expect("to");
+        client_udp.connect(host_addr).expect("client connect");
+
+        let mut client = AuthenticatedDatagramEndpoint::new(
+            client_udp,
+            AuthenticatedSessionConfig {
+                role: SessionRole::Client,
+                path_mtu: 1_400,
+                ..Default::default()
+            },
+        )
+        .expect("client");
+
+        let device_fingerprint = [0x42_u8; 32];
+        let client_nonce = [0x11_u8; 16];
+        let server_nonce = [0x22_u8; 16];
+        let shared_secret = [0x33_u8; 32];
+
+        let hello = client
+            .client_initiate_handshake(device_fingerprint, client_nonce)
+            .expect("hello");
+
+        let mut buf = vec![0_u8; 1_400];
+        let (read, peer) = host_udp.recv_from(&mut buf).expect("recv hello");
+        assert_eq!(&buf[..read], hello.as_slice());
+        host_udp.connect(peer).expect("host connect");
+
+        let mut host = AuthenticatedDatagramEndpoint::new(
+            host_udp,
+            AuthenticatedSessionConfig {
+                role: SessionRole::Host,
+                path_mtu: 1_400,
+                ..Default::default()
+            },
+        )
+        .expect("host");
+
+        let hello_ack = host
+            .host_handle_hello(&buf[..read], &[device_fingerprint], server_nonce, 7, 1)
+            .expect("hello_ack");
+
+        let read = client.receive_raw(&mut buf).expect("recv hello_ack");
+        assert_eq!(&buf[..read], hello_ack.as_slice());
+        let auth = client
+            .client_handle_hello_ack(&buf[..read], &shared_secret)
+            .expect("auth");
+
+        let read = host.receive_raw(&mut buf).expect("recv auth");
+        assert_eq!(&buf[..read], auth.as_slice());
+        let completed = host
+            .host_handle_authenticate(&buf[..read], &shared_secret)
+            .expect("completed");
+
+        let read = client.receive_raw(&mut buf).expect("recv completed");
+        assert_eq!(&buf[..read], completed.as_slice());
+        client
+            .client_handle_handshake_completed(&buf[..read])
+            .expect("active");
+
+        assert_eq!(client.handshake_state(), HandshakeState::Active);
+        assert_eq!(host.handshake_state(), HandshakeState::Active);
+        assert_eq!(client.session_id(), 7);
+        assert_eq!(host.session_id(), 7);
+    }
+
+    #[test]
+    fn send_raw_after_handshake_round_trips() {
+        let (left_sock, right_sock) = UdpEndpoint::connected_pair(1_400).expect("pair");
+        left_sock.set_timeout(Duration::from_secs(1)).expect("to");
+        right_sock.set_timeout(Duration::from_secs(1)).expect("to");
+
+        let mut client = AuthenticatedDatagramEndpoint::new(
+            left_sock,
+            AuthenticatedSessionConfig {
+                role: SessionRole::Client,
+                path_mtu: 1_400,
+                ..Default::default()
+            },
+        )
+        .expect("client");
+        let mut host = AuthenticatedDatagramEndpoint::new(
+            right_sock,
+            AuthenticatedSessionConfig {
+                role: SessionRole::Host,
+                path_mtu: 1_400,
+                ..Default::default()
+            },
+        )
+        .expect("host");
+
+        let device_fingerprint = [0x55_u8; 32];
+        let hello = client
+            .client_initiate_handshake(device_fingerprint, [0xAA; 16])
+            .expect("hello");
+        let mut buf = vec![0_u8; 1_400];
+        let read = host.receive_raw(&mut buf).expect("recv hello");
+        assert_eq!(&buf[..read], hello.as_slice());
+        let hello_ack = host
+            .host_handle_hello(&buf[..read], &[device_fingerprint], [0xBB; 16], 9, 1)
+            .expect("hello_ack");
+        let read = client.receive_raw(&mut buf).expect("recv hello_ack");
+        assert_eq!(&buf[..read], hello_ack.as_slice());
+        let auth = client
+            .client_handle_hello_ack(&buf[..read], &[0x77; 32])
+            .expect("auth");
+        let read = host.receive_raw(&mut buf).expect("recv auth");
+        assert_eq!(&buf[..read], auth.as_slice());
+        let completed = host
+            .host_handle_authenticate(&buf[..read], &[0x77; 32])
+            .expect("completed");
+        let read = client.receive_raw(&mut buf).expect("recv completed");
+        assert_eq!(&buf[..read], completed.as_slice());
+        client
+            .client_handle_handshake_completed(&buf[..read])
+            .expect("active");
+
+        assert_eq!(client.handshake_state(), HandshakeState::Active);
+        assert_eq!(host.handshake_state(), HandshakeState::Active);
+
+        let payload = b"LD";
+        let sent = client.send_raw(payload).expect("send_raw");
+        assert_eq!(sent, payload.len());
+        let read = host.receive_raw(&mut buf).expect("receive_raw");
+        assert_eq!(&buf[..read], payload);
+
+        client.handshake_state = HandshakeState::Initial;
+        assert!(matches!(
+            client.send_raw(payload),
+            Err(SocketError::SessionNotActive)
+        ));
+    }
+
+
 }

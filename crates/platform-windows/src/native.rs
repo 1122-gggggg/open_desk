@@ -214,8 +214,10 @@ pub(crate) mod ffi {
         fn renderer_pump_messages(renderer: Pin<&mut Renderer>) -> bool;
         fn renderer_present(renderer: Pin<&mut Renderer>, surface: &Surface) -> u32;
         fn renderer_present_nv12(renderer: Pin<&mut Renderer>, pixels: &[u8]) -> u32;
+        fn renderer_poll_inputs(renderer: Pin<&mut Renderer>, out: &mut [u8]) -> u32;
         fn renderer_is_open(renderer: &Renderer) -> bool;
         fn renderer_close(renderer: Pin<&mut Renderer>);
+
     }
 }
 

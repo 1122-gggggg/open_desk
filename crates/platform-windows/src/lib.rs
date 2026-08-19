@@ -27,7 +27,30 @@ use std::sync::{Arc, Condvar, Mutex};
 
 #[cfg(windows)]
 mod native;
+
 #[cfg(windows)]
+pub const WINDOW_INPUT_EVENT_BYTES: usize = 20;
+#[cfg(windows)]
+pub const INPUT_KIND_MOUSE_MOVE: u8 = 1;
+#[cfg(windows)]
+pub const INPUT_KIND_BUTTON: u8 = 2;
+#[cfg(windows)]
+pub const INPUT_KIND_KEY: u8 = 3;
+#[cfg(windows)]
+pub const INPUT_KIND_WHEEL: u8 = 4;
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowInputEvent {
+    pub kind: u8,
+    pub button: u8,
+    pub pressed: bool,
+    pub x: i32,
+    pub y: i32,
+    pub wheel: i32,
+    pub vk: u32,
+}
+
 #[cfg(windows)]
 pub struct D3D11WindowRenderer {
     inner: cxx::UniquePtr<native::ffi::Renderer>,
@@ -67,6 +90,31 @@ impl D3D11WindowRenderer {
         }
         Ok(())
     }
+
+    pub fn poll_inputs(&mut self, max_events: usize) -> Vec<WindowInputEvent> {
+        if self.inner.is_null() || max_events == 0 {
+            return Vec::new();
+        }
+        let mut buf = vec![0u8; max_events.saturating_mul(WINDOW_INPUT_EVENT_BYTES)];
+        let count = native::ffi::renderer_poll_inputs(self.inner.pin_mut(), &mut buf) as usize;
+        let count = count.min(max_events);
+        let mut events = Vec::with_capacity(count);
+        for index in 0..count {
+            let offset = index * WINDOW_INPUT_EVENT_BYTES;
+            let rec = &buf[offset..offset + WINDOW_INPUT_EVENT_BYTES];
+            events.push(WindowInputEvent {
+                kind: rec[0],
+                button: rec[1],
+                pressed: rec[2] != 0,
+                x: i32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]),
+                y: i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]),
+                wheel: i32::from_le_bytes([rec[12], rec[13], rec[14], rec[15]]),
+                vk: u32::from_le_bytes([rec[16], rec[17], rec[18], rec[19]]),
+            });
+        }
+        events
+    }
+
 
     pub fn close(&mut self) {
         if !self.inner.is_null() {
@@ -3536,6 +3584,36 @@ pub fn hid_usage_to_win32_vk(usage: u16) -> (u16, bool) {
         other => (other, false),
     }
 }
+
+/// Maps a useful Win32 virtual-key subset back to USB HID keyboard usages.
+#[must_use]
+pub fn win32_vk_to_hid_usage(vk: u16) -> Option<u16> {
+    match vk {
+        0x41..=0x5A => Some(0x04 + (vk - 0x41)),
+        0x31..=0x39 => Some(0x1E + (vk - 0x31)),
+        0x30 => Some(0x27),
+        0x0D => Some(0x28),
+        0x1B => Some(0x29),
+        0x08 => Some(0x2A),
+        0x09 => Some(0x2B),
+        0x20 => Some(0x2C),
+        0x10 | 0xA0 => Some(0xE1),
+        0x11 | 0xA2 => Some(0xE0),
+        0x12 | 0xA4 => Some(0xE2),
+        0x5B => Some(0xE3),
+        0xA1 => Some(0xE5),
+        0xA3 => Some(0xE4),
+        0xA5 => Some(0xE6),
+        0x5C => Some(0xE7),
+        0x25 => Some(0x50),
+        0x26 => Some(0x52),
+        0x27 => Some(0x4F),
+        0x28 => Some(0x51),
+        0x70..=0x7B => Some(0x3A + (vk - 0x70)),
+        _ => None,
+    }
+}
+
 
 /// Converts a reconciled [`AppliedInput`] action into equivalent Win32 `INPUT` structures.
 pub fn applied_input_to_win32(action: AppliedInput) -> Result<Vec<Win32Input>, PlatformError> {

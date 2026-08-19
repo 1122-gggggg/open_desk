@@ -4,9 +4,13 @@
 #include "mf_h264_encoder.hpp"
 
 #include <windows.h>
+#include <windowsx.h>
 #include <werapi.h>
 
+#include <algorithm>
 #include <array>
+#include <cstring>
+#include <deque>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -16,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+
 
 namespace latencydesk::windows_bridge {
 BridgeStatus status_from_hresult(long status) noexcept {
@@ -237,6 +242,23 @@ BridgeStatus Encoder::quiesce() noexcept { return impl_->quiesce(); }
 
 class RendererImpl final {
  public:
+  static constexpr std::uint8_t kKindMouseMove = 1;
+  static constexpr std::uint8_t kKindButton = 2;
+  static constexpr std::uint8_t kKindKey = 3;
+  static constexpr std::uint8_t kKindWheel = 4;
+  static constexpr std::size_t kInputEventBytes = 20;
+  static constexpr std::size_t kInputQueueCap = 64;
+
+  struct QueuedInput {
+    std::uint8_t kind;
+    std::uint8_t button;
+    std::uint8_t pressed;
+    std::int32_t x;
+    std::int32_t y;
+    std::int32_t wheel;
+    std::uint32_t vk;
+  };
+
   RendererImpl(std::uint32_t width, std::uint32_t height)
       : width_(width == 0 ? 1920 : width), height_(height == 0 ? 1080 : height), open_(true) {
     initialize();
@@ -363,6 +385,29 @@ class RendererImpl final {
     return BridgeStatus::Ok;
   }
 
+  [[nodiscard]] std::uint32_t poll_inputs(rust::Slice<std::uint8_t> out) {
+    if (out.data() == nullptr || out.size() < kInputEventBytes) {
+      return 0;
+    }
+    const std::size_t max_events = out.size() / kInputEventBytes;
+    std::uint32_t written = 0;
+    while (written < max_events && !input_queue_.empty()) {
+      const QueuedInput ev = input_queue_.front();
+      input_queue_.pop_front();
+      std::uint8_t* dst = out.data() + static_cast<std::size_t>(written) * kInputEventBytes;
+      dst[0] = ev.kind;
+      dst[1] = ev.button;
+      dst[2] = ev.pressed;
+      dst[3] = 0;
+      std::memcpy(dst + 4, &ev.x, 4);
+      std::memcpy(dst + 8, &ev.y, 4);
+      std::memcpy(dst + 12, &ev.wheel, 4);
+      std::memcpy(dst + 16, &ev.vk, 4);
+      ++written;
+    }
+    return written;
+  }
+
   [[nodiscard]] bool is_open() const noexcept {
     return open_ && (window_ != nullptr) && IsWindow(window_);
   }
@@ -373,28 +418,137 @@ class RendererImpl final {
     context_ = nullptr;
     device_ = nullptr;
     if (window_ != nullptr) {
+      SetWindowLongPtrW(window_, GWLP_USERDATA, 0);
       DestroyWindow(window_);
       window_ = nullptr;
     }
   }
 
  private:
+  static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    RendererImpl* self = nullptr;
+    if (msg == WM_NCCREATE) {
+      auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+      self = static_cast<RendererImpl*>(create->lpCreateParams);
+      SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+    } else {
+      self = reinterpret_cast<RendererImpl*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    }
+    if (self != nullptr) {
+      self->on_message(msg, wparam, lparam);
+    }
+    if (msg == WM_DESTROY) {
+      PostQuitMessage(0);
+      return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+  }
+
+  void on_message(UINT msg, WPARAM wparam, LPARAM lparam) {
+    switch (msg) {
+      case WM_MOUSEMOVE: {
+        int x = GET_X_LPARAM(lparam);
+        int y = GET_Y_LPARAM(lparam);
+        map_client(x, y);
+        push_input(QueuedInput{kKindMouseMove, 0, 0, x, y, 0, 0});
+        break;
+      }
+      case WM_LBUTTONDOWN:
+      case WM_LBUTTONUP:
+      case WM_RBUTTONDOWN:
+      case WM_RBUTTONUP:
+      case WM_MBUTTONDOWN:
+      case WM_MBUTTONUP: {
+        const bool pressed =
+            msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
+        std::uint8_t button = 1;
+        if (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP) {
+          button = 2;
+        } else if (msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP) {
+          button = 3;
+        }
+        int x = GET_X_LPARAM(lparam);
+        int y = GET_Y_LPARAM(lparam);
+        map_client(x, y);
+        if (pressed) {
+          SetCapture(window_);
+        } else if (GetCapture() == window_) {
+          ReleaseCapture();
+        }
+        push_input(QueuedInput{kKindButton, button, static_cast<std::uint8_t>(pressed ? 1 : 0), x, y, 0, 0});
+        break;
+      }
+      case WM_MOUSEWHEEL: {
+        const int delta = GET_WHEEL_DELTA_WPARAM(wparam);
+        int ticks = delta / WHEEL_DELTA;
+        if (ticks == 0) {
+          ticks = delta > 0 ? 1 : -1;
+        }
+        POINT pt{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        ScreenToClient(window_, &pt);
+        int x = pt.x;
+        int y = pt.y;
+        map_client(x, y);
+        push_input(QueuedInput{kKindWheel, 0, 0, x, y, ticks, 0});
+        break;
+      }
+      case WM_KEYDOWN:
+      case WM_SYSKEYDOWN: {
+        if ((lparam & (1 << 30)) != 0) {
+          break;
+        }
+        push_input(QueuedInput{kKindKey, 0, 1, 0, 0, 0, static_cast<std::uint32_t>(wparam)});
+        break;
+      }
+      case WM_KEYUP:
+      case WM_SYSKEYUP:
+        push_input(QueuedInput{kKindKey, 0, 0, 0, 0, 0, static_cast<std::uint32_t>(wparam)});
+        break;
+      case WM_CLOSE:
+        open_ = false;
+        break;
+      default:
+        break;
+    }
+  }
+
+  void map_client(int& x, int& y) const {
+    if (window_ == nullptr) {
+      return;
+    }
+    RECT rc{};
+    GetClientRect(window_, &rc);
+    const int client_w = rc.right - rc.left;
+    const int client_h = rc.bottom - rc.top;
+    if (client_w > 0 && client_h > 0 && width_ > 0 && height_ > 0) {
+      x = static_cast<int>((static_cast<std::int64_t>(x) * width_) / client_w);
+      y = static_cast<int>((static_cast<std::int64_t>(y) * height_) / client_h);
+    }
+  }
+
+  void push_input(const QueuedInput& ev) {
+    if (input_queue_.size() >= kInputQueueCap) {
+      input_queue_.pop_front();
+    }
+    input_queue_.push_back(ev);
+  }
+
   void initialize() {
     WNDCLASSW wc{};
-    wc.lpfnWndProc = DefWindowProcW;
+    wc.lpfnWndProc = WndProc;
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
-    wc.lpszClassName = L"LatencyDeskRendererWindowClass";
+    wc.lpszClassName = L"LatencyDeskRendererWindowClassV2";
     RegisterClassW(&wc);
 
     RECT client_rect{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
     AdjustWindowRectEx(&client_rect, WS_OVERLAPPEDWINDOW, FALSE, 0);
 
     window_ = CreateWindowExW(
-        0, L"LatencyDeskRendererWindowClass", L"LatencyDesk Remote Desktop (1080p120)",
+        0, L"LatencyDeskRendererWindowClassV2", L"LatencyDesk Remote Desktop",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
         client_rect.right - client_rect.left, client_rect.bottom - client_rect.top,
-        nullptr, nullptr, wc.hInstance, nullptr);
+        nullptr, nullptr, wc.hInstance, this);
     if (window_ == nullptr) {
       throw std::runtime_error("failed to create Win32 presentation window");
     }
@@ -420,6 +574,7 @@ class RendererImpl final {
                            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                            feature_levels, ARRAYSIZE(feature_levels),
                            D3D11_SDK_VERSION, &device_, &selected_level, &context_);
+
     if (FAILED(hr)) {
       throw std::runtime_error("D3D11CreateDevice failed for presentation renderer");
     }
@@ -451,7 +606,9 @@ class RendererImpl final {
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
   Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain_;
   Microsoft::WRL::ComPtr<ID3D11Texture2D> dynamic_bgra_texture_;
+  std::deque<QueuedInput> input_queue_;
 };
+
 
 Renderer::Renderer(std::uint32_t width, std::uint32_t height)
     : impl_(std::make_unique<RendererImpl>(width, height)) {}
@@ -461,8 +618,10 @@ Renderer::~Renderer() = default;
 bool Renderer::pump_messages() { return impl_->pump_messages(); }
 BridgeStatus Renderer::present(const Surface& surface) { return impl_->present(surface); }
 BridgeStatus Renderer::present_nv12(rust::Slice<const std::uint8_t> pixels) { return impl_->present_nv12(pixels); }
+std::uint32_t Renderer::poll_inputs(rust::Slice<std::uint8_t> out) { return impl_->poll_inputs(out); }
 bool Renderer::is_open() const noexcept { return impl_->is_open(); }
 void Renderer::close() noexcept { impl_->close(); }
+
 
 class CaptureImpl final {
  public:
@@ -800,6 +959,15 @@ std::uint32_t renderer_present(Renderer& renderer, const Surface& surface) noexc
 std::uint32_t renderer_present_nv12(Renderer& renderer, rust::Slice<const std::uint8_t> pixels) noexcept {
   return invoke_status([&] { return renderer.present_nv12(pixels); });
 }
+
+std::uint32_t renderer_poll_inputs(Renderer& renderer, rust::Slice<std::uint8_t> out) noexcept {
+  try {
+    return renderer.poll_inputs(out);
+  } catch (...) {
+    return 0;
+  }
+}
+
 
 bool renderer_is_open(const Renderer& renderer) noexcept {
   return renderer.is_open();
