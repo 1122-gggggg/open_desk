@@ -51,15 +51,40 @@ pub fn fragment_frame(
     max_datagram_bytes: usize,
 ) -> Result<Vec<Vec<u8>>, TransportError> {
     validate_datagram_mtu(max_datagram_bytes)?;
+    fragment_frame_impl(spec, frame, max_datagram_bytes)
+}
+
+/// Splits one access unit using the byte budget available to the encoded
+/// [`MediaPacket`].
+///
+/// Unlike [`fragment_frame`], this accepts a packet budget smaller than the
+/// internet-safe path MTU. QUIC providers should subtract their outer framing
+/// overhead from the path's datagram limit before calling this function.
+pub fn fragment_frame_with_packet_budget(
+    spec: FragmentSpec,
+    frame: &[u8],
+    max_media_packet_bytes: usize,
+) -> Result<Vec<Vec<u8>>, TransportError> {
+    if !(MEDIA_HEADER_LEN + 1..=MAX_DATAGRAM_MTU).contains(&max_media_packet_bytes) {
+        return Err(TransportError::DatagramMtu(max_media_packet_bytes));
+    }
+    fragment_frame_impl(spec, frame, max_media_packet_bytes)
+}
+
+fn fragment_frame_impl(
+    spec: FragmentSpec,
+    frame: &[u8],
+    max_media_packet_bytes: usize,
+) -> Result<Vec<Vec<u8>>, TransportError> {
     if frame.is_empty() || frame.len() > MAX_FRAME_BYTES as usize {
         return Err(TransportError::FrameLength(frame.len()));
     }
-    if max_datagram_bytes <= MEDIA_HEADER_LEN {
-        return Err(TransportError::DatagramMtu(max_datagram_bytes));
-    }
-    let payload_cap = max_datagram_bytes - MEDIA_HEADER_LEN;
+    let payload_cap = max_media_packet_bytes
+        .checked_sub(MEDIA_HEADER_LEN)
+        .filter(|payload_cap| *payload_cap > 0)
+        .ok_or(TransportError::DatagramMtu(max_media_packet_bytes))?;
     if payload_cap == 0 || payload_cap > usize::from(MAX_FRAGMENT_BYTES) {
-        return Err(TransportError::DatagramMtu(max_datagram_bytes));
+        return Err(TransportError::DatagramMtu(max_media_packet_bytes));
     }
     let frame_len =
         u32::try_from(frame.len()).map_err(|_| TransportError::FrameLength(frame.len()))?;
@@ -1295,6 +1320,30 @@ mod tests {
     }
 
     #[test]
+    fn packet_budget_round_trip_supports_quic_overhead() {
+        let frame: Vec<u8> = (0..5_000).map(|index| (index % 251) as u8).collect();
+        let mut packets =
+            fragment_frame_with_packet_budget(spec(10), &frame, 1_156).expect("fragment");
+
+        assert!(packets.len() > 1);
+        assert!(packets.iter().all(|packet| packet.len() <= 1_156));
+        packets.reverse();
+
+        let mut reassembler = Reassembler::new(ReassemblyConfig::default()).expect("config");
+        let mut completed = None;
+        for (index, packet) in packets.iter().enumerate() {
+            if let IngestOutcome::Complete(value) = reassembler
+                .ingest(packet, index as u64 * 1_000)
+                .expect("ingest")
+            {
+                completed = Some(value.bytes);
+            }
+        }
+
+        assert_eq!(completed, Some(frame));
+    }
+
+    #[test]
     fn exact_duplicate_is_idempotent() {
         let packets = fragment_frame(spec(1), &[3_u8; 2_000], 1_200).expect("fragment");
         let mut reassembler = Reassembler::new(ReassemblyConfig::default()).expect("config");
@@ -1400,6 +1449,28 @@ mod tests {
         assert_eq!(
             fragment_frame(spec(1), &frame, 1_451),
             Err(TransportError::DatagramMtu(1_451))
+        );
+    }
+
+    #[test]
+    fn fragment_frame_with_packet_budget_validates_bounds() {
+        let frame = [1_u8; 100];
+        assert_eq!(
+            fragment_frame_with_packet_budget(spec(1), &frame, MEDIA_HEADER_LEN),
+            Err(TransportError::DatagramMtu(MEDIA_HEADER_LEN))
+        );
+        assert_eq!(
+            fragment_frame_with_packet_budget(spec(1), &frame, MEDIA_HEADER_LEN - 1),
+            Err(TransportError::DatagramMtu(MEDIA_HEADER_LEN - 1))
+        );
+        assert!(fragment_frame_with_packet_budget(spec(1), &frame, MEDIA_HEADER_LEN + 1).is_ok());
+        assert_eq!(
+            fragment_frame_with_packet_budget(spec(1), &frame, MAX_DATAGRAM_MTU + 1),
+            Err(TransportError::DatagramMtu(MAX_DATAGRAM_MTU + 1))
+        );
+        assert_eq!(
+            fragment_frame(spec(1), &frame, 1_199),
+            Err(TransportError::DatagramMtu(1_199))
         );
     }
 

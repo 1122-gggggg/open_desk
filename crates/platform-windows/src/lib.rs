@@ -38,6 +38,10 @@ pub const INPUT_KIND_BUTTON: u8 = 2;
 pub const INPUT_KIND_KEY: u8 = 3;
 #[cfg(windows)]
 pub const INPUT_KIND_WHEEL: u8 = 4;
+#[cfg(windows)]
+pub const INPUT_KIND_RELEASE_ALL: u8 = 5;
+#[cfg(windows)]
+pub const INPUT_KIND_OVERFLOW: u8 = 6;
 
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,13 +119,13 @@ impl D3D11WindowRenderer {
         events
     }
 
-
     pub fn close(&mut self) {
         if !self.inner.is_null() {
             native::ffi::renderer_close(self.inner.pin_mut());
         }
     }
 }
+#[cfg(windows)]
 pub(crate) use native::DesktopDuplicationCaptureSource;
 
 /// Windows capture API selected for one display session.
@@ -3268,11 +3272,22 @@ pub struct WindowsEncodeBackend {
     policy: LowDelayPolicy,
     device: DeviceIdentity,
     planner: ContinuityPlanner,
+    #[cfg(windows)]
     native_encoder: Option<cxx::UniquePtr<native::ffi::Encoder>>,
     output_meta: Option<EncodedFrameMeta>,
     output_bytes: Vec<u8>,
     completed: bool,
     diagnostics: ProviderDiagnostics,
+}
+
+const ENCODER_STATUS_OK: u32 = 0;
+
+fn apply_encoder_quiesce_status(completed: &mut bool, status: u32) -> Result<(), PlatformError> {
+    if status != ENCODER_STATUS_OK {
+        return Err(PlatformError::InvalidState);
+    }
+    *completed = true;
+    Ok(())
 }
 
 impl WindowsEncodeBackend {
@@ -3286,6 +3301,7 @@ impl WindowsEncodeBackend {
             policy,
             device,
             planner: ContinuityPlanner::new(codec_epoch, 1),
+            #[cfg(windows)]
             native_encoder: None,
             output_meta: None,
             output_bytes: Vec::new(),
@@ -3308,6 +3324,7 @@ impl WindowsEncodeBackend {
 
     pub fn request_recovery_point(&mut self) -> Result<(), WindowsBackendError> {
         self.planner.note_output_drop();
+        #[cfg(windows)]
         if let Some(encoder) = self.native_encoder.as_mut() {
             let status = native::ffi::encoder_request_idr(encoder.pin_mut());
             if status != native::STATUS_OK {
@@ -3357,6 +3374,7 @@ impl EncodeBackend for WindowsEncodeBackend {
             return Err(submission.reject(PlatformError::InvalidSurface));
         }
 
+        #[cfg(windows)]
         if self.native_encoder.is_none()
             && preflight.descriptor.memory_domain == MemoryDomain::D3D11
         {
@@ -3381,6 +3399,7 @@ impl EncodeBackend for WindowsEncodeBackend {
 
         let sub = submission.submit()?;
 
+        #[cfg(windows)]
         if let Some(encoder) = self.native_encoder.as_mut() {
             if let Some(cxx_surface) = sub
                 .frame()
@@ -3415,6 +3434,7 @@ impl EncodeBackend for WindowsEncodeBackend {
         if self.completed {
             return Ok(NativePresentationCompletion::Complete);
         }
+        #[cfg(windows)]
         if let Some(encoder) = self.native_encoder.as_mut() {
             let mut output_buf = vec![0u8; 2 * 1024 * 1024];
             let mut output_size = 0usize;
@@ -3452,11 +3472,14 @@ impl EncodeBackend for WindowsEncodeBackend {
     }
 
     fn quiesce_encoding(&mut self) -> Result<(), PlatformError> {
-        if let Some(encoder) = self.native_encoder.as_mut() {
-            let _ = native::ffi::encoder_quiesce(encoder.pin_mut());
-        }
-        self.completed = true;
-        Ok(())
+        #[cfg(windows)]
+        let status = match self.native_encoder.as_mut() {
+            Some(encoder) => native::ffi::encoder_quiesce(encoder.pin_mut()),
+            None => native::STATUS_OK,
+        };
+        #[cfg(not(windows))]
+        let status = ENCODER_STATUS_OK;
+        apply_encoder_quiesce_status(&mut self.completed, status)
     }
 
     fn diagnostics(&self) -> ProviderDiagnostics {
@@ -3613,7 +3636,6 @@ pub fn win32_vk_to_hid_usage(vk: u16) -> Option<u16> {
         _ => None,
     }
 }
-
 
 /// Converts a reconciled [`AppliedInput`] action into equivalent Win32 `INPUT` structures.
 pub fn applied_input_to_win32(action: AppliedInput) -> Result<Vec<Win32Input>, PlatformError> {
@@ -4789,6 +4811,23 @@ mod tests {
         let meta3 = encoder.process_annex_b(idr).expect("recovery idr");
         assert!(meta3.recovery_point);
         assert_eq!(meta3.frame_id, 4);
+    }
+
+    #[test]
+    fn encoder_quiesce_status_only_completes_on_success() {
+        let mut completed = false;
+
+        assert_eq!(
+            apply_encoder_quiesce_status(&mut completed, ENCODER_STATUS_OK + 1),
+            Err(PlatformError::InvalidState)
+        );
+        assert!(!completed);
+
+        assert_eq!(
+            apply_encoder_quiesce_status(&mut completed, ENCODER_STATUS_OK),
+            Ok(())
+        );
+        assert!(completed);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 #include "latencydesk_windows_bridge.h"
 
 #include "dda_capture_source.hpp"
+#include "input_event_queue.hpp"
 #include "mf_h264_encoder.hpp"
 
 #include <windows.h>
@@ -10,7 +11,6 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
-#include <deque>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -242,22 +242,7 @@ BridgeStatus Encoder::quiesce() noexcept { return impl_->quiesce(); }
 
 class RendererImpl final {
  public:
-  static constexpr std::uint8_t kKindMouseMove = 1;
-  static constexpr std::uint8_t kKindButton = 2;
-  static constexpr std::uint8_t kKindKey = 3;
-  static constexpr std::uint8_t kKindWheel = 4;
   static constexpr std::size_t kInputEventBytes = 20;
-  static constexpr std::size_t kInputQueueCap = 64;
-
-  struct QueuedInput {
-    std::uint8_t kind;
-    std::uint8_t button;
-    std::uint8_t pressed;
-    std::int32_t x;
-    std::int32_t y;
-    std::int32_t wheel;
-    std::uint32_t vk;
-  };
 
   RendererImpl(std::uint32_t width, std::uint32_t height)
       : width_(width == 0 ? 1920 : width), height_(height == 0 ? 1080 : height), open_(true) {
@@ -391,9 +376,8 @@ class RendererImpl final {
     }
     const std::size_t max_events = out.size() / kInputEventBytes;
     std::uint32_t written = 0;
-    while (written < max_events && !input_queue_.empty()) {
-      const QueuedInput ev = input_queue_.front();
-      input_queue_.pop_front();
+    QueuedInput ev{};
+    while (written < max_events && input_queue_.pop(ev)) {
       std::uint8_t* dst = out.data() + static_cast<std::size_t>(written) * kInputEventBytes;
       dst[0] = ev.kind;
       dst[1] = ev.button;
@@ -450,7 +434,7 @@ class RendererImpl final {
         int x = GET_X_LPARAM(lparam);
         int y = GET_Y_LPARAM(lparam);
         map_client(x, y);
-        push_input(QueuedInput{kKindMouseMove, 0, 0, x, y, 0, 0});
+        push_input(QueuedInput{kInputKindMouseMove, 0, 0, x, y, 0, 0});
         break;
       }
       case WM_LBUTTONDOWN:
@@ -470,12 +454,21 @@ class RendererImpl final {
         int x = GET_X_LPARAM(lparam);
         int y = GET_Y_LPARAM(lparam);
         map_client(x, y);
+        const std::uint8_t button_mask =
+            static_cast<std::uint8_t>(1U << static_cast<unsigned>(button - 1));
         if (pressed) {
-          SetCapture(window_);
-        } else if (GetCapture() == window_) {
-          ReleaseCapture();
+          pressed_buttons_ = static_cast<std::uint8_t>(pressed_buttons_ | button_mask);
+          if (GetCapture() != window_) {
+            SetCapture(window_);
+          }
+        } else {
+          pressed_buttons_ =
+              static_cast<std::uint8_t>(pressed_buttons_ & ~button_mask);
+          if (pressed_buttons_ == 0) {
+            release_owned_capture();
+          }
         }
-        push_input(QueuedInput{kKindButton, button, static_cast<std::uint8_t>(pressed ? 1 : 0), x, y, 0, 0});
+        push_input(QueuedInput{kInputKindButton, button, static_cast<std::uint8_t>(pressed ? 1 : 0), x, y, 0, 0});
         break;
       }
       case WM_MOUSEWHEEL: {
@@ -489,7 +482,7 @@ class RendererImpl final {
         int x = pt.x;
         int y = pt.y;
         map_client(x, y);
-        push_input(QueuedInput{kKindWheel, 0, 0, x, y, ticks, 0});
+        push_input(QueuedInput{kInputKindWheel, 0, 0, x, y, ticks, 0});
         break;
       }
       case WM_KEYDOWN:
@@ -497,12 +490,27 @@ class RendererImpl final {
         if ((lparam & (1 << 30)) != 0) {
           break;
         }
-        push_input(QueuedInput{kKindKey, 0, 1, 0, 0, 0, static_cast<std::uint32_t>(wparam)});
+        push_input(QueuedInput{kInputKindKey, 0, 1, 0, 0, 0, static_cast<std::uint32_t>(wparam)});
         break;
       }
       case WM_KEYUP:
       case WM_SYSKEYUP:
-        push_input(QueuedInput{kKindKey, 0, 0, 0, 0, 0, static_cast<std::uint32_t>(wparam)});
+        push_input(QueuedInput{kInputKindKey, 0, 0, 0, 0, 0, static_cast<std::uint32_t>(wparam)});
+        break;
+      case WM_KILLFOCUS:
+      case WM_CANCELMODE:
+        queue_release_all();
+        break;
+      case WM_ACTIVATEAPP:
+        if (wparam == FALSE) {
+          queue_release_all();
+        }
+        break;
+      case WM_CAPTURECHANGED:
+        if (!releasing_capture_ && reinterpret_cast<HWND>(lparam) != window_) {
+          pressed_buttons_ = 0;
+          push_input(QueuedInput{.kind = kInputKindReleaseAll});
+        }
         break;
       case WM_CLOSE:
         open_ = false;
@@ -527,10 +535,22 @@ class RendererImpl final {
   }
 
   void push_input(const QueuedInput& ev) {
-    if (input_queue_.size() >= kInputQueueCap) {
-      input_queue_.pop_front();
+    input_queue_.push(ev);
+  }
+
+  void release_owned_capture() {
+    if (GetCapture() != window_) {
+      return;
     }
-    input_queue_.push_back(ev);
+    releasing_capture_ = true;
+    ReleaseCapture();
+    releasing_capture_ = false;
+  }
+
+  void queue_release_all() {
+    pressed_buttons_ = 0;
+    release_owned_capture();
+    push_input(QueuedInput{.kind = kInputKindReleaseAll});
   }
 
   void initialize() {
@@ -601,12 +621,14 @@ class RendererImpl final {
   std::uint32_t width_;
   std::uint32_t height_;
   bool open_{};
+  bool releasing_capture_{};
+  std::uint8_t pressed_buttons_{};
   HWND window_{};
   Microsoft::WRL::ComPtr<ID3D11Device> device_;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
   Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain_;
   Microsoft::WRL::ComPtr<ID3D11Texture2D> dynamic_bgra_texture_;
-  std::deque<QueuedInput> input_queue_;
+  InputEventQueue input_queue_;
 };
 
 

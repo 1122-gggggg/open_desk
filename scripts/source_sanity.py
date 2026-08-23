@@ -42,7 +42,13 @@ def crate_token(package_name: str) -> str:
 
 
 def parse_simple_manifest(text: str) -> dict[str, object]:
-    data: dict[str, object] = {"package": {}, "dependencies": {}, "dev-dependencies": {}, "build-dependencies": {}}
+    data: dict[str, object] = {
+        "package": {},
+        "dependencies": {},
+        "dev-dependencies": {},
+        "build-dependencies": {},
+        "target": {},
+    }
     current_section = ""
     for line in text.splitlines():
         line = line.strip()
@@ -56,17 +62,54 @@ def parse_simple_manifest(text: str) -> dict[str, object]:
             val_clean = val.strip("\"'")
             if current_section == "package" and key == "name":
                 data["package"]["name"] = val_clean
-            elif current_section in ("dependencies", "dev-dependencies", "build-dependencies"):
+            dependency_section = None
+            destination = None
+            if current_section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                dependency_section = current_section
+                destination = data[current_section]
+            else:
+                target_match = re.fullmatch(
+                    r"target\.(?:'([^']+)'|\"([^\"]+)\")\."
+                    r"(dependencies|dev-dependencies|build-dependencies)",
+                    current_section,
+                )
+                if target_match:
+                    target_name = target_match.group(1) or target_match.group(2)
+                    dependency_section = target_match.group(3)
+                    target_table = data["target"].setdefault(target_name, {})
+                    destination = target_table.setdefault(dependency_section, {})
+            if dependency_section is not None:
                 if val.startswith("{") and "path" in val:
                     path_match = re.search(r'path\s*=\s*["\']([^"\']+)["\']', val)
                     pkg_match = re.search(r'package\s*=\s*["\']([^"\']+)["\']', val)
                     spec = {"path": path_match.group(1) if path_match else ""}
                     if pkg_match:
                         spec["package"] = pkg_match.group(1)
-                    data[current_section][key] = spec
+                    destination[key] = spec
                 else:
-                    data[current_section][key] = val_clean
+                    destination[key] = val_clean
     return data
+
+
+def dependency_tables(data: dict[str, object]) -> list[dict[str, object]]:
+    """Return every Cargo dependency table, including target-specific ones."""
+    tables: list[dict[str, object]] = []
+    section_names = ("dependencies", "dev-dependencies", "build-dependencies")
+    for section in section_names:
+        values = data.get(section, {})
+        if isinstance(values, dict):
+            tables.append(values)
+
+    targets = data.get("target", {})
+    if isinstance(targets, dict):
+        for target in targets.values():
+            if not isinstance(target, dict):
+                continue
+            for section in section_names:
+                values = target.get(section, {})
+                if isinstance(values, dict):
+                    tables.append(values)
+    return tables
 
 
 def load_workspace() -> tuple[list[Package], list[str]]:
@@ -109,8 +152,7 @@ def load_workspace() -> tuple[list[Package], list[str]]:
         names.add(name)
         dependencies: set[str] = set()
         path_dependencies: list[tuple[str, Path]] = []
-        for section in ("dependencies", "dev-dependencies", "build-dependencies"):
-            values = data.get(section, {})
+        for values in dependency_tables(data):
             for dependency_name, spec in values.items():
                 actual_name = dependency_name
                 if isinstance(spec, dict):

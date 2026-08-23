@@ -10,6 +10,9 @@
 __pycache__/
 *.py[cod]
 
+# Persistent device private keys are local credentials, never source artifacts.
+**/identity.key.der
+
 /build/
 
 # Local CMake/native build outputs

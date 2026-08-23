@@ -1229,8 +1229,7 @@ mod tests {
         let abort_duration = start.elapsed();
         assert!(
             abort_duration < std::time::Duration::from_millis(50),
-            "abort took too long: {:?}",
-            abort_duration
+            "abort took too long: {abort_duration:?}"
         );
 
         // After abort, poll must return Ok(None) immediately without deadlock or blocking

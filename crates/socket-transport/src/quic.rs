@@ -15,10 +15,14 @@ use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 const PROTOCOL_VIOLATION_CODE: quinn::VarInt = quinn::VarInt::from_u32(0x100);
 const PROTOCOL_VIOLATION_REASON: &[u8] = b"invalid application record";
+const RELIABLE_OPERATION_TIMEOUT_CODE: quinn::VarInt = quinn::VarInt::from_u32(0x101);
+const RELIABLE_OPERATION_TIMEOUT_REASON: &[u8] = b"reliable lane operation timed out";
+const DEFAULT_RELIABLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Outcome of an unreliable media submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,12 +51,15 @@ pub struct ReceivedStreamRecord {
 /// Failures surfaced by the QUIC lane adapter.
 #[derive(Debug)]
 pub enum QuicTransportError {
-    /// The endpoint socket could not be created.
+    /// Endpoint I/O or a locally bounded transport operation failed.
     Io(std::io::Error),
     /// A client connection could not be started.
     Connect(quinn::ConnectError),
     /// The QUIC connection or endpoint closed.
     Connection(quinn::ConnectionError),
+    /// One accepted QUIC Initial did not complete TLS within the caller's
+    /// bounded per-attempt authentication window.
+    HandshakeTimeout,
     /// A reliable stream ended before its declared record body.
     Read(quinn::ReadExactError),
     /// Quinn rejected a reliable stream write.
@@ -89,6 +96,9 @@ impl fmt::Display for QuicTransportError {
             Self::Io(error) => write!(formatter, "QUIC endpoint I/O failed: {error}"),
             Self::Connect(error) => write!(formatter, "QUIC connection start failed: {error}"),
             Self::Connection(error) => write!(formatter, "QUIC connection failed: {error}"),
+            Self::HandshakeTimeout => {
+                formatter.write_str("QUIC TLS handshake exceeded its per-attempt timeout")
+            }
             Self::Read(error) => write!(formatter, "QUIC stream read failed: {error}"),
             Self::Write(error) => write!(formatter, "QUIC stream write failed: {error}"),
             Self::ExpiryMismatch { expected, actual } => {
@@ -126,12 +136,35 @@ impl Error for QuicTransportError {
             Self::Write(error) => Some(error),
             Self::Protocol(error) => Some(error),
             Self::ExpiryMismatch { .. }
+            | Self::HandshakeTimeout
             | Self::EndpointClosed
             | Self::MissingPeerIdentity
             | Self::UnexpectedPeerIdentity
             | Self::DuplicateInboundLane(_)
             | Self::StreamKindChanged { .. } => None,
         }
+    }
+}
+
+impl QuicTransportError {
+    /// Returns true only for a peer-requested application close with code 0.
+    /// Transport failures, local shutdown, timeouts, and nonzero application
+    /// codes remain errors.
+    #[must_use]
+    pub fn is_clean_application_close(&self) -> bool {
+        let connection_error = match self {
+            Self::Connection(error) => Some(error),
+            Self::Read(quinn::ReadExactError::ReadError(quinn::ReadError::ConnectionLost(
+                error,
+            )))
+            | Self::Write(quinn::WriteError::ConnectionLost(error)) => Some(error),
+            _ => None,
+        };
+        matches!(
+            connection_error,
+            Some(quinn::ConnectionError::ApplicationClosed(close))
+                if close.error_code.into_inner() == 0
+        )
     }
 }
 
@@ -142,6 +175,7 @@ pub struct QuicConnection {
     connection: quinn::Connection,
     outbound: Arc<OutboundLanes>,
     inbound: Arc<InboundLanes>,
+    reliable_operation_timeout: Duration,
 }
 
 #[derive(Debug, Default)]
@@ -227,6 +261,29 @@ impl QuicConnection {
         Ok(Self::from_connection(connection))
     }
 
+    /// Accepts one incoming connection and bounds only the TLS/QUIC handshake
+    /// after an Initial has arrived. Waiting for a new Initial is deliberately
+    /// not charged to this timeout; callers should apply their separate total
+    /// listener deadline around this operation.
+    pub async fn accept_with_handshake_timeout(
+        endpoint: &quinn::Endpoint,
+        handshake_timeout: std::time::Duration,
+    ) -> Result<Self, QuicTransportError> {
+        if handshake_timeout.is_zero() {
+            return Err(QuicTransportError::HandshakeTimeout);
+        }
+        let incoming = endpoint
+            .accept()
+            .await
+            .ok_or(QuicTransportError::EndpointClosed)?;
+        let connecting = incoming.accept().map_err(QuicTransportError::Connection)?;
+        let connection = tokio::time::timeout(handshake_timeout, connecting)
+            .await
+            .map_err(|_| QuicTransportError::HandshakeTimeout)?
+            .map_err(QuicTransportError::Connection)?;
+        Ok(Self::from_connection(connection))
+    }
+
     /// Closes the connection with a caller-selected application error code.
     pub fn close(&self, error_code: u32, reason: &[u8]) {
         self.connection
@@ -236,6 +293,13 @@ impl QuicConnection {
     /// Waits until Quinn reports the terminal connection condition.
     pub async fn closed(&self) -> quinn::ConnectionError {
         self.connection.closed().await
+    }
+
+    /// Returns the largest application DATAGRAM the current QUIC path can
+    /// carry, or `None` when DATAGRAM support was not negotiated.
+    #[must_use]
+    pub fn max_datagram_size(&self) -> Option<usize> {
+        self.connection.max_datagram_size()
     }
 
     /// Returns the verified certificate chain Quinn obtained during the TLS
@@ -265,6 +329,18 @@ impl QuicConnection {
     /// stream, independent from control head-of-line blocking.
     pub async fn send_input(&self, record: &[u8]) -> Result<(), QuicTransportError> {
         self.send_reliable(StreamKind::Input, record).await
+    }
+
+    /// Writes one input record using a caller-selected local bound. Timeout
+    /// cancellation and fail-closed connection shutdown happen in this layer,
+    /// so callers cannot leave a partially written record reusable.
+    pub(crate) async fn send_input_with_timeout(
+        &self,
+        record: &[u8],
+        timeout: Duration,
+    ) -> Result<(), QuicTransportError> {
+        self.send_reliable_with_timeout(StreamKind::Input, record, timeout)
+            .await
     }
 
     /// Accepts the next persistent ordered lane. A peer can establish at most
@@ -376,6 +452,7 @@ impl QuicConnection {
             connection,
             outbound: Arc::new(OutboundLanes::default()),
             inbound: Arc::new(InboundLanes::default()),
+            reliable_operation_timeout: DEFAULT_RELIABLE_OPERATION_TIMEOUT,
         }
     }
 
@@ -384,30 +461,65 @@ impl QuicConnection {
         kind: StreamKind,
         record: &[u8],
     ) -> Result<(), QuicTransportError> {
-        StreamRecord::decode_for(kind, record).map_err(QuicTransportError::Protocol)?;
-
-        let lane = match kind {
-            StreamKind::Control => &self.outbound.control,
-            StreamKind::Input => &self.outbound.input,
-        };
-        let mut stream = lane.lock().await;
-        if stream.is_none() {
-            *stream = Some(
-                self.connection
-                    .open_uni()
-                    .await
-                    .map_err(QuicTransportError::Connection)?,
-            );
-        }
-        stream
-            .as_mut()
-            .expect("stream assigned before use")
-            .write_all(record)
+        self.send_reliable_with_timeout(kind, record, self.reliable_operation_timeout)
             .await
-            .map_err(QuicTransportError::Write)
     }
 
-    fn close_for_protocol_violation(&self) {
+    async fn send_reliable_with_timeout(
+        &self,
+        kind: StreamKind,
+        record: &[u8],
+        timeout: Duration,
+    ) -> Result<(), QuicTransportError> {
+        StreamRecord::decode_for(kind, record).map_err(QuicTransportError::Protocol)?;
+
+        let operation = async {
+            let lane = match kind {
+                StreamKind::Control => &self.outbound.control,
+                StreamKind::Input => &self.outbound.input,
+            };
+            let mut stream = lane.lock().await;
+            if stream.is_none() {
+                *stream = Some(
+                    self.connection
+                        .open_uni()
+                        .await
+                        .map_err(QuicTransportError::Connection)?,
+                );
+            }
+            stream
+                .as_mut()
+                .expect("stream assigned before use")
+                .write_all(record)
+                .await
+                .map_err(QuicTransportError::Write)
+        };
+
+        match tokio::time::timeout(timeout, operation).await {
+            Ok(result) => result,
+            Err(_) => {
+                // Cancellation can interrupt `write_all` after a partial
+                // record. Close fail-closed instead of ever reusing that lane.
+                self.connection.close(
+                    RELIABLE_OPERATION_TIMEOUT_CODE,
+                    RELIABLE_OPERATION_TIMEOUT_REASON,
+                );
+                Err(QuicTransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("reliable {kind:?} lane operation timed out after {timeout:?}"),
+                )))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn with_reliable_operation_timeout(mut self, timeout: Duration) -> Self {
+        assert!(!timeout.is_zero(), "test timeout must be nonzero");
+        self.reliable_operation_timeout = timeout;
+        self
+    }
+
+    pub(crate) fn close_for_protocol_violation(&self) {
         self.connection
             .close(PROTOCOL_VIOLATION_CODE, PROTOCOL_VIOLATION_REASON);
     }
@@ -494,6 +606,12 @@ mod tests {
     }
 
     fn test_configs() -> (quinn::ServerConfig, quinn::ClientConfig, Vec<u8>, Vec<u8>) {
+        test_configs_with_client_uni_stream_credit(None)
+    }
+
+    fn test_configs_with_client_uni_stream_credit(
+        client_uni_stream_credit: Option<u32>,
+    ) -> (quinn::ServerConfig, quinn::ClientConfig, Vec<u8>, Vec<u8>) {
         let server_identity = test_identity("localhost");
         let client_identity = test_identity("latencydesk-client");
         let server_certificate = server_identity.certificate.as_ref().to_vec();
@@ -546,7 +664,11 @@ mod tests {
             quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_crypto))
                 .expect("QUIC client crypto"),
         ));
-        client.transport_config(Arc::new(test_transport_config()));
+        let mut client_transport = test_transport_config();
+        if let Some(credit) = client_uni_stream_credit {
+            client_transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(credit));
+        }
+        client.transport_config(Arc::new(client_transport));
         (server, client, server_certificate, client_certificate)
     }
 
@@ -561,8 +683,62 @@ mod tests {
         config
     }
 
+    #[test]
+    fn only_peer_application_close_code_zero_is_clean() {
+        let clean = QuicTransportError::Connection(quinn::ConnectionError::ApplicationClosed(
+            quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(0),
+                reason: Bytes::from_static(b"session complete"),
+            },
+        ));
+        let nonzero = QuicTransportError::Connection(quinn::ConnectionError::ApplicationClosed(
+            quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(1),
+                reason: Bytes::from_static(b"session failed"),
+            },
+        ));
+        let local = QuicTransportError::Connection(quinn::ConnectionError::LocallyClosed);
+        let nested_read = QuicTransportError::Read(quinn::ReadExactError::ReadError(
+            quinn::ReadError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(
+                quinn::ApplicationClose {
+                    error_code: quinn::VarInt::from_u32(0),
+                    reason: Bytes::from_static(b"session complete"),
+                },
+            )),
+        ));
+        let nested_write = QuicTransportError::Write(quinn::WriteError::ConnectionLost(
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(0),
+                reason: Bytes::from_static(b"session complete"),
+            }),
+        ));
+
+        assert!(clean.is_clean_application_close());
+        assert!(nested_read.is_clean_application_close());
+        assert!(nested_write.is_clean_application_close());
+        assert!(!nonzero.is_clean_application_close());
+        assert!(!local.is_clean_application_close());
+    }
+
+    #[tokio::test]
+    async fn zero_handshake_budget_fails_without_waiting_for_an_initial() {
+        let (server_config, _, _, _) = test_configs();
+        let endpoint = bind_server(server_config, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("server endpoint");
+        assert!(matches!(
+            QuicConnection::accept_with_handshake_timeout(&endpoint, Duration::ZERO).await,
+            Err(QuicTransportError::HandshakeTimeout)
+        ));
+    }
+
     async fn connected_pair() -> ConnectedPair {
-        let (server_config, client_config, server_certificate, client_certificate) = test_configs();
+        connected_pair_with_configs(test_configs()).await
+    }
+
+    async fn connected_pair_with_configs(
+        configs: (quinn::ServerConfig, quinn::ClientConfig, Vec<u8>, Vec<u8>),
+    ) -> ConnectedPair {
+        let (server_config, client_config, server_certificate, client_certificate) = configs;
         let server_endpoint =
             bind_server(server_config, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
                 .expect("server endpoint");
@@ -663,6 +839,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clean_peer_close_inside_established_input_read_is_classified_cleanly() {
+        let pair = connected_pair().await;
+        let input = StreamRecord::encode(StreamKind::Input, active_stamp(), b"key-down")
+            .expect("input record");
+        pair.client
+            .send_input(&input)
+            .await
+            .expect("establish input lane");
+        let mut inbound = pair
+            .server
+            .accept_inbound_stream()
+            .await
+            .expect("accept input lane");
+        assert_eq!(
+            inbound.next_record().await.expect("first input").payload,
+            Bytes::from_static(b"key-down")
+        );
+
+        pair.client.close(0, b"client session complete");
+        let error = tokio::time::timeout(Duration::from_secs(1), inbound.next_record())
+            .await
+            .expect("input read observes peer close")
+            .expect_err("persistent input lane must end with its connection");
+        assert!(
+            error.is_clean_application_close(),
+            "nested input read close should remain clean: {error:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn control_and_input_keep_independent_ordered_streams() {
         let pair = connected_pair().await;
         let control_first = StreamRecord::encode(StreamKind::Control, active_stamp(), b"control-1")
@@ -744,6 +950,48 @@ mod tests {
                 .as_ref(),
             b"input-2"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zero_stream_credit_cannot_block_a_reliable_open_forever() {
+        let pair =
+            connected_pair_with_configs(test_configs_with_client_uni_stream_credit(Some(0))).await;
+        let server = pair
+            .server
+            .with_reliable_operation_timeout(Duration::from_millis(50));
+        let control = StreamRecord::encode(StreamKind::Control, active_stamp(), b"blocked")
+            .expect("control record");
+        let started = std::time::Instant::now();
+
+        assert!(matches!(
+            server.send_control(&control).await,
+            Err(QuicTransportError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            pair.client.closed().await,
+            quinn::ConnectionError::ApplicationClosed(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zero_stream_credit_cannot_block_release_all_input_forever() {
+        let pair =
+            connected_pair_with_configs(test_configs_with_client_uni_stream_credit(Some(0))).await;
+        let input = StreamRecord::encode(StreamKind::Input, active_stamp(), b"release-all")
+            .expect("input record");
+        let timeout = Duration::from_millis(50);
+        let started = std::time::Instant::now();
+
+        assert!(matches!(
+            pair.server.send_input_with_timeout(&input, timeout).await,
+            Err(QuicTransportError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            pair.client.closed().await,
+            quinn::ConnectionError::ApplicationClosed(_)
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

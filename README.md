@@ -1,141 +1,176 @@
-# LatencyDesk
+# LatencyDesk (`open_desk`)
 
-**Ultra-Low-Latency Native Remote Desktop Engine for Direct LAN 1080p120**
+> **Secure alpha — not production-ready.** The default product path now uses
+> exact-leaf TLS 1.3 mutual authentication over QUIC, but the native platform
+> matrix, codec, WAN connectivity, recovery, packaging, and app-level evidence
+> are incomplete. LatencyDesk does not yet match or surpass AnyDesk or RustDesk.
 
-LatencyDesk is a high-performance, security-hardened remote desktop system engineered for sub-frame latency, zero-unbounded-queueing, and strict hardware ownership.
+LatencyDesk is a Rust remote-desktop project built around fail-closed peer
+identity, bounded queues, reliable control/input lanes, and deadline-aware QUIC
+media DATAGRAMs. Its first honest product slice is a Linux X11 host and a
+Windows client on a trusted, low-latency LAN.
 
----
+## Current capability
 
-## Key Highlights
+| Area | Current implementation | Status |
+| --- | --- | --- |
+| Secure transport | TLS 1.3-only mTLS over Quinn QUIC; both sides pin and byte-check the expected leaf certificate; no automatic UDP downgrade | Default product path; in-process tests pass |
+| Device identity | `latencydesk-identity` creates persistent self-signed certificate DER and PKCS#8 private-key DER files without overwriting an existing identity | Implemented; certificate exchange is manual |
+| Control and input | Authenticated product handshake and session-stamped reliable QUIC lanes | Implemented and tested in process |
+| Linux host | Real X11 root capture, CPU BGRA-to-NV12 conversion, and reconciled XTEST input | Secure alpha path; X11-to-headless process loopback is verified, while cross-machine rendering and visible input effects remain pending |
+| Windows client | Strict raw-NV12 validation, Direct3D 11 viewer, bounded latest-frame presentation, and native input forwarding; `--frames` provides headless mode | Secure alpha path; Windows viewer cross-machine E2E evidence is still pending |
+| Other clients | Headless frame receive and input probe are available; no interactive Linux viewer | Partial |
+| Windows host | Secure hosting is rejected before opening a socket because real capture/input providers are not connected | Unsupported |
+| Media | Raw NV12 fragmented across QUIC DATAGRAMs; no production H.264/AV1 encode/decode path | Low-resolution LAN preview only |
+| WAN connectivity | Direct IP only; no rendezvous, NAT traversal, relay, discovery, or seamless reconnect | Not implemented |
+| Distribution | No supported signed installer, updater, or production service | Not implemented |
+| Legacy transport | Plaintext custom UDP, available only with explicit `--unsafe-udp-lab` | Local compatibility test only |
 
-- **Direct-LAN 1080p120 Profile**: End-to-end hardware pipeline engineered for high-refresh-rate, low-jitter desktop interaction over wired LAN.
-- **QUIC / TLS 1.3 Transport**: Single Quinn QUIC connection providing authenticated reliable control/input streams and deadline-expiring media DATAGRAMs.
-- **Zero-Unbounded-Queue Architecture**: Every buffer, queue, and allocation has static capacity (1..=4 frames in flight); stale frames are automatically dropped before queue buildup.
-- **Hardware-Accelerated Windows Path**:
-  - **Capture**: DXGI Desktop Duplication (DDA) and Windows Graphics Capture (WGC) with epoch-bound protected content masking.
-  - **Color Conversion**: Direct3D 11 Video Processor hardware BGRA $\to$ NV12 conversion with strict BT.709 color contract.
-  - **Encoding**: Media Foundation hardware H.264 encoder configured for ultra-low latency, real-time rate control, 0 B-frames, and dynamic forced IDR recovery.
-  - **Input & Presentation**: UIPI-gated `SendInput` with emergency release-all and Direct3D 11 swap chain presentation with fence completion tracking.
-- **Modern Linux Path**: XDG Desktop Portal ScreenCast/RemoteDesktop, PipeWire DMA-BUF zero-copy buffer import, Wayland presentation timing, and libei input.
-- **Cryptographic Device Identity**: Pinned TLS SPKI fingerprints and short authentication string (SAS) pairing without unauthenticated data paths.
+Raw NV12 is intentionally not marketed as a WAN solution. For scale, 640×360
+at 15 fps is about 41.5 Mbit/s before transport overhead; the default capture
+limits at 1280×720 and 60 fps would be about 664 Mbit/s. Start with the low
+preview profile below on a wired LAN.
 
----
+## Build and targeted verification
 
-## Architecture Overview
+The repository pins Rust **1.88.0**. On Windows, native C++ checks also require
+Visual Studio 2022 Build Tools with C++20 and a Windows SDK. The secure host
+requires Linux with a running X11 session and `DISPLAY` set.
 
-```
- ┌───────────────────────────────────────────────────────────────────────────┐
- │                               HOST SYSTEM                                 │
- │                                                                           │
- │  ┌───────────────────────┐         ┌───────────────────────────────────┐  │
- │  │ DXGI Desktop Output   │         │ D3D11 Video Processor             │  │
- │  │ (DDA / WGC Capture)   │────────▶│ (Hardware BGRA -> NV12 Conversion)│  │
- │  └───────────────────────┘         └─────────────────┬─────────────────┘  │
- │                                                      │                    │
- │  ┌───────────────────────┐         ┌─────────────────▼─────────────────┐  │
- │  │ Win32 SendInput       │         │ Media Foundation H.264 Encoder    │  │
- │  │ (UIPI / Security Gate)│         │ (Low-Delay, 0 B-Frames, IDR Sync) │  │
- │  └───────────▲───────────┘         └─────────────────┬─────────────────┘  │
- └──────────────┼───────────────────────────────────────┼────────────────────┘
-                │ Control / Input Streams               │ Media DATAGRAMs
-                │ (Reliable Ordered)                    │ (Deadline Expiring)
-                ▼                                       ▼
- ┌───────────────────────────────────────────────────────────────────────────┐
- │                     QUINN QUIC / TLS 1.3 TRANSPORT                        │
- └───────────────────────────────────────────────────────────────────────────┘
-                │                                       │
-                ▼                                       ▼
- ┌───────────────────────────────────────────────────────────────────────────┐
- │                              CLIENT SYSTEM                                │
- │                                                                           │
- │  ┌───────────────────────┐         ┌───────────────────────────────────┐  │
- │  │ Client Local Input    │         │ H.264 Hardware Decoder            │  │
- │  │ (Reconciler & Sync)   │         │ (Continuity & Recovery Tracker)   │  │
- │  └───────────────────────┘         └─────────────────┬─────────────────┘  │
- │                                                      │                    │
- │                                    ┌─────────────────▼─────────────────┐  │
- │                                    │ Direct3D 11 / Wayland Swap Chain  │  │
- │                                    │ (Presentation Completion Fences)  │  │
- │                                    └───────────────────────────────────┘  │
- └───────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Building & Packaging
-
-### Prerequisites
-- **Rust**: 1.78+ (`rustup toolchain install stable`)
-- **Windows**: Visual Studio 2022 / Build Tools with C++20 and Windows 11 SDK
-- **Linux**: GCC/Clang with C++20, CMake 3.20+, `libx11-dev`, `libpipewire-0.3-dev`
-
-### Compilation
 ```bash
-# Build all workspace packages
-cargo build --release --workspace
-
-# Run complete workspace tests
-cargo test --workspace --all-targets
-
-# Run linter and formatting checks
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo build --workspace --locked
+cargo test --workspace --all-targets --locked
+cargo test --workspace --doc --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo fmt --all -- --check
 ```
 
-### Packaging Release Binaries
-- **Windows**:
-  ```powershell
-  pwsh -File scripts/package.ps1
-  ```
-  Produces `artifacts/release/windows-x86_64/` with `latencydesk-host.exe`, `latencydesk-client.exe`, `release-manifest.json`, and `LatencyDesk-windows-x86_64.zip`.
+The following narrower test command currently passes and covers identity file
+handling, exact-peer mTLS success/failure, QUIC product lanes and fragmentation,
+and secure-default CLI parsing:
 
-- **Linux**:
-  ```bash
-  ./scripts/package.sh
-  ```
-  Produces `artifacts/release/linux-x86_64/` with `latencydesk-host`, `latencydesk-client`, `release-manifest.json`, and `LatencyDesk-linux-x86_64.tar.gz`.
-
----
-
-## Quick Start Guide
-
-### 1. Launching Host
 ```bash
-# Start host listening on all interfaces with 1080p120 profile
-latencydesk-host --listen 0.0.0.0:9000 --1080p120-profile
+cargo test --locked -p latencydesk-socket-transport -p latencydesk-identity -p latencydesk-host -p latencydesk-client
 ```
 
-### 2. Connecting Client
+The repository also has a process-level secure loopback gate for Linux X11. It
+generates disposable identities, proves that a rogue certificate is rejected
+before accepting the pinned client, completes TLS 1.3 mTLS and the product
+handshake, and receives real X11 pixels in headless mode:
+
 ```bash
-# Connect to remote host
-latencydesk-client --connect 192.168.1.100:9000 --1080p120-profile
+cargo build --locked -p latencydesk-host -p latencydesk-client -p latencydesk-identity
+xvfb-run -a python3 scripts/secure_connect_test.py \
+  --host-bin target/debug/latencydesk-host \
+  --client-bin target/debug/latencydesk-client \
+  --identity-bin target/debug/latencydesk-identity \
+  --frames 3 --fps 10 --max-width 320 --max-height 180 \
+  --pairing-timeout 30 --output artifacts/secure-connect.json
 ```
 
-### 3. Pairing & Security Verification
-Upon initial connection, both sides compute and display a 6-digit Short Authentication String (SAS) derived from SHA-256 over canonical pairing evidence. Once confirmed, the peer TLS SPKI fingerprint is permanently pinned.
+This proves only a single-machine Xvfb/WSL2-style X11-to-headless process
+loopback. It does **not** prove Linux-to-Windows rendering, visible XTEST input
+effects, packet-capture confidentiality, cross-machine operation, or
+long-running network reliability. Those gates remain Pending in
+[Product readiness](docs/PRODUCT_READINESS.md).
 
----
+## Secure LAN preview quick start
 
-## Latency Benchmark & Comparison Protocol
+This workflow requires a Linux X11 host and either a Windows interactive client
+or a headless client. Use the same source revision on both machines and a
+trusted wired LAN. Replace `192.168.1.20` with the Linux host's address and allow
+inbound UDP port 9000 only on the trusted LAN.
 
-To ensure reproducible, truthful performance statements against any baseline remote desktop solution:
+### 1. Generate one persistent identity on each machine
 
-1. **Strict Metadata Validation**: Both baseline and candidate must operate on identical resolution (1920x1080), framerate (120 fps or 60 fps), color format (SDR BT.709), and physical network medium (direct wired LAN).
-2. **Comparison Tool**:
-   ```bash
-   python scripts/compare-latency.py path/to/baseline.json path/to/latencydesk.json
-   ```
-3. The comparison report evaluates per-stage p50, p95, and p99 metrics:
-   - Capture to Color Convert
-   - Convert to Encode Submit
-   - Hardware Video Encode
-   - QUIC Transport Delivery
-   - Receive to Decode
-   - Decode to Present Fence
-   - Total Pipeline Processing
+On the Linux host:
 
----
+```bash
+cargo run --locked -p latencydesk-identity -- generate \
+  --name "Linux X11 host" \
+  --out-dir "$HOME/.local/share/latencydesk/host"
+```
 
-## License
+On the Windows client in PowerShell:
 
-Apache-2.0 or MIT.
+```powershell
+cargo run --locked -p latencydesk-identity -- generate `
+  --name "Windows client" `
+  --out-dir "$env:LOCALAPPDATA\LatencyDesk\client"
+```
+
+Each directory contains `identity.cert.der` and `identity.key.der`. Exchange
+**only** `identity.cert.der` over a trusted channel. Never copy or share
+`identity.key.der`. Compare the printed SHA-256 fingerprints through a separate
+trusted channel; they can also be inspected later with:
+
+```bash
+cargo run --locked -p latencydesk-identity -- fingerprint --cert /path/to/identity.cert.der
+```
+
+In the commands below, `peers/windows-client.cert.der` is the certificate copied
+to the host, and `peers/linux-host.cert.der` is the certificate copied to the
+client.
+
+### 2. Start the Linux X11 host
+
+```bash
+cargo run --locked -p latencydesk-host -- \
+  --listen 0.0.0.0:9000 \
+  --identity-cert "$HOME/.local/share/latencydesk/host/identity.cert.der" \
+  --identity-key "$HOME/.local/share/latencydesk/host/identity.key.der" \
+  --peer-cert "$HOME/.local/share/latencydesk/peers/windows-client.cert.der" \
+  --max-width 640 --max-height 360 --fps 15
+```
+
+The host accepts only the exact pinned client certificate. Capture and XTEST
+open only after peer authentication succeeds.
+
+### 3. Start the Windows viewer
+
+```powershell
+cargo run --locked -p latencydesk-client -- `
+  --connect 192.168.1.20:9000 `
+  --identity-cert "$env:LOCALAPPDATA\LatencyDesk\client\identity.cert.der" `
+  --identity-key "$env:LOCALAPPDATA\LatencyDesk\client\identity.key.der" `
+  --peer-cert "$env:LOCALAPPDATA\LatencyDesk\peers\linux-host.cert.der"
+```
+
+For a bounded headless receive check on any supported client platform, add
+`--frames 60`. A non-Windows client without `--frames` or `--inject-probe`
+fails closed because an interactive viewer is not implemented.
+
+This is the intended secure workflow. The repository retains a successful
+single-machine X11-to-headless process result, but not a cross-machine Windows
+viewer result. Treat failures as alpha defects, not as a supported deployment
+issue.
+
+## Unsafe legacy loopback smoke
+
+The legacy harness is retained only to check compatibility behavior. It opts in
+to `--unsafe-udp-lab`, uses a public built-in test secret, and carries plaintext
+media/input. Supplying `--shared-secret` does not make this custom protocol safe.
+
+```powershell
+cargo build --workspace --locked
+python scripts/remote_connect_test.py --mode loopback --frames 8 --host-frames 16 --fps 30
+```
+
+Use loopback only. Never select `lan-bind`, bind it to an external interface,
+forward its port, or use real sensitive desktop content.
+
+## Performance and competitor claims
+
+`scripts/compare-latency.py` is a development tool, not evidence of product
+superiority. Claims against AnyDesk, RustDesk, or another product require the
+same content, codec/quality, resolution, frame rate, hardware, display mode,
+network profile, repeated trials, raw data, and third-party reproducibility.
+Missing or zero metrics are not evidence. See the quantitative gates in
+[Product readiness](docs/PRODUCT_READINESS.md).
+
+## Security and license
+
+Read [SECURITY.md](SECURITY.md) before exchanging identities or running either
+transport. Repository: <https://github.com/1122-gggggg/open_desk>
+
+Licensed under Apache-2.0 or MIT.

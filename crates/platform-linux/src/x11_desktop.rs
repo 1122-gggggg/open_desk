@@ -64,6 +64,15 @@ pub struct X11DesktopSession {
     last_geom: Option<LetterboxGeom>,
 }
 
+#[derive(Clone, Copy)]
+struct ZPixmapFormat {
+    bits_per_pixel: u8,
+    lsb_first: bool,
+    red_mask: u32,
+    green_mask: u32,
+    blue_mask: u32,
+}
+
 impl X11DesktopSession {
     pub fn open() -> Result<Self, X11DesktopError> {
         match env::var_os("DISPLAY") {
@@ -89,8 +98,7 @@ impl X11DesktopSession {
             .unwrap_or(32);
         if bits_per_pixel != 24 && bits_per_pixel != 32 {
             return Err(X11DesktopError::Protocol(format!(
-                "unsupported root depth {} bpp",
-                bits_per_pixel
+                "unsupported root depth {bits_per_pixel} bpp"
             )));
         }
 
@@ -137,8 +145,14 @@ impl X11DesktopSession {
         if src_w == 0 || src_h == 0 {
             return Err(X11DesktopError::InvalidDimensions);
         }
-        let (geom, scaled) =
-            letterbox_scale_bgra(&bgra, src_w, src_h, src_w as usize * 4, max_width, max_height)?;
+        let (geom, scaled) = letterbox_scale_bgra(
+            &bgra,
+            src_w,
+            src_h,
+            src_w as usize * 4,
+            max_width,
+            max_height,
+        )?;
         self.last_geom = Some(geom);
         let nv12 = bgra_to_nv12_bt601_limited(
             geom.out_width,
@@ -148,7 +162,6 @@ impl X11DesktopSession {
         )?;
         Ok((geom.out_width, geom.out_height, nv12))
     }
-
 
     pub fn inject(&mut self, action: AppliedInput) -> Result<(), X11DesktopError> {
         match action {
@@ -187,11 +200,9 @@ impl X11DesktopSession {
                     .map_err(protocol)?
                     .reply()
                     .map_err(protocol)?;
-                let x = (i32::from(pointer.root_x) + dx)
-                    .clamp(0, self.screen_width.saturating_sub(1) as i32);
-                let y = (i32::from(pointer.root_y) + dy)
-                    .clamp(0, self.screen_height.saturating_sub(1) as i32);
-                self.warp(x as i16, y as i16)?;
+                let x = relative_pointer_coordinate(pointer.root_x, dx, self.screen_width);
+                let y = relative_pointer_coordinate(pointer.root_y, dy, self.screen_height);
+                self.warp(x, y)?;
             }
             AppliedInput::PointerMotionAbsolute {
                 x,
@@ -220,7 +231,10 @@ impl X11DesktopSession {
                     self.screen_width,
                     self.screen_height,
                 );
-                self.warp(sx as i16, sy as i16)?;
+                self.warp(
+                    absolute_pointer_coordinate(sx, self.screen_width),
+                    absolute_pointer_coordinate(sy, self.screen_height),
+                )?;
             }
             AppliedInput::Wheel {
                 vertical,
@@ -230,7 +244,7 @@ impl X11DesktopSession {
                     return Ok(());
                 }
                 let button = if vertical > 0 { 4 } else { 5 };
-                let clicks = vertical.unsigned_abs().min(8).max(1);
+                let clicks = vertical.unsigned_abs().clamp(1, 8);
                 for _ in 0..clicks {
                     self.conn
                         .xtest_fake_input(X_BUTTON_PRESS, button, 0, x11rb::NONE, 0, 0, 0)
@@ -300,11 +314,13 @@ impl X11DesktopSession {
                 &reply.data,
                 width,
                 height,
-                self.bits_per_pixel,
-                self.image_lsb_first,
-                self.red_mask,
-                self.green_mask,
-                self.blue_mask,
+                ZPixmapFormat {
+                    bits_per_pixel: self.bits_per_pixel,
+                    lsb_first: self.image_lsb_first,
+                    red_mask: self.red_mask,
+                    green_mask: self.green_mask,
+                    blue_mask: self.blue_mask,
+                },
                 &mut bgra,
             )?;
             Ok(bgra)
@@ -313,12 +329,20 @@ impl X11DesktopSession {
         let _ = self.conn.free_pixmap(pixmap);
         result
     }
-
-
 }
 
 fn protocol<E: fmt::Display>(error: E) -> X11DesktopError {
     X11DesktopError::Protocol(error.to_string())
+}
+
+fn absolute_pointer_coordinate(value: u32, screen_extent: u32) -> i16 {
+    let maximum = screen_extent.saturating_sub(1).min(i16::MAX as u32);
+    value.min(maximum) as i16
+}
+
+fn relative_pointer_coordinate(current: i16, delta: i32, screen_extent: u32) -> i16 {
+    let maximum = screen_extent.saturating_sub(1).min(i16::MAX as u32) as i32;
+    i32::from(current).saturating_add(delta).clamp(0, maximum) as i16
 }
 
 fn find_visual(setup: &xproto::Setup, visual_id: xproto::Visualid) -> Option<&Visualtype> {
@@ -336,16 +360,12 @@ fn unpack_zpixmap_bgra(
     data: &[u8],
     width: u32,
     height: u32,
-    bits_per_pixel: u8,
-    lsb_first: bool,
-    red_mask: u32,
-    green_mask: u32,
-    blue_mask: u32,
+    format: ZPixmapFormat,
     out: &mut [u8],
 ) -> Result<(), X11DesktopError> {
     let width = width as usize;
     let height = height as usize;
-    let src_bpp = if bits_per_pixel == 24 { 3 } else { 4 };
+    let src_bpp = if format.bits_per_pixel == 24 { 3 } else { 4 };
     let required = width * height * src_bpp;
     if data.len() < required {
         return Err(X11DesktopError::Protocol(format!(
@@ -362,22 +382,22 @@ fn unpack_zpixmap_bgra(
             let src = (y * width + x) * src_bpp;
             let pixel = if src_bpp == 4 {
                 let bytes = [data[src], data[src + 1], data[src + 2], data[src + 3]];
-                if lsb_first {
+                if format.lsb_first {
                     u32::from_le_bytes(bytes)
                 } else {
                     u32::from_be_bytes(bytes)
                 }
             } else {
                 let bytes = [data[src], data[src + 1], data[src + 2], 0];
-                if lsb_first {
+                if format.lsb_first {
                     u32::from_le_bytes(bytes)
                 } else {
                     u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]])
                 }
             };
-            let r = extract_channel(pixel, red_mask);
-            let g = extract_channel(pixel, green_mask);
-            let b = extract_channel(pixel, blue_mask);
+            let r = extract_channel(pixel, format.red_mask);
+            let g = extract_channel(pixel, format.green_mask);
+            let b = extract_channel(pixel, format.blue_mask);
             let dst = (y * width + x) * 4;
             out[dst] = b;
             out[dst + 1] = g;
@@ -400,5 +420,28 @@ fn extract_channel(pixel: u32, mask: u32) -> u8 {
     } else {
         let max = (1u32 << bits) - 1;
         ((value * 255) / max) as u8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{absolute_pointer_coordinate, relative_pointer_coordinate};
+
+    #[test]
+    fn relative_pointer_extremes_saturate_without_overflow() {
+        assert_eq!(relative_pointer_coordinate(100, i32::MAX, 1_920), 1_919);
+        assert_eq!(relative_pointer_coordinate(100, i32::MIN, 1_920), 0);
+        assert_eq!(relative_pointer_coordinate(100, 25, 1_920), 125);
+        assert_eq!(relative_pointer_coordinate(100, -25, 1_920), 75);
+    }
+
+    #[test]
+    fn pointer_coordinates_respect_x11_signed_wire_range() {
+        assert_eq!(
+            relative_pointer_coordinate(i16::MAX, i32::MAX, u32::MAX),
+            i16::MAX
+        );
+        assert_eq!(absolute_pointer_coordinate(u32::MAX, u32::MAX), i16::MAX);
+        assert_eq!(absolute_pointer_coordinate(500, 1), 0);
     }
 }

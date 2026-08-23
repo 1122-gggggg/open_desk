@@ -19,6 +19,7 @@ jobs:
           python-version: '3.12'
       - run: python3 scripts/static_validate.py
       - run: python3 scripts/source_sanity.py
+      - run: python3 -m unittest discover -s scripts/tests -p "test_*.py"
       - run: python3 scripts/reference_lab.py --fuzz-iterations 100000
 
   rust:
@@ -29,12 +30,53 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: rustfmt, clippy
+      - name: Install Linux build and process-smoke dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y xvfb libx11-dev libxtst-dev
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --all-targets --locked
+      - run: cargo test --workspace --doc --locked
+      - name: Build secure process-smoke binaries
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build --locked -p latencydesk-host -p latencydesk-client -p latencydesk-identity
+      - name: Secure QUIC/mTLS X11 process smoke
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p artifacts/ci
+          xvfb-run -a python3 scripts/secure_connect_test.py \
+            --host-bin target/debug/latencydesk-host \
+            --client-bin target/debug/latencydesk-client \
+            --identity-bin target/debug/latencydesk-identity \
+            --frames 3 --fps 10 --max-width 320 --max-height 180 \
+            --pairing-timeout 30 \
+            --output artifacts/ci/secure-connect.json
+      - name: Upload secure process-smoke evidence
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v7
+        with:
+          name: secure-process-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/ci/secure-connect.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Build Linux lab-preview package
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/package.sh --lab-preview --out-dir artifacts/package-ci
+      - name: Build Windows lab-preview package
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: .\scripts\package.ps1 -LabPreview -OutDir artifacts/package-ci
+      - name: Upload lab-preview package evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: lab-preview-package-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/package-ci
+          if-no-files-found: error
+          retention-days: 14
 
   native-linux:
     runs-on: ubuntu-latest

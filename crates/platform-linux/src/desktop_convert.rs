@@ -153,12 +153,12 @@ pub fn letterbox_geom(
             .min(u64::from(out_height) * u64::from(src_width)),
     );
     let mut content_width = even_dimension(
-        ((u64::from(src_width) * u64::from(out_height)) / u64::from(src_height)).min(u64::from(out_width))
-            as u32,
+        ((u64::from(src_width) * u64::from(out_height)) / u64::from(src_height))
+            .min(u64::from(out_width)) as u32,
     );
     let mut content_height = even_dimension(
-        ((u64::from(src_height) * u64::from(out_width)) / u64::from(src_width)).min(u64::from(out_height))
-            as u32,
+        ((u64::from(src_height) * u64::from(out_width)) / u64::from(src_width))
+            .min(u64::from(out_height)) as u32,
     );
     if content_width == 0 {
         content_width = 2;
@@ -252,8 +252,8 @@ pub fn map_letterboxed_pointer(
         if from <= 1 {
             0
         } else {
-            ((u64::from(value) * u64::from(to.saturating_sub(1))) / u64::from(from.saturating_sub(1)))
-                as u32
+            ((u64::from(value) * u64::from(to.saturating_sub(1)))
+                / u64::from(from.saturating_sub(1))) as u32
         }
     };
     let px = scale_x(x.min(width.saturating_sub(1)), width, geom.out_width);

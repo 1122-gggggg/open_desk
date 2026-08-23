@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "apps/client",
     "apps/host",
+    "apps/identity",
     "apps/lab",
     "apps/stress",
     "apps/udp-loopback",
@@ -29,9 +30,9 @@ members = [
 [workspace.package]
 version = "0.1.0-alpha.2"
 edition = "2021"
-rust-version = "1.78"
+rust-version = "1.88.0"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/1122-gggggg/latencydesk"
+repository = "https://github.com/1122-gggggg/open_desk"
 authors = ["LatencyDesk contributors"]
 
 

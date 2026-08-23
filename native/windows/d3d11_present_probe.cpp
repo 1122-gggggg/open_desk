@@ -172,7 +172,7 @@ class ProbeWindow final {
     WNDCLASSW window_class{};
     window_class.lpfnWndProc = window_proc;
     window_class.hInstance = GetModuleHandleW(nullptr);
-    window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    window_class.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
     window_class.lpszClassName = kClassName;
     const ATOM atom = RegisterClassW(&window_class);
     if (atom == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
@@ -410,7 +410,7 @@ class Presenter final {
     check(swap_chain_.As(&swap_chain2), "Query IDXGISwapChain2");
     check(swap_chain2->SetMaximumFrameLatency(1), "SetMaximumFrameLatency");
     frame_latency_waitable_.reset(swap_chain2->GetFrameLatencyWaitableObject());
-    check(swap_chain_.As(&swap_chain3), "Query IDXGISwapChain3");
+    check(swap_chain_.As(&swap_chain3_), "Query IDXGISwapChain3");
   }
 
   void create_video_processor() {

@@ -2,6 +2,7 @@
 
 #include "capture_detach.hpp"
 #include "dda_capture_source.hpp"
+#include "input_event_queue.hpp"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -46,6 +47,36 @@ int main() {
   // 1. ABI version check
   TEST_ASSERT(bridge::bridge_abi_version() == bridge::kBridgeAbiVersion,
               "unexpected bridge ABI version");
+
+  // Input motion may be coalesced, but transitions must never be silently
+  // evicted. Saturating an all-transition queue yields one explicit marker.
+  {
+    bridge::InputEventQueue queue;
+    queue.push(bridge::QueuedInput{.kind = bridge::kInputKindMouseMove, .x = 1});
+    queue.push(bridge::QueuedInput{.kind = bridge::kInputKindMouseMove, .x = 2});
+    TEST_ASSERT(queue.size() == 1U, "adjacent mouse moves must coalesce");
+    bridge::QueuedInput event{};
+    TEST_ASSERT(queue.pop(event), "coalesced mouse move must be readable");
+    TEST_ASSERT(event.kind == bridge::kInputKindMouseMove && event.x == 2,
+                "coalescing must retain the newest absolute position");
+
+    for (std::size_t index = 0; index < bridge::InputEventQueue::kCapacity;
+         ++index) {
+      queue.push(bridge::QueuedInput{.kind = bridge::kInputKindKey,
+                                     .pressed = static_cast<std::uint8_t>(index & 1U),
+                                     .vk = static_cast<std::uint32_t>(index)});
+    }
+    queue.push(bridge::QueuedInput{.kind = bridge::kInputKindButton,
+                                   .button = 1,
+                                   .pressed = 0});
+    TEST_ASSERT(queue.overflow_latched(),
+                "all-transition overflow must latch fail-closed state");
+    TEST_ASSERT(queue.size() == 1U,
+                "overflow must collapse unsafe backlog to one marker");
+    TEST_ASSERT(queue.pop(event), "overflow marker must be readable");
+    TEST_ASSERT(event.kind == bridge::kInputKindOverflow,
+                "transition saturation must be explicit");
+  }
 
   // 2. Capacity bounds check
   TEST_ASSERT(!bridge::valid_capture_queue_capacity(0U),

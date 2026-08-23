@@ -4,6 +4,8 @@
 //! anti-replay protection, monotonic epoch tracking, MTU fragmentation/reassembly,
 //! and adaptive congestion control.
 
+pub mod identity;
+pub mod product;
 pub mod quic;
 
 use latencydesk_protocol::{
@@ -27,7 +29,6 @@ pub const DEFAULT_MAX_SOCKET_DATAGRAM: usize = DEFAULT_MAX_DATAGRAM_BYTES;
 /// Deterministic 32-byte shared secret for `--approve` LAN/test sessions.
 /// Used only when product binaries omit `--shared-secret`. Not a production credential.
 pub const APPROVE_LAN_TEST_SECRET: [u8; 32] = *b"LatencyDeskApproveLanTestSecret1";
-
 
 #[derive(Debug)]
 pub struct UdpEndpoint {
@@ -108,7 +109,6 @@ impl UdpEndpoint {
         self.socket.local_addr().map_err(SocketError::Io)
     }
 
-
     pub fn set_timeout(&self, timeout: Duration) -> Result<(), SocketError> {
         self.socket
             .set_read_timeout(Some(timeout))
@@ -123,7 +123,6 @@ impl UdpEndpoint {
             .set_read_timeout(Some(timeout))
             .map_err(SocketError::Io)
     }
-
 
     pub fn send(&self, datagram: &[u8]) -> Result<usize, SocketError> {
         if datagram.is_empty() || datagram.len() > self.max_datagram {
@@ -180,7 +179,6 @@ fn unspecified_peer(local: SocketAddr) -> SocketAddr {
         SocketAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)),
     }
 }
-
 
 /// Role in a remote desktop transport session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -616,7 +614,6 @@ impl AuthenticatedDatagramEndpoint {
         self.endpoint.receive(buffer)
     }
 
-
     /// Sends one datagram only after the session handshake is Active.
     ///
     /// Intended for unreliable input envelopes (`LDIN`). This is not the
@@ -632,11 +629,9 @@ impl AuthenticatedDatagramEndpoint {
         self.endpoint.set_timeout(timeout)
     }
 
-
     pub fn set_read_timeout(&self, timeout: Duration) -> Result<(), SocketError> {
         self.endpoint.set_read_timeout(timeout)
     }
-
 
     /// Sends a reliable control message with session identity.
     pub fn send_control(
@@ -1185,6 +1180,4 @@ mod tests {
             Err(SocketError::SessionNotActive)
         ));
     }
-
-
 }

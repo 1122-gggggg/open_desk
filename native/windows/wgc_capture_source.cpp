@@ -119,7 +119,8 @@ WgcPollResult WgcCaptureSource::poll(std::uint64_t timeout_ns) {
       return {.kind = WgcPollKind::SizeChanged};
     }
 
-    auto access = frame.Surface().as<::IDirect3DDxgiInterfaceAccess>();
+    auto access = frame.Surface().as<
+        ::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
     Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
     check_hresult(access->GetInterface(IID_PPV_ARGS(&texture)), "Get WGC frame texture");
     texture->GetDesc(&pending_description_);

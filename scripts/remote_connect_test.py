@@ -22,6 +22,14 @@ DEFAULT_FPS = 30
 TOTAL_TIMEOUT_S = 45.0
 HOST_READY_WAIT_S = 2.0
 TAIL_CHARS = 4000
+TRANSPORT_MODE = "unsafe_udp_lab"
+SECURITY_MODE = "plaintext"
+NETWORK_SCOPE = "localhost_only"
+WILDCARD_BIND_LOOPBACK = "wildcard-bind-loopback"
+SCOPE_NOTE = (
+    "All cases connect to 127.0.0.1. wildcard-bind-loopback only verifies a "
+    "0.0.0.0 listener and is not a real LAN test."
+)
 
 HANDSHAKE_RE = re.compile(r"handshake:\s*active\s+session_id=(\S+)", re.IGNORECASE)
 RECEIVED_FRAMES_RE = re.compile(r"received:\s*frames=(\d+)", re.IGNORECASE)
@@ -166,6 +174,128 @@ def parse_client_frames(output: str) -> int:
     return max(int(value) for value in matches)
 
 
+def canonical_mode(mode: str) -> str:
+    """Map the former misleading mode name to its explicit localhost scope."""
+    return WILDCARD_BIND_LOOPBACK if mode == "lan-bind" else mode
+
+
+def validate_case_result(
+    *,
+    name: str,
+    host_exit: int | None,
+    client_exit: int | None,
+    host_handshake: str | None,
+    client_handshake: str | None,
+    received_frames: int,
+    requested_frames: int,
+    killed: bool,
+    runtime_error: str | None,
+) -> str | None:
+    """Return a complete failure summary, or ``None`` when the case passed."""
+    failures: list[str] = []
+    if runtime_error:
+        failures.append(runtime_error)
+    if host_exit is None:
+        failures.append(f"{name}: host produced no exit code")
+    if client_exit is None:
+        failures.append(f"{name}: client produced no exit code")
+    if host_exit not in (0,) or client_exit not in (0,):
+        failures.append(f"{name}: nonzero exit host={host_exit} client={client_exit}")
+    if not host_handshake:
+        failures.append(f"{name}: missing host handshake: active session_id=")
+    if not client_handshake:
+        failures.append(f"{name}: missing client handshake: active session_id=")
+    if host_handshake and client_handshake and host_handshake != client_handshake:
+        failures.append(
+            f"{name}: session id mismatch host={host_handshake} client={client_handshake}"
+        )
+    if received_frames < requested_frames:
+        failures.append(
+            f"{name}: client_frames={received_frames} < requested {requested_frames}"
+        )
+    if killed and not runtime_error:
+        failures.append(f"{name}: leftover processes were killed")
+    return "; ".join(failures) if failures else None
+
+
+def finalize_report(report: dict[str, object], results: list[dict[str, object]]) -> bool:
+    """Populate top-level status and require every selected case to pass."""
+    report["transport_mode"] = TRANSPORT_MODE
+    report["security"] = SECURITY_MODE
+    report["network_scope"] = NETWORK_SCOPE
+    report["real_lan"] = False
+    report["scope_note"] = SCOPE_NOTE
+    report["cases"] = results
+    if not results:
+        report["ok"] = False
+        report["error"] = "no connection cases were selected"
+        return False
+
+    flatten_primary(report, results[0])
+    failed = [result for result in results if result.get("ok") is not True]
+    if failed:
+        details = []
+        for result in failed:
+            detail = result.get("error")
+            if detail:
+                details.append(str(detail))
+            else:
+                details.append(
+                    f"{result.get('name', 'unknown')}: failed without error details"
+                )
+        report["ok"] = False
+        report["error"] = "; ".join(details)
+        return False
+
+    report["ok"] = True
+    report["error"] = None
+    return True
+
+
+def build_case_commands(
+    *,
+    host_bin: Path,
+    client_bin: Path,
+    listen_addr: str,
+    connect_addr: str,
+    host_frames: int,
+    client_frames: int,
+    fps: int,
+    shared_secret: str | None,
+    extra_host: list[str],
+    extra_client: list[str],
+) -> tuple[list[str], list[str]]:
+    """Build explicit legacy-lab commands; secure mode is never selected implicitly."""
+    host_cmd = [
+        str(host_bin),
+        "--unsafe-udp-lab",
+        "--listen",
+        listen_addr,
+        "--approve",
+        "--frames",
+        str(host_frames),
+        "--fps",
+        str(fps),
+        *extra_host,
+    ]
+    client_cmd = [
+        str(client_bin),
+        "--unsafe-udp-lab",
+        "--connect",
+        connect_addr,
+        "--approve",
+        "--frames",
+        str(client_frames),
+        "--bind",
+        "127.0.0.1:0",
+        *extra_client,
+    ]
+    if shared_secret:
+        host_cmd.extend(["--shared-secret", shared_secret])
+        client_cmd.extend(["--shared-secret", shared_secret])
+    return host_cmd, client_cmd
+
+
 def run_case(
     *,
     name: str,
@@ -183,31 +313,18 @@ def run_case(
     port = pick_free_udp_port()
     listen_addr = f"{listen_host}:{port}"
     connect_addr = f"{connect_host}:{port}"
-    host_cmd = [
-        str(host_bin),
-        "--listen",
-        listen_addr,
-        "--approve",
-        "--frames",
-        str(host_frames),
-        "--fps",
-        str(fps),
-        *extra_host,
-    ]
-    client_cmd = [
-        str(client_bin),
-        "--connect",
-        connect_addr,
-        "--approve",
-        "--frames",
-        str(client_frames),
-        "--bind",
-        "127.0.0.1:0",
-        *extra_client,
-    ]
-    if shared_secret:
-        host_cmd.extend(["--shared-secret", shared_secret])
-        client_cmd.extend(["--shared-secret", shared_secret])
+    host_cmd, client_cmd = build_case_commands(
+        host_bin=host_bin,
+        client_bin=client_bin,
+        listen_addr=listen_addr,
+        connect_addr=connect_addr,
+        host_frames=host_frames,
+        client_frames=client_frames,
+        fps=fps,
+        shared_secret=shared_secret,
+        extra_host=extra_host,
+        extra_client=extra_client,
+    )
 
     deadline = time.monotonic() + TOTAL_TIMEOUT_S
     host: TrackedProcess | None = None
@@ -266,27 +383,25 @@ def run_case(
     host_handshake = parse_handshake(host_out)
     client_handshake = parse_handshake(client_out)
     received = parse_client_frames(client_out)
-
-    if host_exit is None:
-        error = error or f"{name}: host produced no exit code"
-    if client_exit is None:
-        error = error or f"{name}: client produced no exit code"
-    if host_exit not in (0,) or client_exit not in (0,):
-        error = error or f"{name}: nonzero exit host={host_exit} client={client_exit}"
-    if not host_handshake:
-        error = error or f"{name}: missing host handshake: active session_id="
-    if not client_handshake:
-        error = error or f"{name}: missing client handshake: active session_id="
-    if received < client_frames:
-        error = error or (
-            f"{name}: client_frames={received} < requested {client_frames}"
-        )
-    if killed and error is None:
-        error = f"{name}: leftover processes were killed"
-
-    ok = error is None and host_exit == 0 and client_exit == 0
+    error = validate_case_result(
+        name=name,
+        host_exit=host_exit,
+        client_exit=client_exit,
+        host_handshake=host_handshake,
+        client_handshake=client_handshake,
+        received_frames=received,
+        requested_frames=client_frames,
+        killed=killed,
+        runtime_error=error,
+    )
+    ok = error is None
     return {
         "name": name,
+        "transport_mode": TRANSPORT_MODE,
+        "security": SECURITY_MODE,
+        "network_scope": NETWORK_SCOPE,
+        "real_lan": False,
+        "scope_note": SCOPE_NOTE,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "host_bin": str(host_bin),
         "client_bin": str(client_bin),
@@ -338,9 +453,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=("both", "loopback", "lan-bind"),
+        choices=("both", "loopback", WILDCARD_BIND_LOOPBACK, "lan-bind"),
         default="both",
-        help="loopback=127.0.0.1 listen; lan-bind=0.0.0.0 listen; both runs loopback then lan-bind",
+        help=(
+            "loopback=127.0.0.1 listen; wildcard-bind-loopback=0.0.0.0 listen "
+            "with a 127.0.0.1 client (not a real LAN test); lan-bind is a legacy alias"
+        ),
     )
     parser.add_argument("--frames", type=int, default=DEFAULT_CLIENT_FRAMES, dest="client_frames")
     parser.add_argument("--host-frames", type=int, default=DEFAULT_HOST_FRAMES)
@@ -348,9 +466,17 @@ def main() -> int:
     parser.add_argument("--shared-secret", default=None)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUT)
     args = parser.parse_args()
+    selected_mode = canonical_mode(args.mode)
 
     report: dict[str, object] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "requested_mode": args.mode,
+        "mode": selected_mode,
+        "transport_mode": TRANSPORT_MODE,
+        "security": SECURITY_MODE,
+        "network_scope": NETWORK_SCOPE,
+        "real_lan": False,
+        "scope_note": SCOPE_NOTE,
         "binary_paths": {},
         "listen_addr": None,
         "host_exit": None,
@@ -377,10 +503,10 @@ def main() -> int:
         return 1
 
     cases: list[tuple[str, str, str]] = []
-    if args.mode in ("both", "loopback"):
+    if selected_mode in ("both", "loopback"):
         cases.append(("loopback", "127.0.0.1", "127.0.0.1"))
-    if args.mode in ("both", "lan-bind"):
-        cases.append(("lan-bind", "0.0.0.0", "127.0.0.1"))
+    if selected_mode in ("both", WILDCARD_BIND_LOOPBACK):
+        cases.append((WILDCARD_BIND_LOOPBACK, "0.0.0.0", "127.0.0.1"))
 
     results: list[dict[str, object]] = []
     for name, listen_host, connect_host in cases:
@@ -399,27 +525,11 @@ def main() -> int:
         )
         results.append(result)
 
-    report["cases"] = results
-    primary = results[0]
-    flatten_primary(report, primary)
-    # Required case is loopback when both run; a lan-bind-only run uses that case.
-    required_ok = bool(primary.get("ok"))
-    lan = next((item for item in results if item.get("name") == "lan-bind"), None)
-    if args.mode == "both" and lan is not None and not lan.get("ok"):
-        extra = lan.get("error") or "lan-bind failed"
-        if report["error"]:
-            report["error"] = f"{report['error']}; {extra}"
-        else:
-            report["error"] = extra
-            # Case 1 still decides process exit; keep top-level ok from loopback.
-    report["ok"] = required_ok
-    if required_ok and args.mode == "both" and lan is not None and not lan.get("ok"):
-        report["ok"] = True
-        report["error"] = f"loopback ok; {lan.get('error') or 'lan-bind failed'}"
+    all_cases_ok = finalize_report(report, results)
 
     write_report(args.output, report)
     print(json.dumps(report, indent=2))
-    return 0 if required_ok else 1
+    return 0 if all_cases_ok else 1
 
 
 if __name__ == "__main__":

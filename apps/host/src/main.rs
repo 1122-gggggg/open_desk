@@ -2,14 +2,18 @@
 //!
 //! Native QUIC/UDP host role coordinator using platform providers.
 
-use latencydesk_input::{AppliedInput, InputEvent, InputMessage, InputReconciler, ReconcileOutcome};
+mod secure;
+
+use latencydesk_input::{
+    AppliedInput, InputEvent, InputMessage, InputReconciler, ReconcileOutcome,
+};
 use latencydesk_platform::{
     EncodeBackend, EncodeFailure, EncodeSubmission, EncoderSubmissionGuard,
     NativePresentationCompletion, PlatformError, ProviderDiagnostics,
 };
-use latencydesk_protocol::{
-    media_flags, ControlKind, ControlPacket, HelloMessage, MediaKind,
-};
+#[cfg(target_os = "linux")]
+use latencydesk_platform_linux::{pack_nv12_access_unit, X11DesktopSession};
+use latencydesk_protocol::{media_flags, ControlKind, ControlPacket, HelloMessage, MediaKind};
 use latencydesk_runtime::HostMediaBackend;
 use latencydesk_session::authorization::SessionId;
 use latencydesk_session::runtime::{
@@ -21,16 +25,43 @@ use latencydesk_socket_transport::{
     AuthenticatedDatagramEndpoint, AuthenticatedSessionConfig, HandshakeState, SessionRole,
     SocketError, UdpEndpoint, APPROVE_LAN_TEST_SECRET, DEFAULT_MAX_SOCKET_DATAGRAM,
 };
-#[cfg(target_os = "linux")]
-use latencydesk_platform_linux::{pack_nv12_access_unit, X11DesktopSession};
 
 use std::env;
 use std::error::Error;
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const HOST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const LEGACY_MODE_ERROR: &str = "--client/--connect, --peer-alias, --approve/--auto-approve, --shared-secret, --device-fingerprint, --1080p120-profile, --width, and --height are legacy plaintext options; add --unsafe-udp-lab only in an isolated trusted lab, or use the secure certificate and capture options";
+
+const HOST_HELP: &str = "Usage: latencydesk-host [OPTIONS]\n\n\
+Options:\n  \
+  --listen <ADDR>           QUIC address to bind (default 0.0.0.0:9000)\n  \
+  --identity-cert <PATH>    Host public certificate (DER; required securely)\n  \
+  --identity-key <PATH>     Host private key (PKCS#8 DER; required securely)\n  \
+  --peer-cert <PATH>        Exact trusted client certificate (DER; required securely)\n  \
+  --pairing-timeout <SECS>  TLS connection timeout, 1..=3600 (default 60)\n  \
+  --max-width <PIXELS>      Secure Linux X11 capture canvas width (default 1280, even)\n  \
+  --max-height <PIXELS>     Secure Linux X11 capture canvas height (default 720, even)\n  \
+  --fps <FPS>               Secure capture frame rate, 1..=240 (default 60)\n  \
+  --frames <COUNT>          Stop streaming after N frames\n  \
+  --role host               Explicit role assertion\n  \
+  --unsafe-udp-lab          Opt in to unauthenticated-server, plaintext legacy UDP\n  \
+  --version, -V             Show the host version\n  \
+  --client/--connect <ADDR> Legacy UDP peer (requires --unsafe-udp-lab)\n  \
+  --peer-alias <NAME>       Legacy alias (requires --unsafe-udp-lab)\n  \
+  --shared-secret <HEX64>   Legacy 32-byte secret (requires --unsafe-udp-lab)\n  \
+  --device-fingerprint <HEX64>  Legacy pin (repeatable; requires --unsafe-udp-lab)\n  \
+  --approve/--auto-approve  Legacy built-in test secret (requires --unsafe-udp-lab)\n  \
+  --1080p120-profile        Legacy synthetic profile (requires --unsafe-udp-lab)\n  \
+  --width <PIXELS>          Legacy synthetic width (requires --unsafe-udp-lab)\n  \
+  --height <PIXELS>         Legacy synthetic height (requires --unsafe-udp-lab)\n  \
+  --help, -h                Show this help message\n\n\
+Generate identities with `latencydesk-identity generate`, exchange only the\n\
+certificate files, and keep private keys on their originating machines.\n\
+Secure hosting currently requires Linux X11. --unsafe-udp-lab is plaintext\n\
+compatibility mode and must never be exposed to an untrusted network.";
 
 #[derive(Debug, Clone)]
 pub struct HostArgs {
@@ -48,8 +79,13 @@ pub struct HostArgs {
     pub auto_approve: bool,
     pub shared_secret: Option<[u8; 32]>,
     pub pinned_fingerprints: Vec<[u8; 32]>,
+    pub identity_cert: Option<PathBuf>,
+    pub identity_key: Option<PathBuf>,
+    pub peer_cert: Option<PathBuf>,
+    pub unsafe_udp_lab: bool,
+    pub show_version: bool,
+    synthetic_geometry_explicit: bool,
 }
-
 
 impl Default for HostArgs {
     fn default() -> Self {
@@ -68,10 +104,15 @@ impl Default for HostArgs {
             auto_approve: false,
             shared_secret: None,
             pinned_fingerprints: Vec::new(),
+            identity_cert: None,
+            identity_key: None,
+            peer_cert: None,
+            unsafe_udp_lab: false,
+            show_version: false,
+            synthetic_geometry_explicit: false,
         }
     }
 }
-
 
 pub fn parse_host_args() -> Result<HostArgs, Box<dyn Error>> {
     parse_host_args_from(env::args())
@@ -128,6 +169,7 @@ where
                     return Err("missing value for --width".into());
                 }
                 config.width = args[i + 1].parse()?;
+                config.synthetic_geometry_explicit = true;
                 i += 2;
             }
             "--height" => {
@@ -135,6 +177,7 @@ where
                     return Err("missing value for --height".into());
                 }
                 config.height = args[i + 1].parse()?;
+                config.synthetic_geometry_explicit = true;
                 i += 2;
             }
             "--fps" => {
@@ -165,6 +208,35 @@ where
                 }
                 config.max_frames = Some(args[i + 1].parse()?);
                 i += 2;
+            }
+            "--identity-cert" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --identity-cert".into());
+                }
+                config.identity_cert = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--identity-key" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --identity-key".into());
+                }
+                config.identity_key = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--peer-cert" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --peer-cert".into());
+                }
+                config.peer_cert = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--unsafe-udp-lab" => {
+                config.unsafe_udp_lab = true;
+                i += 1;
+            }
+            "--version" | "-V" => {
+                config.show_version = true;
+                i += 1;
             }
             "--shared-secret" => {
                 if i + 1 >= args.len() {
@@ -200,35 +272,15 @@ where
                 );
             }
             "--help" | "-h" => {
-                println!(
-                    "Usage: latencydesk-host [OPTIONS]\n\n\
-                     Options:\n  \
-                       --listen <ADDR>           Socket address to bind (default 0.0.0.0:9000)\n  \
-                       --client <ADDR>           Optional known Client IP:port to connect after bind\n  \
-                       --peer-alias <NAME>       Alias name for peer authorization\n  \
-                       --pairing-timeout <SECS>  Pairing expiration timeout in seconds (default 60)\n  \
-                       --1080p120-profile        Enable 1080p 120fps direct LAN streaming profile\n  \
-                       --width <PIXELS>          Synthetic capture width (default 1920)\n  \
-                       --height <PIXELS>         Synthetic capture height (default 1080)\n  \
-                       --max-width <PIXELS>      Linux capture canvas width (default 1280, even)\n  \
-                       --max-height <PIXELS>     Linux capture canvas height (default 720, even)\n  \
-                       --fps <FPS>               Frame rate (default 60, or 120 with profile)\n  \
-                       --frames <COUNT>          Stop streaming after N frames (for benchmarking)\n  \
-                       --shared-secret <HEX64>   32-byte HMAC secret as 64 hex characters\n  \
-                       --device-fingerprint <HEX64>  Extra pinned device fingerprint (repeatable)\n  \
-                       --role host               Explicit role assertion\n  \
-                       --approve                 LAN/test auto-pin of the connecting device\n  \
-                       --help, -h                Show this help message\n\n\
-                     Note: The product binary strictly rejects simulated --interactive mode."
-                );
+                println!("{HOST_HELP}");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown option: {other}").into()),
         }
     }
 
-    if config.width == 0 || config.height == 0 || config.fps == 0 {
-        return Err("width, height, and fps must be positive and nonzero".into());
+    if config.width == 0 || config.height == 0 {
+        return Err("width and height must be positive and nonzero".into());
     }
     if config.width % 2 != 0 || config.height % 2 != 0 {
         return Err("width and height must be even integers for NV12 video encoding".into());
@@ -237,7 +289,39 @@ where
         return Err("max-width and max-height must be positive and nonzero".into());
     }
     if config.max_width % 2 != 0 || config.max_height % 2 != 0 {
-        return Err("max-width and max-height must be even integers for NV12 video encoding".into());
+        return Err(
+            "max-width and max-height must be even integers for NV12 video encoding".into(),
+        );
+    }
+    if !(1..=240).contains(&config.fps) {
+        return Err("fps must be between 1 and 240".into());
+    }
+    if !(1..=3_600).contains(&config.pairing_timeout_secs) {
+        return Err("pairing-timeout must be between 1 and 3600 seconds".into());
+    }
+    if config.max_frames == Some(0) {
+        return Err("frames must be positive and nonzero".into());
+    }
+
+    let has_identity_flag = config.identity_cert.is_some()
+        || config.identity_key.is_some()
+        || config.peer_cert.is_some();
+    if config.unsafe_udp_lab && has_identity_flag {
+        return Err(
+            "--identity-cert, --identity-key, and --peer-cert cannot be combined with --unsafe-udp-lab"
+                .into(),
+        );
+    }
+
+    let has_legacy_only_option = config.connect_addr.is_some()
+        || config.peer_alias.is_some()
+        || config.auto_approve
+        || config.shared_secret.is_some()
+        || !config.pinned_fingerprints.is_empty()
+        || config.profile_1080p120
+        || config.synthetic_geometry_explicit;
+    if !config.unsafe_udp_lab && has_legacy_only_option {
+        return Err(LEGACY_MODE_ERROR.into());
     }
 
     Ok(config)
@@ -360,7 +444,6 @@ impl SessionGate for HostSessionGate {
 /// avoiding network congestion while delivering 120 fps video.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 fn generate_compressed_frame(width: u32, height: u32, frame_id: u64, is_keyframe: bool) -> Vec<u8> {
-
     let mut payload = Vec::with_capacity(2048);
     if is_keyframe {
         // SPS NALU (0x67)
@@ -463,29 +546,47 @@ fn wait_first_datagram(
     }
 }
 
-fn complete_host_handshake(
-    session: &mut AuthenticatedDatagramEndpoint,
-    hello: &[u8],
-    pins: &[[u8; 32]],
+struct HostHandshake<'a> {
+    hello: &'a [u8],
+    pins: &'a [[u8; 32]],
     server_nonce: [u8; 16],
     session_id: u64,
-    shared_secret: &[u8; 32],
-    buffer: &mut [u8],
+    shared_secret: &'a [u8; 32],
     deadline: Instant,
+}
+
+fn complete_host_handshake(
+    session: &mut AuthenticatedDatagramEndpoint,
+    buffer: &mut [u8],
+    handshake: HostHandshake<'_>,
 ) -> Result<(), Box<dyn Error>> {
-    session.host_handle_hello(hello, pins, server_nonce, session_id, 1)?;
+    session.host_handle_hello(
+        handshake.hello,
+        handshake.pins,
+        handshake.server_nonce,
+        handshake.session_id,
+        1,
+    )?;
     loop {
-        if Instant::now() >= deadline {
+        if Instant::now() >= handshake.deadline {
             return Err("handshake timed out waiting for Authenticate".into());
         }
         match session.receive_raw(buffer) {
-            Ok(len) => match session.host_handle_authenticate(&buffer[..len], shared_secret) {
-                Ok(_) => return Ok(()),
-                Err(SocketError::UnexpectedControlKind(ControlKind::Hello)) => {
-                    session.host_handle_hello(&buffer[..len], pins, server_nonce, session_id, 1)?;
+            Ok(len) => {
+                match session.host_handle_authenticate(&buffer[..len], handshake.shared_secret) {
+                    Ok(_) => return Ok(()),
+                    Err(SocketError::UnexpectedControlKind(ControlKind::Hello)) => {
+                        session.host_handle_hello(
+                            &buffer[..len],
+                            handshake.pins,
+                            handshake.server_nonce,
+                            handshake.session_id,
+                            1,
+                        )?;
+                    }
+                    Err(err) => return Err(err.into()),
                 }
-                Err(err) => return Err(err.into()),
-            },
+            }
             Err(SocketError::Io(err)) if is_transient(&err) => continue,
             Err(err) => return Err(err.into()),
         }
@@ -587,13 +688,33 @@ fn send_video_frame(
         Some(frame_id.saturating_sub(1))
     };
     session.send_media_frame(payload, MediaKind::Video, flags, frame_id, dependency)?;
-    println!("streaming: frame {frame_id} bytes={}", payload.len());
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_host_args()?;
+    if args.show_version {
+        println!("{}", version_text());
+        return Ok(());
+    }
+    if args.unsafe_udp_lab {
+        eprintln!(
+            "!!! UNSAFE UDP LAB MODE: traffic after the legacy handshake is plaintext, the server is not authenticated, and the built-in approve secret is public. Never expose this mode to an untrusted network. !!!"
+        );
+        run_unsafe_udp_lab(args)
+    } else {
+        secure::run(&args).await
+    }
+}
+
+fn version_text() -> String {
+    format!("latencydesk-host {}", env!("CARGO_PKG_VERSION"))
+}
+
+fn run_unsafe_udp_lab(args: HostArgs) -> Result<(), Box<dyn Error>> {
     println!("=== LatencyDesk Host ===");
+    println!("Mode: UNSAFE legacy UDP lab compatibility");
     println!(
         "Selected Direct LAN 1080p120 Profile: {}",
         args.profile_1080p120
@@ -603,10 +724,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "Stream Resolution: {}x{} @ {} fps",
         args.width, args.height, args.fps
     );
-    println!(
-        "Capture canvas: {}x{}",
-        args.max_width, args.max_height
-    );
+    println!("Capture canvas: {}x{}", args.max_width, args.max_height);
 
     if args.auto_approve {
         println!("approve-mode: test/LAN only; not a production pairing path");
@@ -637,7 +755,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let deadline = Instant::now() + HOST_HANDSHAKE_TIMEOUT;
+    let deadline = Instant::now() + Duration::from_secs(args.pairing_timeout_secs);
     let mut recv_buf = vec![0u8; DEFAULT_MAX_SOCKET_DATAGRAM];
     let (hello_len, hello_peer) = wait_first_datagram(&udp, &mut recv_buf, deadline)?;
     if args.connect_addr.is_none() {
@@ -668,13 +786,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let session_id = assign_session_id();
     if let Err(err) = complete_host_handshake(
         &mut session,
-        &hello_packet,
-        &pins,
-        random_nonce(),
-        session_id,
-        &shared_secret,
         &mut recv_buf,
-        deadline,
+        HostHandshake {
+            hello: &hello_packet,
+            pins: &pins,
+            server_nonce: random_nonce(),
+            session_id,
+            shared_secret: &shared_secret,
+            deadline,
+        },
     ) {
         if session.handshake_state() == HandshakeState::Active {
             let mut reconciler = InputReconciler::default();
@@ -688,7 +808,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     println!("handshake: active session_id={}", session.session_id());
     session.set_read_timeout(Duration::from_millis(2))?;
-
 
     let mut reconciler = InputReconciler::default();
     #[cfg(target_os = "linux")]
@@ -726,7 +845,9 @@ fn run_host_media_loop(
     loop {
         #[cfg(target_os = "linux")]
         drain_input(session, recv_buf, reconciler, |action| {
-            desktop.inject(action).map_err(|err| Box::<dyn Error>::from(err.to_string()))
+            desktop
+                .inject(action)
+                .map_err(|err| Box::<dyn Error>::from(err.to_string()))
         })?;
         #[cfg(not(target_os = "linux"))]
         drain_input(session, recv_buf, reconciler, |_| Ok(()))?;
@@ -746,12 +867,18 @@ fn run_host_media_loop(
                 }
                 let encoded_data = pack_nv12_access_unit(width, height, &nv12);
                 send_video_frame(session, &encoded_data, frame_id, is_keyframe)?;
+                if frame_id == 1 || frame_id % 60 == 0 {
+                    println!("streaming: frame {frame_id} bytes={}", encoded_data.len());
+                }
             }
             #[cfg(not(target_os = "linux"))]
             {
                 let encoded_data =
                     generate_compressed_frame(args.width, args.height, frame_id, is_keyframe);
                 send_video_frame(session, &encoded_data, frame_id, is_keyframe)?;
+                if frame_id == 1 || frame_id % 60 == 0 {
+                    println!("streaming: frame {frame_id} bytes={}", encoded_data.len());
+                }
             }
 
             if let Some(max) = args.max_frames {
@@ -765,7 +892,6 @@ fn run_host_media_loop(
 
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -785,6 +911,7 @@ mod tests {
     fn host_parser_accepts_1080p120_profile() {
         let args = parse_host_args_from([
             "latencydesk-host",
+            "--unsafe-udp-lab",
             "--1080p120-profile",
             "--listen",
             "127.0.0.1:9005",
@@ -798,11 +925,71 @@ mod tests {
     }
 
     #[test]
+    fn secure_mode_rejects_every_synthetic_legacy_option_even_at_default_values() {
+        let cases: [&[&str]; 3] = [
+            &["latencydesk-host", "--1080p120-profile"],
+            &["latencydesk-host", "--width", "1920"],
+            &["latencydesk-host", "--height", "1080"],
+        ];
+        for arguments in cases {
+            let error = parse_host_args_from(arguments.iter().copied())
+                .expect_err("synthetic option must require explicit lab mode");
+            assert_eq!(error.to_string(), LEGACY_MODE_ERROR);
+        }
+    }
+
+    #[test]
+    fn lab_mode_accepts_synthetic_profile_and_geometry() {
+        let args = parse_host_args_from([
+            "latencydesk-host",
+            "--unsafe-udp-lab",
+            "--1080p120-profile",
+            "--width",
+            "1280",
+            "--height",
+            "720",
+        ])
+        .expect("explicit lab mode accepts synthetic options");
+        assert!(args.profile_1080p120);
+        assert_eq!(args.width, 1280);
+        assert_eq!(args.height, 720);
+        assert_eq!(args.fps, 120);
+    }
+
+    #[test]
+    fn help_and_mode_error_label_every_legacy_option_consistently() {
+        for option in [
+            "--client",
+            "--connect",
+            "--peer-alias",
+            "--approve",
+            "--auto-approve",
+            "--shared-secret",
+            "--device-fingerprint",
+            "--1080p120-profile",
+            "--width",
+            "--height",
+        ] {
+            assert!(HOST_HELP.contains(option), "help omitted {option}");
+            assert!(LEGACY_MODE_ERROR.contains(option), "error omitted {option}");
+        }
+        for line in HOST_HELP.lines().filter(|line| line.contains("Legacy")) {
+            assert!(
+                line.contains("requires --unsafe-udp-lab"),
+                "legacy help line is not fail-closed: {line}"
+            );
+        }
+        assert!(HOST_HELP.contains("--max-width <PIXELS>      Secure Linux X11 capture"));
+        assert!(HOST_HELP.contains("--fps <FPS>               Secure capture frame rate"));
+    }
+
+    #[test]
     fn host_parser_accepts_approve_secret_and_frames() {
         let secret = "aa".repeat(32);
         let fingerprint = "bb".repeat(32);
         let args = parse_host_args_from([
             "latencydesk-host",
+            "--unsafe-udp-lab",
             "--approve",
             "--shared-secret",
             secret.as_str(),
@@ -822,6 +1009,7 @@ mod tests {
     fn host_parser_accepts_max_geometry() {
         let args = parse_host_args_from([
             "latencydesk-host",
+            "--unsafe-udp-lab",
             "--max-width",
             "1280",
             "--max-height",
@@ -835,4 +1023,97 @@ mod tests {
         assert_eq!(args.height, 1080);
     }
 
+    #[test]
+    fn host_defaults_to_secure_mode() {
+        let args = parse_host_args_from(["latencydesk-host"]).expect("secure defaults parse");
+        assert!(!args.unsafe_udp_lab);
+        assert!(args.identity_cert.is_none());
+        assert!(args.identity_key.is_none());
+        assert!(args.peer_cert.is_none());
+    }
+
+    #[test]
+    fn legacy_credentials_require_explicit_lab_mode() {
+        let error = parse_host_args_from(["latencydesk-host", "--approve"])
+            .expect_err("legacy option must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("--unsafe-udp-lab"));
+        assert!(message.contains("legacy plaintext"));
+    }
+
+    #[test]
+    fn secure_identity_and_unsafe_lab_modes_are_mutually_exclusive() {
+        let error = parse_host_args_from([
+            "latencydesk-host",
+            "--unsafe-udp-lab",
+            "--identity-cert",
+            "host.der",
+        ])
+        .expect_err("mixed security modes must be rejected");
+        assert!(error.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn host_parser_accepts_complete_secure_identity_paths() {
+        let args = parse_host_args_from([
+            "latencydesk-host",
+            "--identity-cert",
+            "host.der",
+            "--identity-key",
+            "host-key.der",
+            "--peer-cert",
+            "client.der",
+        ])
+        .expect("secure identity flags parse");
+        assert_eq!(args.identity_cert, Some(PathBuf::from("host.der")));
+        assert_eq!(args.identity_key, Some(PathBuf::from("host-key.der")));
+        assert_eq!(args.peer_cert, Some(PathBuf::from("client.der")));
+        assert!(!args.unsafe_udp_lab);
+    }
+
+    #[test]
+    fn host_version_is_a_stable_cli_action() {
+        let args =
+            parse_host_args_from(["latencydesk-host", "--version"]).expect("version option parses");
+        assert!(args.show_version);
+        assert_eq!(
+            version_text(),
+            format!("latencydesk-host {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn pairing_timeout_enforces_bounded_range() {
+        for invalid in ["0", "3601"] {
+            let error = parse_host_args_from(["latencydesk-host", "--pairing-timeout", invalid])
+                .expect_err("out-of-range timeout must fail");
+            assert!(error.to_string().contains("between 1 and 3600"));
+        }
+
+        let minimum = parse_host_args_from(["latencydesk-host", "--pairing-timeout", "1"])
+            .expect("minimum timeout");
+        assert_eq!(minimum.pairing_timeout_secs, 1);
+
+        let maximum = parse_host_args_from(["latencydesk-host", "--pairing-timeout", "3600"])
+            .expect("maximum timeout");
+        assert_eq!(maximum.pairing_timeout_secs, 3_600);
+    }
+
+    #[test]
+    fn fps_enforces_safe_interval_range() {
+        for invalid in ["0", "241", "4294967295"] {
+            let error = parse_host_args_from(["latencydesk-host", "--fps", invalid])
+                .expect_err("out-of-range fps must fail before interval construction");
+            assert!(error.to_string().contains("between 1 and 240"));
+        }
+
+        let maximum = parse_host_args_from(["latencydesk-host", "--fps", "240"])
+            .expect("maximum fps remains valid");
+        assert_eq!(maximum.fps, 240);
+
+        let legacy_profile =
+            parse_host_args_from(["latencydesk-host", "--unsafe-udp-lab", "--1080p120-profile"])
+                .expect("legacy 120 fps profile remains valid in explicit lab mode");
+        assert_eq!(legacy_profile.fps, 120);
+    }
 }

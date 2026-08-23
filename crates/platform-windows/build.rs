@@ -5,6 +5,7 @@ fn main() {
         "src/native.rs",
         "../../native/windows/include/latencydesk_windows_bridge.h",
         "../../native/windows/latencydesk_windows_bridge.cpp",
+        "../../native/windows/input_event_queue.hpp",
         "../../native/windows/dda_capture_source.hpp",
         "../../native/windows/dda_capture_source.cpp",
         "../../native/windows/mf_h264_encoder.hpp",

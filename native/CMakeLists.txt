@@ -29,6 +29,11 @@ add_test(NAME capture_detach COMMAND latencydesk_capture_detach)
 add_test(NAME portal_stream_target COMMAND latencydesk_portal_stream_target)
 
 if(WIN32)
+  # Keep the legacy min/max macros out of every Windows SDK translation unit.
+  # Several probes use std::numeric_limits and std::min/std::max, so this must
+  # be a target-wide build contract rather than an include-order accident.
+  add_compile_definitions(NOMINMAX)
+
   add_library(latencydesk_win_dda_capture_source STATIC windows/dda_capture_source.cpp)
   target_include_directories(latencydesk_win_dda_capture_source PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/common)
   target_link_libraries(latencydesk_win_dda_capture_source PUBLIC d3d11 dxgi)

@@ -3,33 +3,32 @@
 //! Native QUIC/UDP client role coordinator using platform providers.
 
 use latencydesk_input::{InputEvent, InputMessage};
-use latencydesk_media::ContinuityAction;
-use latencydesk_platform::{CursorMode, PlatformError, PresentableFrame, ProviderDiagnostics};
-use latencydesk_runtime::{ClientRuntime, DecodeBackend, LocalInputBackend};
-use latencydesk_session::authorization::SessionId;
-use latencydesk_session::runtime::{
-    AuthorityError, ClosedAuthority, DispatchPermit, DispatchStamp, InputLedger, SessionGate,
-    SessionInputError,
-};
 use latencydesk_socket_transport::{
     AuthenticatedDatagramEndpoint, AuthenticatedSessionConfig, HandshakeState, SessionRole,
     SocketError, UdpEndpoint, APPROVE_LAN_TEST_SECRET, DEFAULT_MAX_SOCKET_DATAGRAM,
 };
-use latencydesk_transport::{IngestOutcome, ReassembledFrame, ReassemblyConfig};
+#[cfg(windows)]
+use latencydesk_transport::ReassembledFrame;
+use latencydesk_transport::{IngestOutcome, ReassemblyConfig};
 
 use std::env;
 use std::error::Error;
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+#[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(windows, test))]
 use std::sync::mpsc;
+#[cfg(windows)]
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const CLIENT_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
+mod secure;
+
+const MAX_PAIRING_TIMEOUT_SECS: u64 = 3_600;
 #[derive(Debug, Clone)]
 pub struct ClientArgs {
-
     pub connect_addr: SocketAddr,
     pub bind_addr: SocketAddr,
     pub peer_alias: Option<String>,
@@ -41,6 +40,11 @@ pub struct ClientArgs {
     pub auto_approve: bool,
     pub shared_secret: Option<[u8; 32]>,
     pub inject_probe: bool,
+    pub identity_cert: Option<PathBuf>,
+    pub identity_key: Option<PathBuf>,
+    pub peer_cert: Option<PathBuf>,
+    pub unsafe_udp_lab: bool,
+    pub show_version: bool,
 }
 
 impl Default for ClientArgs {
@@ -57,10 +61,14 @@ impl Default for ClientArgs {
             auto_approve: false,
             shared_secret: None,
             inject_probe: false,
+            identity_cert: None,
+            identity_key: None,
+            peer_cert: None,
+            unsafe_udp_lab: false,
+            show_version: false,
         }
     }
 }
-
 
 pub fn parse_client_args() -> Result<ClientArgs, Box<dyn Error>> {
     parse_client_args_from(env::args())
@@ -134,7 +142,35 @@ where
                 config.inject_probe = true;
                 i += 1;
             }
-
+            "--identity-cert" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --identity-cert".into());
+                }
+                config.identity_cert = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--identity-key" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --identity-key".into());
+                }
+                config.identity_key = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--peer-cert" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --peer-cert".into());
+                }
+                config.peer_cert = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--unsafe-udp-lab" => {
+                config.unsafe_udp_lab = true;
+                i += 1;
+            }
+            "--version" | "-V" => {
+                config.show_version = true;
+                i += 1;
+            }
             "--shared-secret" => {
                 if i + 1 >= args.len() {
                     return Err("missing value for --shared-secret".into());
@@ -164,21 +200,27 @@ where
             "--help" | "-h" => {
                 println!(
                     "Usage: latencydesk-client [OPTIONS]\n\n\
-                     Options:\n  \
+                     Secure QUIC options (default and required):\n  \
                        --connect <ADDR>          Host address to connect to (default 127.0.0.1:9000)\n  \
                        --bind <ADDR>             Local socket address to bind (default 0.0.0.0:0)\n  \
-                       --peer-alias <NAME>       Alias name used to derive a stable device fingerprint\n  \
-                       --pairing-timeout <SECS>  Pairing expiration timeout in seconds (default 60)\n  \
-                       --1080p120-profile        Request 1080p 120fps direct LAN streaming profile\n  \
-                       --width <PIXELS>          Presentation width (default 1280)\n  \
-                       --height <PIXELS>         Presentation height (default 720)\n  \
+                       --identity-cert <PATH>    Client identity certificate in DER format\n  \
+                       --identity-key <PATH>     Client PKCS#8 private key in DER format\n  \
+                       --peer-cert <PATH>        Exact Host certificate to pin in DER format\n  \
+                       --pairing-timeout <SECS>  Connect/media timeout, 1..3600 (default 60)\n  \
+                       --width <PIXELS>          Probe coordinate width (--inject-probe only; default 1280)\n  \
+                       --height <PIXELS>         Probe coordinate height (--inject-probe only; default 720)\n  \
                        --frames <COUNT>          Receive N completed frames then exit (headless)\n  \
                        --inject-probe            Send one pointer move and ReleaseAll, wait 3 frames, exit\n  \
-                       --shared-secret <HEX64>   32-byte HMAC secret as 64 hex characters\n  \
                        --role client             Explicit role assertion\n  \
-                       --approve                 LAN/test mode using the built-in default secret\n  \
+                       --version, -V             Show version information\n  \
                        --help, -h                Show this help message\n\n\
-                     Note: The product binary strictly rejects simulated --interactive mode."
+                     Unsafe legacy UDP lab mode (plaintext; never expose to a network):\n  \
+                       --unsafe-udp-lab          Explicitly opt into the legacy plaintext transport\n  \
+                       --shared-secret <HEX64>   Legacy 32-byte handshake secret\n  \
+                       --approve                 Legacy built-in lab secret\n  \
+                       --peer-alias <NAME>       Legacy fingerprint alias\n  \
+                       --1080p120-profile        Legacy LAN profile request\n\n\
+                     Secure identity flags and --unsafe-udp-lab are mutually exclusive."
                 );
                 std::process::exit(0);
             }
@@ -191,6 +233,66 @@ where
     if config.width % 2 != 0 || config.height % 2 != 0 {
         return Err("width and height must be even integers for NV12 presentation".into());
     }
+    if config.max_frames == Some(0) {
+        return Err("--frames must be greater than zero".into());
+    }
+    if config.inject_probe && config.max_frames.is_some() {
+        return Err("--inject-probe and --frames are mutually exclusive".into());
+    }
+    if config.pairing_timeout_secs == 0 || config.pairing_timeout_secs > MAX_PAIRING_TIMEOUT_SECS {
+        return Err(format!(
+            "--pairing-timeout must be between 1 and {MAX_PAIRING_TIMEOUT_SECS} seconds"
+        )
+        .into());
+    }
+    if config.show_version {
+        return Ok(config);
+    }
+
+    let has_identity = config.identity_cert.is_some()
+        || config.identity_key.is_some()
+        || config.peer_cert.is_some();
+    let has_legacy_option = config.peer_alias.is_some()
+        || config.auto_approve
+        || config.shared_secret.is_some()
+        || config.profile_1080p120;
+    if config.unsafe_udp_lab {
+        if has_identity {
+            return Err(
+                "secure identity flags cannot be combined with --unsafe-udp-lab; remove one mode"
+                    .into(),
+            );
+        }
+        if !config.auto_approve && config.shared_secret.is_none() {
+            return Err(
+                "--unsafe-udp-lab requires --shared-secret <HEX64> or explicit --approve".into(),
+            );
+        }
+    } else {
+        if has_legacy_option {
+            return Err(
+                "legacy UDP options require explicit --unsafe-udp-lab; secure mode uses identity certificates"
+                    .into(),
+            );
+        }
+        let mut missing = Vec::new();
+        if config.identity_cert.is_none() {
+            missing.push("--identity-cert <PATH>");
+        }
+        if config.identity_key.is_none() {
+            missing.push("--identity-key <PATH>");
+        }
+        if config.peer_cert.is_none() {
+            missing.push("--peer-cert <PATH>");
+        }
+        if !missing.is_empty() {
+            return Err(format!(
+                "secure QUIC mode requires {}; generate an identity and exchange only certificate files",
+                missing.join(", ")
+            )
+            .into());
+        }
+    }
     Ok(config)
 }
 
@@ -201,136 +303,7 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
-#[derive(Debug)]
-struct PassthroughDecoder {
-    diagnostics: ProviderDiagnostics,
-}
-
-impl PassthroughDecoder {
-    fn new() -> Self {
-        Self {
-            diagnostics: ProviderDiagnostics::idle("client_decoder"),
-        }
-    }
-}
-
-impl DecodeBackend for PassthroughDecoder {
-    fn decode(
-        &mut self,
-        _frame: ReassembledFrame,
-        _continuity: ContinuityAction,
-        _stamp: DispatchStamp,
-        _now_ns: u64,
-    ) -> Result<PresentableFrame, latencydesk_runtime::RuntimeError> {
-        Err(latencydesk_runtime::RuntimeError::Platform(
-            PlatformError::Unsupported,
-        ))
-    }
-
-    fn quiesce_decoding(&mut self) -> Result<(), latencydesk_runtime::RuntimeError> {
-        Ok(())
-    }
-
-    fn diagnostics(&self) -> ProviderDiagnostics {
-        self.diagnostics.clone()
-    }
-}
-
-#[derive(Debug)]
-struct NativeLocalInput {
-    diagnostics: ProviderDiagnostics,
-}
-
-impl NativeLocalInput {
-    fn new() -> Self {
-        Self {
-            diagnostics: ProviderDiagnostics::idle("client_local_input"),
-        }
-    }
-}
-
-impl LocalInputBackend for NativeLocalInput {
-    fn release_all(
-        &mut self,
-        _actions: &[latencydesk_input::AppliedInput],
-    ) -> Result<(), latencydesk_runtime::RuntimeError> {
-        Ok(())
-    }
-
-    fn diagnostics(&self) -> ProviderDiagnostics {
-        self.diagnostics.clone()
-    }
-}
-
-pub struct ClientSessionGate {
-    session_id: SessionId,
-    generation: u64,
-    authorization_epoch: u32,
-    display_epoch: u32,
-    codec_epoch: u32,
-    closed: bool,
-}
-
-impl ClientSessionGate {
-    pub fn new(session_id: SessionId) -> Self {
-        Self {
-            session_id,
-            generation: 1,
-            authorization_epoch: 1,
-            display_epoch: 1,
-            codec_epoch: 1,
-            closed: false,
-        }
-    }
-}
-
-impl SessionGate for ClientSessionGate {
-    fn acquire_dispatch(&self, _now_ns: u64) -> Result<DispatchPermit, AuthorityError> {
-        if self.closed {
-            return Err(AuthorityError::Closed);
-        }
-        let stamp = DispatchStamp::new(
-            self.session_id,
-            self.generation,
-            self.authorization_epoch,
-            self.display_epoch,
-            self.codec_epoch,
-        )?;
-        Ok(DispatchPermit::from_stamp(stamp))
-    }
-
-    fn recheck(
-        &self,
-        permit: &DispatchPermit,
-        _now_ns: u64,
-    ) -> Result<DispatchStamp, AuthorityError> {
-        if self.closed {
-            return Err(AuthorityError::Closed);
-        }
-        if permit.stamp().generation() != self.generation
-            || permit.stamp().authorization_epoch() != self.authorization_epoch
-            || permit.stamp().display_epoch() != self.display_epoch
-            || permit.stamp().codec_epoch() != self.codec_epoch
-        {
-            return Err(AuthorityError::StaleDispatch);
-        }
-        Ok(permit.stamp())
-    }
-
-    fn apply_input(
-        &mut self,
-        _message: latencydesk_input::InputMessage,
-        _now_ns: u64,
-    ) -> Result<latencydesk_input::ReconcileOutcome, SessionInputError> {
-        Ok(latencydesk_input::ReconcileOutcome::Applied(vec![]))
-    }
-
-    fn close(&mut self) -> Result<ClosedAuthority, AuthorityError> {
-        self.closed = true;
-        Ok(ClosedAuthority::new(InputLedger::default(), 0))
-    }
-}
-
+#[cfg(windows)]
 fn reconstruct_frame_nv12(width: usize, height: usize, frame_bytes: &[u8]) -> Vec<u8> {
     let luma_size = width * height;
     let chroma_size = luma_size / 2;
@@ -355,8 +328,10 @@ fn reconstruct_frame_nv12(width: usize, height: usize, frame_bytes: &[u8]) -> Ve
     nv12
 }
 
+#[cfg(any(windows, test))]
 const MAX_FRAMES_PER_PUMP: usize = 4;
 
+#[cfg(any(windows, test))]
 fn take_latest_frame<T>(receiver: &mpsc::Receiver<T>) -> Option<T> {
     let mut latest = None;
     for _ in 0..MAX_FRAMES_PER_PUMP {
@@ -368,6 +343,7 @@ fn take_latest_frame<T>(receiver: &mpsc::Receiver<T>) -> Option<T> {
     latest
 }
 
+#[cfg(any(windows, test))]
 fn parse_nv12_access_unit(bytes: &[u8]) -> Option<(u32, u32, &[u8])> {
     if bytes.len() < 8 {
         return None;
@@ -407,6 +383,7 @@ fn send_input_event(
     Ok(())
 }
 
+#[cfg(windows)]
 fn pixels_for_frame(width: u32, height: u32, bytes: &[u8]) -> Vec<u8> {
     if let Some((w, h, nv12)) = parse_nv12_access_unit(bytes) {
         if w == width && h == height {
@@ -420,6 +397,7 @@ fn run_inject_probe(
     session: &mut AuthenticatedDatagramEndpoint,
     width: u32,
     height: u32,
+    timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
     session.set_read_timeout(Duration::from_millis(2))?;
 
@@ -435,13 +413,11 @@ fn run_inject_probe(
         },
     )?;
     send_input_event(session, &mut sequence, InputEvent::ReleaseAll)?;
-    let received = receive_completed_frames_for(session, 3, Duration::from_secs(30))?;
+    let received = receive_completed_frames_for(session, 3, timeout)?;
     println!("inject-probe: sent");
     println!("received: frames={received}");
     Ok(())
 }
-
-
 
 fn parse_hex32(value: &str) -> Result<[u8; 32], Box<dyn Error>> {
     let value = value.trim();
@@ -561,7 +537,6 @@ fn establish_client_session(
         },
     )?;
 
-
     let fingerprint = match &args.peer_alias {
         Some(alias) => fingerprint_from_alias(alias),
         None => {
@@ -571,7 +546,7 @@ fn establish_client_session(
         }
     };
     let client_nonce = random_nonce();
-    let deadline = Instant::now() + CLIENT_SESSION_TIMEOUT;
+    let deadline = Instant::now() + Duration::from_secs(args.pairing_timeout_secs);
     let mut buf = vec![0u8; DEFAULT_MAX_SOCKET_DATAGRAM];
 
     session.client_initiate_handshake(fingerprint, client_nonce)?;
@@ -612,19 +587,11 @@ fn establish_client_session(
     Ok(session)
 }
 
-fn receive_completed_frames(
-    session: &mut AuthenticatedDatagramEndpoint,
-    needed: u64,
-) -> Result<u64, Box<dyn Error>> {
-    receive_completed_frames_for(session, needed, CLIENT_SESSION_TIMEOUT)
-}
-
 fn receive_completed_frames_for(
     session: &mut AuthenticatedDatagramEndpoint,
     needed: u64,
     timeout: Duration,
-) -> Result<u64, Box<dyn Error>>
-{
+) -> Result<u64, Box<dyn Error>> {
     let deadline = Instant::now() + timeout;
     let mut buf = vec![0u8; DEFAULT_MAX_SOCKET_DATAGRAM];
     let mut completed = 0u64;
@@ -642,9 +609,24 @@ fn receive_completed_frames_for(
     Ok(completed)
 }
 
-
 fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_client_args()?;
+    if args.show_version {
+        println!("latencydesk-client {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.unsafe_udp_lab {
+        eprintln!(
+            "WARNING: --unsafe-udp-lab uses unauthenticated plaintext media/input UDP. \
+             It is only for isolated localhost/lab testing and must never be exposed to a LAN or WAN."
+        );
+        run_unsafe_udp_lab(&args)
+    } else {
+        secure::run(&args)
+    }
+}
+
+fn run_unsafe_udp_lab(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
     println!("=== LatencyDesk Client ===");
     println!("Target Host Address: {}", args.connect_addr);
     println!("Local Binding Address: {}", args.bind_addr);
@@ -653,14 +635,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.profile_1080p120
     );
 
-    let mut session = establish_client_session(&args)?;
+    let mut session = establish_client_session(args)?;
+    let timeout = Duration::from_secs(args.pairing_timeout_secs);
 
     if args.inject_probe {
-        return run_inject_probe(&mut session, args.width, args.height);
+        return run_inject_probe(&mut session, args.width, args.height, timeout);
     }
 
     if let Some(max_frames) = args.max_frames {
-        let received = receive_completed_frames(&mut session, max_frames)?;
+        let received = receive_completed_frames_for(&mut session, max_frames, timeout)?;
         println!("received: frames={received}");
         return Ok(());
     }
@@ -669,10 +652,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         use latencydesk_platform_windows::D3D11WindowRenderer;
 
-
         session.set_read_timeout(Duration::from_millis(2))?;
 
-        let first = wait_first_completed_frame(&mut session)?;
+        let first = wait_first_completed_frame(&mut session, timeout)?;
         let (width, height, real_nv12) = match parse_nv12_access_unit(&first.bytes) {
             Some((w, h, _)) => (w, h, true),
             None => (args.width, args.height, false),
@@ -722,8 +704,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut rendered_frames = 1u64;
         let mut input_seq = 0u64;
 
-        while window.pump_messages() {
+        'viewer: while window.pump_messages() {
             for event in window.poll_inputs(32) {
+                if window_input_overflowed(&event) {
+                    eprintln!(
+                        "native input queue overflowed; disconnecting to prevent a stuck key or button"
+                    );
+                    break 'viewer;
+                }
                 if let Some(input) = window_event_to_input(event, width, height) {
                     input_seq = input_seq.saturating_add(1);
                     if let Ok(bytes) = encode_input(input_seq, input) {
@@ -757,7 +745,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("Presentation window closed. Disconnected cleanly.");
     }
 
-
     #[cfg(not(windows))]
     {
         let _ = session;
@@ -767,10 +754,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn wait_first_completed_frame(
     session: &mut AuthenticatedDatagramEndpoint,
+    timeout: Duration,
 ) -> Result<ReassembledFrame, Box<dyn Error>> {
-    let deadline = Instant::now() + CLIENT_SESSION_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let mut buf = vec![0u8; DEFAULT_MAX_SOCKET_DATAGRAM];
     loop {
         if Instant::now() >= deadline {
@@ -793,7 +782,7 @@ fn window_event_to_input(
 ) -> Option<InputEvent> {
     use latencydesk_platform_windows::{
         win32_vk_to_hid_usage, INPUT_KIND_BUTTON, INPUT_KIND_KEY, INPUT_KIND_MOUSE_MOVE,
-        INPUT_KIND_WHEEL,
+        INPUT_KIND_RELEASE_ALL, INPUT_KIND_WHEEL,
     };
     match event.kind {
         INPUT_KIND_MOUSE_MOVE => {
@@ -823,12 +812,15 @@ fn window_event_to_input(
             horizontal: 0,
             vertical: event.wheel.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
         }),
+        INPUT_KIND_RELEASE_ALL => Some(InputEvent::ReleaseAll),
         _ => None,
     }
 }
 
-
-
+#[cfg(windows)]
+fn window_input_overflowed(event: &latencydesk_platform_windows::WindowInputEvent) -> bool {
+    event.kind == latencydesk_platform_windows::INPUT_KIND_OVERFLOW
+}
 
 #[cfg(test)]
 mod tests {
@@ -848,6 +840,8 @@ mod tests {
     fn client_parser_accepts_1080p120_profile() {
         let args = parse_client_args_from([
             "latencydesk-client",
+            "--unsafe-udp-lab",
+            "--approve",
             "--1080p120-profile",
             "--connect",
             "127.0.0.1:9000",
@@ -862,6 +856,7 @@ mod tests {
         let secret = "cc".repeat(32);
         let args = parse_client_args_from([
             "latencydesk-client",
+            "--unsafe-udp-lab",
             "--approve",
             "--shared-secret",
             secret.as_str(),
@@ -892,6 +887,12 @@ mod tests {
     fn client_parser_accepts_geometry_and_inject_probe() {
         let args = parse_client_args_from([
             "latencydesk-client",
+            "--identity-cert",
+            "client-cert.der",
+            "--identity-key",
+            "client-key.der",
+            "--peer-cert",
+            "host-cert.der",
             "--width",
             "1280",
             "--height",
@@ -902,6 +903,92 @@ mod tests {
         assert_eq!(args.width, 1280);
         assert_eq!(args.height, 720);
         assert!(args.inject_probe);
+    }
+
+    #[test]
+    fn client_mode_defaults_to_secure() {
+        let args = ClientArgs::default();
+        assert!(!args.unsafe_udp_lab);
+    }
+
+    #[test]
+    fn client_parser_accepts_complete_secure_identity() {
+        let args = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client-cert.der",
+            "--identity-key",
+            "client-key.der",
+            "--peer-cert",
+            "host-cert.der",
+            "--pairing-timeout",
+            "12",
+            "--frames",
+            "2",
+        ])
+        .expect("secure args");
+        assert!(!args.unsafe_udp_lab);
+        assert_eq!(args.identity_cert, Some(PathBuf::from("client-cert.der")));
+        assert_eq!(args.identity_key, Some(PathBuf::from("client-key.der")));
+        assert_eq!(args.peer_cert, Some(PathBuf::from("host-cert.der")));
+        assert_eq!(args.max_frames, Some(2));
+        assert_eq!(args.pairing_timeout_secs, 12);
+    }
+
+    #[test]
+    fn client_parser_requires_explicit_lab_opt_in_for_legacy_flags() {
+        let error = parse_client_args_from(["latencydesk-client", "--approve"])
+            .expect_err("approve cannot silently downgrade transport");
+        assert!(error.to_string().contains("--unsafe-udp-lab"));
+    }
+
+    #[test]
+    fn client_parser_rejects_mixed_secure_and_lab_modes() {
+        let error = parse_client_args_from([
+            "latencydesk-client",
+            "--unsafe-udp-lab",
+            "--approve",
+            "--identity-cert",
+            "client-cert.der",
+        ])
+        .expect_err("identity and plaintext modes must not mix");
+        assert!(error.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn client_parser_rejects_incomplete_secure_identity() {
+        let error =
+            parse_client_args_from(["latencydesk-client", "--identity-cert", "client-cert.der"])
+                .expect_err("all three secure identity files are required");
+        let message = error.to_string();
+        assert!(message.contains("--identity-key"));
+        assert!(message.contains("--peer-cert"));
+    }
+
+    #[test]
+    fn client_parser_accepts_version_without_identity_files() {
+        let args = parse_client_args_from(["latencydesk-client", "--version"])
+            .expect("version is an offline action");
+        assert!(args.show_version);
+    }
+
+    #[test]
+    fn client_parser_rejects_out_of_range_timeout() {
+        for timeout in ["0", "3601"] {
+            let error = parse_client_args_from([
+                "latencydesk-client",
+                "--identity-cert",
+                "client-cert.der",
+                "--identity-key",
+                "client-key.der",
+                "--peer-cert",
+                "host-cert.der",
+                "--pairing-timeout",
+                timeout,
+            ])
+            .expect_err("timeout must be bounded");
+            assert!(error.to_string().contains("between 1 and 3600"));
+        }
     }
 
     #[test]
@@ -918,4 +1005,27 @@ mod tests {
         assert!(parse_nv12_access_unit(&[0, 0, 0, 1, 0x67, 1, 2, 3]).is_none());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn window_safety_events_release_or_fail_closed() {
+        use latencydesk_platform_windows::{
+            WindowInputEvent, INPUT_KIND_OVERFLOW, INPUT_KIND_RELEASE_ALL,
+        };
+
+        let event = |kind| WindowInputEvent {
+            kind,
+            button: 0,
+            pressed: false,
+            x: 0,
+            y: 0,
+            wheel: 0,
+            vk: 0,
+        };
+        assert_eq!(
+            window_event_to_input(event(INPUT_KIND_RELEASE_ALL), 640, 360),
+            Some(InputEvent::ReleaseAll)
+        );
+        assert!(window_input_overflowed(&event(INPUT_KIND_OVERFLOW)));
+        assert!(window_event_to_input(event(INPUT_KIND_OVERFLOW), 640, 360).is_none());
+    }
 }
