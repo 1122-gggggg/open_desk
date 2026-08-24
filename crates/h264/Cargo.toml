@@ -8,6 +8,8 @@ repository.workspace = true
 
 [dependencies]
 latencydesk-media = { path = "../media" }
+latencydesk-codec = { path = "../codec" }
+
 
 [lints]
 workspace = true

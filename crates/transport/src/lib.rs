@@ -423,6 +423,15 @@ impl Reassembler {
         expired.len()
     }
 
+    /// Polls and drops incomplete frames whose age exceeds
+    /// [`ReassemblyConfig::max_frame_age_ns`].
+    ///
+    /// Documented alias of [`Self::expire`] for receive loops that must age out
+    /// partial access units without ingesting another datagram.
+    pub fn expire_due(&mut self, now_ns: u64) -> usize {
+        self.expire(now_ns)
+    }
+
     #[must_use]
     pub fn inflight_frames(&self) -> usize {
         self.frames.len()
@@ -1594,5 +1603,31 @@ mod tests {
         assert_eq!(msg.codec_epoch, 2);
         assert!(msg.flags & rate_flags::FORCE_KEYFRAME != 0);
         assert!(msg.flags & rate_flags::EPOCH_BUMP != 0);
+    }
+
+    #[test]
+    fn expire_due_removes_partial_without_ingest() {
+        let packets = fragment_frame(spec(3), &[9_u8; 2_000], 1_200).expect("fragment");
+        assert!(
+            packets.len() > 1,
+            "test requires a partial AU after one ingest"
+        );
+        let config = ReassemblyConfig {
+            max_frame_age_ns: 1_000,
+            ..ReassemblyConfig::default()
+        };
+        let mut reassembler = Reassembler::new(config).expect("config");
+        assert!(matches!(
+            reassembler.ingest(&packets[0], 0).expect("partial ingest"),
+            IngestOutcome::Pending { .. }
+        ));
+        assert_eq!(reassembler.inflight_frames(), 1);
+        assert_eq!(reassembler.stats().frames_expired, 0);
+
+        let expired = reassembler.expire_due(config.max_frame_age_ns);
+        assert_eq!(expired, 1);
+        assert_eq!(reassembler.inflight_frames(), 0);
+        assert_eq!(reassembler.buffered_bytes(), 0);
+        assert_eq!(reassembler.stats().frames_expired, 1);
     }
 }

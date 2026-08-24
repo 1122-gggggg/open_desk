@@ -33,7 +33,7 @@ fn main() {
 
     for library in [
         "d3d11", "dxgi", "dxguid", "wer", "mfplat", "mf", "mfuuid", "ole32", "oleaut32", "propsys",
-        "user32",
+        "user32", "gdi32",
     ] {
         println!("cargo:rustc-link-lib={library}");
     }

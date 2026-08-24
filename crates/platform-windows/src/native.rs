@@ -143,7 +143,7 @@ pub(crate) fn map_bridge_status_to_failure(
 
 // CXX requires the externally implemented boundary to be marked unsafe. The
 // interface is narrow and does not expose raw OS handles to safe Rust.
-#[allow(dead_code, unsafe_code)]
+#[allow(dead_code, unsafe_code, clippy::too_many_arguments)]
 #[cxx::bridge(namespace = "latencydesk::windows_bridge")]
 pub(crate) mod ffi {
     unsafe extern "C++" {
@@ -217,6 +217,29 @@ pub(crate) mod ffi {
         fn renderer_poll_inputs(renderer: Pin<&mut Renderer>, out: &mut [u8]) -> u32;
         fn renderer_is_open(renderer: &Renderer) -> bool;
         fn renderer_close(renderer: Pin<&mut Renderer>);
+        fn gdi_desktop_metrics(
+            width: &mut u32,
+            height: &mut u32,
+            origin_x: &mut i32,
+            origin_y: &mut i32,
+        ) -> u32;
+        fn gdi_capture_desktop_bgra(
+            pixels: &mut [u8],
+            width: &mut u32,
+            height: &mut u32,
+            stride: &mut u32,
+        ) -> u32;
+        fn send_win32_input(
+            kind: u32,
+            dx: i32,
+            dy: i32,
+            mouse_data: u32,
+            flags: u32,
+            vk_code: u16,
+            scan_code: u16,
+            time: u32,
+            extra_info: u64,
+        ) -> u32;
 
     }
 }

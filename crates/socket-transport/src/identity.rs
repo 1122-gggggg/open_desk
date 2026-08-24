@@ -16,6 +16,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -133,6 +135,22 @@ pub enum IdentityError {
         /// Permission bits observed on disk.
         mode: u32,
     },
+    /// Windows DACL grants Everyone, Users, or Authenticated Users access.
+    #[cfg(windows)]
+    InsecureWindowsPrivateKeyAcl {
+        /// Path supplied by the caller.
+        path: PathBuf,
+    },
+    /// `icacls` could not inspect or restrict a private-key ACL.
+    #[cfg(windows)]
+    WindowsAclCommandFailed {
+        /// Operation being attempted.
+        operation: &'static str,
+        /// Path supplied by the caller.
+        path: PathBuf,
+        /// `icacls` exit status or spawn failure, without file contents.
+        details: String,
+    },
     /// Filesystem work failed. No file contents are included in this error.
     Io {
         /// Operation being attempted.
@@ -187,6 +205,22 @@ impl fmt::Display for IdentityError {
                 "private key at {} has insecure mode {mode:04o}; expected no group/other permissions (0600 recommended)",
                 path.display()
             ),
+            #[cfg(windows)]
+            Self::InsecureWindowsPrivateKeyAcl { path } => write!(
+                formatter,
+                "private key at {} has an insecure Windows ACL; Everyone, Users, and Authenticated Users must not have access",
+                path.display()
+            ),
+            #[cfg(windows)]
+            Self::WindowsAclCommandFailed {
+                operation,
+                path,
+                details,
+            } => write!(
+                formatter,
+                "failed to {operation} {}: {details}",
+                path.display()
+            ),
             Self::Io {
                 operation,
                 path,
@@ -216,6 +250,10 @@ impl Error for IdentityError {
             | Self::PeerCertificateMismatch => None,
             #[cfg(unix)]
             Self::InsecurePrivateKeyPermissions { .. } => None,
+            #[cfg(windows)]
+            Self::InsecureWindowsPrivateKeyAcl { .. } | Self::WindowsAclCommandFailed { .. } => {
+                None
+            }
         }
     }
 }
@@ -310,7 +348,9 @@ impl TlsIdentity {
     /// Persists raw DER files without overwriting either destination.
     ///
     /// The private-key file is created first with `create_new`. On Unix its
-    /// permissions are set to exactly `0600` before key bytes are written. If
+    /// permissions are set to exactly `0600` before key bytes are written. On
+    /// Windows its DACL is restricted with `icacls` so only the current user
+    /// can read/write; a failed restriction deletes the new file. If
     /// certificate creation fails, the newly created private-key file is
     /// removed so callers never observe a successful half-write.
     pub fn write_der(
@@ -372,9 +412,148 @@ fn verify_private_key_permissions(path: &Path) -> Result<(), IdentityError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn verify_private_key_permissions(path: &Path) -> Result<(), IdentityError> {
+    let listing = run_icacls(path, &[], "inspect private-key ACL for")?;
+    if windows_acl_grants_world_access(&listing) {
+        return Err(IdentityError::InsecureWindowsPrivateKeyAcl {
+            path: path.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn verify_private_key_permissions(_path: &Path) -> Result<(), IdentityError> {
     Ok(())
+}
+
+#[cfg(windows)]
+fn restrict_windows_owner_only_acl(path: &Path) -> Result<(), IdentityError> {
+    let user =
+        current_windows_account().map_err(|source| IdentityError::WindowsAclCommandFailed {
+            operation: "determine current Windows account for",
+            path: path.to_owned(),
+            details: source.to_string(),
+        })?;
+    let grant = format!("{user}:(R,W)");
+    run_icacls(
+        path,
+        &["/grant:r", grant.as_str()],
+        "restrict private-key ACL for",
+    )?;
+    run_icacls(
+        path,
+        &["/inheritance:r"],
+        "disable private-key ACL inheritance for",
+    )?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn current_windows_account() -> io::Result<String> {
+    let output = Command::new(system32_tool("whoami.exe")).output()?;
+    if output.status.success() {
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !name.is_empty() {
+            return Ok(name);
+        }
+    }
+    match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(domain), Ok(user)) if !user.is_empty() => {
+            if domain.is_empty() {
+                Ok(user)
+            } else {
+                Ok(format!("{domain}\\{user}"))
+            }
+        }
+        (_, Ok(user)) if !user.is_empty() => Ok(user),
+        _ => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "current Windows account is unavailable",
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn system32_tool(name: &str) -> PathBuf {
+    match std::env::var_os("SystemRoot") {
+        Some(root) => PathBuf::from(root).join("System32").join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+#[cfg(windows)]
+fn run_icacls(
+    path: &Path,
+    extra_args: &[&str],
+    operation: &'static str,
+) -> Result<String, IdentityError> {
+    let mut command = Command::new(system32_tool("icacls.exe"));
+    command.arg(path);
+    for arg in extra_args {
+        command.arg(arg);
+    }
+    let output = command
+        .output()
+        .map_err(|source| IdentityError::WindowsAclCommandFailed {
+            operation,
+            path: path.to_owned(),
+            details: source.to_string(),
+        })?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        let details = if stderr.trim().is_empty() {
+            format!("icacls exited with {}", output.status)
+        } else {
+            format!("icacls exited with {}: {}", output.status, stderr.trim())
+        };
+        return Err(IdentityError::WindowsAclCommandFailed {
+            operation,
+            path: path.to_owned(),
+            details,
+        });
+    }
+    Ok(stdout)
+}
+
+#[cfg(windows)]
+fn windows_acl_grants_world_access(listing: &str) -> bool {
+    let lower = listing.to_ascii_lowercase().replace('/', "\\");
+    const MARKERS: [&str; 7] = [
+        "everyone:(",
+        "authenticated users:(",
+        "builtin\\users:(",
+        "nt authority\\authenticated users:(",
+        "s-1-1-0:(",
+        "s-1-5-11:(",
+        "s-1-5-32-545:(",
+    ];
+    if MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return true;
+    }
+    for line in lower.lines() {
+        let Some((left, _)) = line.split_once(":(") else {
+            continue;
+        };
+        let name = left
+            .rsplit('\\')
+            .next()
+            .unwrap_or(left)
+            .trim()
+            .rsplit(' ')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if matches!(
+            name,
+            "users" | "everyone" | "s-1-1-0" | "s-1-5-11" | "s-1-5-32-545"
+        ) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Computes the SHA-256 fingerprint of exact DER certificate bytes.
@@ -672,6 +851,11 @@ fn write_new_file(path: &Path, bytes: &[u8], private: bool) -> Result<(), Identi
                     source,
                 })?;
         }
+        #[cfg(windows)]
+        if private {
+            restrict_windows_owner_only_acl(path)?;
+            verify_private_key_permissions(path)?;
+        }
         file.write_all(bytes).map_err(|source| IdentityError::Io {
             operation: if private {
                 "write private key"
@@ -906,6 +1090,73 @@ mod tests {
         assert!(matches!(
             TlsIdentity::load_der(&certificate_path, &private_key_path),
             Err(IdentityError::InsecurePrivateKeyPermissions { mode: 0o640, .. })
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_key_is_written_with_owner_only_acl() {
+        let directory = TestDirectory::new();
+        let certificate_path = directory.path("identity.cert.der");
+        let private_key_path = directory.path("identity.key.der");
+        TlsIdentity::generate("Permissions")
+            .expect("identity")
+            .write_der(&certificate_path, &private_key_path)
+            .expect("write identity");
+        verify_private_key_permissions(&private_key_path)
+            .expect("freshly written key ACL must be accepted");
+        TlsIdentity::load_der(&certificate_path, &private_key_path).expect("load restricted key");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn loading_rejects_world_readable_private_key_acl() {
+        let directory = TestDirectory::new();
+        let certificate_path = directory.path("identity.cert.der");
+        let private_key_path = directory.path("identity.key.der");
+        TlsIdentity::generate("Insecure Permissions")
+            .expect("identity")
+            .write_der(&certificate_path, &private_key_path)
+            .expect("write identity");
+
+        let grant = Command::new(system32_tool("icacls.exe"))
+            .arg(&private_key_path)
+            .arg("/grant")
+            .arg("Everyone:(R)")
+            .output()
+            .expect("grant Everyone");
+        assert!(
+            grant.status.success(),
+            "granting Everyone read must work without admin: {}",
+            String::from_utf8_lossy(&grant.stderr)
+        );
+
+        assert!(matches!(
+            TlsIdentity::load_der(&certificate_path, &private_key_path),
+            Err(IdentityError::InsecureWindowsPrivateKeyAcl { .. })
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_acl_parser_rejects_world_principals() {
+        assert!(windows_acl_grants_world_access(
+            "C:\\k Everyone:(R)\r\nSuccessfully processed 1 files; Failed processing 0 files\r\n"
+        ));
+        assert!(windows_acl_grants_world_access(
+            "C:\\k NT AUTHORITY\\Authenticated Users:(R)\r\n"
+        ));
+        assert!(windows_acl_grants_world_access(
+            "C:\\k BUILTIN\\Users:(R)\r\n"
+        ));
+        assert!(windows_acl_grants_world_access(
+            "                                                     Users:(R)\r\n"
+        ));
+        assert!(!windows_acl_grants_world_access(
+            "C:\\k 90607STAR\\90607:(R,W)\r\nSuccessfully processed 1 files; Failed processing 0 files\r\n"
+        ));
+        assert!(!windows_acl_grants_world_access(
+            "C:\\k 90607star\\CodexSandboxUsers:(I)(M)\r\n"
         ));
     }
 

@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+latencydesk-frame = { path = "../frame" }
+
 latencydesk-h264 = { path = "../h264" }
 latencydesk-input = { path = "../input" }
 latencydesk-media = { path = "../media" }

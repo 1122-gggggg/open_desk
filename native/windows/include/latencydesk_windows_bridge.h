@@ -223,4 +223,16 @@ class Input;
 [[nodiscard]] bool renderer_is_open(const Renderer& renderer) noexcept;
 void renderer_close(Renderer& renderer) noexcept;
 [[nodiscard]] std::uint32_t encoder_quiesce(Encoder& encoder) noexcept;
+[[nodiscard]] std::uint32_t gdi_desktop_metrics(std::uint32_t& width, std::uint32_t& height,
+                                                std::int32_t& origin_x,
+                                                std::int32_t& origin_y) noexcept;
+[[nodiscard]] std::uint32_t gdi_capture_desktop_bgra(rust::Slice<std::uint8_t> pixels,
+                                                     std::uint32_t& width,
+                                                     std::uint32_t& height,
+                                                     std::uint32_t& stride) noexcept;
+[[nodiscard]] std::uint32_t send_win32_input(std::uint32_t kind, std::int32_t dx, std::int32_t dy,
+                                             std::uint32_t mouse_data, std::uint32_t flags,
+                                             std::uint16_t vk_code, std::uint16_t scan_code,
+                                             std::uint32_t time, std::uint64_t extra_info) noexcept;
+
 }  // namespace latencydesk::windows_bridge

@@ -998,4 +998,116 @@ bool renderer_is_open(const Renderer& renderer) noexcept {
 void renderer_close(Renderer& renderer) noexcept {
   renderer.close();
 }
+
+std::uint32_t gdi_desktop_metrics(std::uint32_t& width, std::uint32_t& height,
+                                  std::int32_t& origin_x, std::int32_t& origin_y) noexcept {
+  const int virtual_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+  const int virtual_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+  if (virtual_width <= 0 || virtual_height <= 0) {
+    return status_code(BridgeStatus::InternalFailure);
+  }
+  width = static_cast<std::uint32_t>(virtual_width);
+  height = static_cast<std::uint32_t>(virtual_height);
+  origin_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+  origin_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+  return status_code(BridgeStatus::Ok);
+}
+
+std::uint32_t gdi_capture_desktop_bgra(rust::Slice<std::uint8_t> pixels, std::uint32_t& width,
+                                       std::uint32_t& height, std::uint32_t& stride) noexcept {
+  try {
+    const int origin_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int origin_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int virtual_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int virtual_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (virtual_width <= 0 || virtual_height <= 0) {
+      return status_code(BridgeStatus::InternalFailure);
+    }
+    width = static_cast<std::uint32_t>(virtual_width);
+    height = static_cast<std::uint32_t>(virtual_height);
+    stride = width * 4U;
+    const std::size_t required =
+        static_cast<std::size_t>(virtual_width) * static_cast<std::size_t>(virtual_height) * 4U;
+    if (pixels.data() == nullptr || pixels.size() < required) {
+      return status_code(BridgeStatus::InvalidArgument);
+    }
+
+    HDC screen_dc = GetDC(nullptr);
+    if (screen_dc == nullptr) {
+      return status_code(BridgeStatus::PermissionDenied);
+    }
+    HDC memory_dc = CreateCompatibleDC(screen_dc);
+    if (memory_dc == nullptr) {
+      ReleaseDC(nullptr, screen_dc);
+      return status_code(BridgeStatus::InternalFailure);
+    }
+
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = virtual_width;
+    info.bmiHeader.biHeight = -virtual_height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HBITMAP bitmap =
+        CreateDIBSection(memory_dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bitmap == nullptr || bits == nullptr) {
+      if (bitmap != nullptr) {
+        DeleteObject(bitmap);
+      }
+      DeleteDC(memory_dc);
+      ReleaseDC(nullptr, screen_dc);
+      return status_code(BridgeStatus::InternalFailure);
+    }
+
+    HGDIOBJ previous = SelectObject(memory_dc, bitmap);
+    const BOOL copied =
+        BitBlt(memory_dc, 0, 0, virtual_width, virtual_height, screen_dc, origin_x, origin_y,
+               SRCCOPY | CAPTUREBLT);
+    if (copied) {
+      GdiFlush();
+      std::memcpy(pixels.data(), bits, required);
+    }
+    SelectObject(memory_dc, previous);
+    DeleteObject(bitmap);
+    DeleteDC(memory_dc);
+    ReleaseDC(nullptr, screen_dc);
+    return copied ? status_code(BridgeStatus::Ok) : status_code(BridgeStatus::InternalFailure);
+  } catch (...) {
+    return status_code(BridgeStatus::InternalFailure);
+  }
+}
+
+std::uint32_t send_win32_input(std::uint32_t kind, std::int32_t dx, std::int32_t dy,
+                               std::uint32_t mouse_data, std::uint32_t flags,
+                               std::uint16_t vk_code, std::uint16_t scan_code, std::uint32_t time,
+                               std::uint64_t extra_info) noexcept {
+  INPUT event{};
+  if (kind == INPUT_MOUSE) {
+    event.type = INPUT_MOUSE;
+    event.mi.dx = dx;
+    event.mi.dy = dy;
+    event.mi.mouseData = mouse_data;
+    event.mi.dwFlags = flags;
+    event.mi.time = time;
+    event.mi.dwExtraInfo = static_cast<ULONG_PTR>(extra_info);
+  } else if (kind == INPUT_KEYBOARD) {
+    event.type = INPUT_KEYBOARD;
+    event.ki.wVk = vk_code;
+    event.ki.wScan = scan_code;
+    event.ki.dwFlags = flags;
+    event.ki.time = time;
+    event.ki.dwExtraInfo = static_cast<ULONG_PTR>(extra_info);
+  } else {
+    return status_code(BridgeStatus::InvalidArgument);
+  }
+  const UINT injected = SendInput(1, &event, sizeof(event));
+  if (injected != 1U) {
+    return status_code(BridgeStatus::InternalFailure);
+  }
+  return status_code(BridgeStatus::Ok);
+}
+
 }  // namespace latencydesk::windows_bridge

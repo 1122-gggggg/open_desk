@@ -10,8 +10,8 @@ use latencydesk_protocol::quic::{
     MediaDatagram, SessionStamp, StreamKind, StreamRecord, QUIC_MEDIA_HEADER_LEN,
 };
 use latencydesk_protocol::{
-    ControlHeader, ControlKind, ControlPacket, HandshakeCompletedMessage, ProtocolError,
-    MEDIA_HEADER_LEN,
+    ControlHeader, ControlKind, ControlPacket, HandshakeCompletedMessage, MediaPacket,
+    ProtocolError, MEDIA_HEADER_LEN,
 };
 use latencydesk_transport::{
     fragment_frame_with_packet_budget, FragmentSpec, IngestOutcome, ReassembledFrame, Reassembler,
@@ -113,8 +113,15 @@ pub enum ProductSessionError {
     InvalidMediaMaxAge,
     /// Sender-local deadline arithmetic exceeded the wire clock range.
     MediaDeadlineOverflow,
-    /// Quinn rejected a fragment after bounded packetization.
-    MediaSend(MediaSendOutcome),
+    /// A fragment was not accepted; remaining fragments of the AU were not sent.
+    MediaSendAborted {
+        /// QUIC/media outcome that stopped the access unit.
+        outcome: MediaSendOutcome,
+        /// Fragments accepted as [`MediaSendOutcome::Sent`] before abort.
+        fragments_sent: usize,
+        /// Fragments that belonged to the aborted access unit.
+        fragments_total: usize,
+    },
     /// The complete post-mTLS product handshake exceeded its local bound.
     HandshakeTimedOut {
         /// Local bound applied to the handshake.
@@ -153,12 +160,14 @@ impl fmt::Display for ProductSessionError {
             Self::MediaDeadlineOverflow => {
                 formatter.write_str("sender-local media deadline overflowed")
             }
-            Self::MediaSend(outcome) => {
-                write!(
-                    formatter,
-                    "QUIC rejected a packetized media fragment: {outcome:?}"
-                )
-            }
+            Self::MediaSendAborted {
+                outcome,
+                fragments_sent,
+                fragments_total,
+            } => write!(
+                formatter,
+                "media access unit aborted after {fragments_sent}/{fragments_total} fragments: {outcome:?}"
+            ),
             Self::HandshakeTimedOut { timeout } => {
                 write!(formatter, "product handshake timed out after {timeout:?}")
             }
@@ -177,7 +186,7 @@ impl Error for ProductSessionError {
             | Self::DatagramBudgetTooSmall { .. }
             | Self::InvalidMediaMaxAge
             | Self::MediaDeadlineOverflow
-            | Self::MediaSend(_)
+            | Self::MediaSendAborted { .. }
             | Self::HandshakeTimedOut { .. } => None,
         }
     }
@@ -385,6 +394,18 @@ impl ProductSession {
         frame: &[u8],
         max_age: Duration,
     ) -> Result<MediaFrameSendReport, ProductSessionError> {
+        let now_ns = self.local_now_ns();
+        self.send_media_frame_at(spec, frame, max_age, now_ns, |_| now_ns)
+    }
+
+    fn send_media_frame_at(
+        &self,
+        spec: FragmentSpec,
+        frame: &[u8],
+        max_age: Duration,
+        now_ns: u64,
+        mut send_now_ns: impl FnMut(usize) -> u64,
+    ) -> Result<MediaFrameSendReport, ProductSessionError> {
         let max_age_ns = u64::try_from(max_age.as_nanos())
             .ok()
             .filter(|age| *age != 0)
@@ -412,26 +433,34 @@ impl ProductSession {
             });
         }
 
-        let now_ns = self.local_now_ns();
         let expires_at_ns = now_ns
             .checked_add(max_age_ns)
             .ok_or(ProductSessionError::MediaDeadlineOverflow)?;
-        for packet in &packets {
-            let inner = latencydesk_protocol::MediaPacket::decode(packet)?;
+        let fragments_total = packets.len();
+        let mut fragments_sent = 0;
+        for (index, packet) in packets.iter().enumerate() {
+            let inner = MediaPacket::decode(packet)?;
             let datagram =
                 MediaDatagram::encode(self.stamp, expires_at_ns, inner.header, inner.payload)?;
             debug_assert!(datagram.len() <= path_max_datagram_bytes);
-            match self
-                .connection
-                .send_media(Bytes::from(datagram), now_ns, expires_at_ns)?
-            {
-                MediaSendOutcome::Sent => {}
-                outcome => return Err(ProductSessionError::MediaSend(outcome)),
+            match self.connection.send_media(
+                Bytes::from(datagram),
+                send_now_ns(index),
+                expires_at_ns,
+            )? {
+                MediaSendOutcome::Sent => fragments_sent += 1,
+                outcome => {
+                    return Err(ProductSessionError::MediaSendAborted {
+                        outcome,
+                        fragments_sent,
+                        fragments_total,
+                    });
+                }
             }
         }
 
         Ok(MediaFrameSendReport {
-            fragments_sent: packets.len(),
+            fragments_sent,
             largest_datagram_bytes,
             path_max_datagram_bytes,
             expires_at_ns,
@@ -443,6 +472,10 @@ impl ProductSession {
     /// arrival times drive bounded reassembly age.
     pub async fn receive_media_frame(&self) -> Result<ReassembledFrame, ProductSessionError> {
         loop {
+            {
+                let mut reassembler = self.reassembler.lock().await;
+                reassembler.expire_due(self.local_now_ns());
+            }
             let bytes = self.connection.receive_media().await?;
             let datagram = match MediaDatagram::decode(&bytes) {
                 Ok(datagram) => datagram,
@@ -466,6 +499,7 @@ impl ProductSession {
             let now_ns = self.local_now_ns();
             let outcome = {
                 let mut reassembler = self.reassembler.lock().await;
+                reassembler.expire_due(now_ns);
                 reassembler.ingest(&bytes[QUIC_MEDIA_HEADER_LEN..], now_ns)
             };
             match outcome {
@@ -492,6 +526,7 @@ impl ProductSession {
                     return Ok(frame);
                 }
                 Ok(IngestOutcome::Pending { .. } | IngestOutcome::Duplicate { .. }) => {}
+                Err(error) if is_skippable_ingest_error(&error) => {}
                 Err(error) => {
                     self.connection.close_for_protocol_violation();
                     return Err(ProductSessionError::Transport(error));
@@ -655,11 +690,26 @@ fn inbound_error(connection: &QuicConnection, error: QuicTransportError) -> Prod
     ProductSessionError::Quic(error)
 }
 
+fn is_skippable_ingest_error(error: &TransportError) -> bool {
+    matches!(
+        error,
+        TransportError::StaleCodecEpoch { .. }
+            | TransportError::MetadataConflict(_)
+            | TransportError::FragmentConflict
+            | TransportError::FragmentOverlap
+            | TransportError::ReplayDetected(_)
+            | TransportError::FragmentEntryLimit
+            | TransportError::ReassemblyCapacity
+            | TransportError::FrameExceedsReassemblyBudget { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::quic::{bind_client, bind_server};
     use latencydesk_protocol::{media_flags, MediaKind, MediaPacket};
+    use latencydesk_transport::FrameKey;
     use rcgen::generate_simple_self_signed;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::net::{Ipv4Addr, SocketAddr};
@@ -1133,6 +1183,180 @@ mod tests {
         assert_eq!(
             media_packet_budget(too_small + 1).expect("minimum complete datagram"),
             MEDIA_HEADER_LEN + 1
+        );
+    }
+
+    #[test]
+    fn stale_and_conflict_ingest_errors_are_skippable() {
+        assert!(is_skippable_ingest_error(
+            &TransportError::StaleCodecEpoch {
+                packet_epoch: 1,
+                current_epoch: 2,
+            }
+        ));
+        assert!(is_skippable_ingest_error(
+            &TransportError::MetadataConflict(FrameKey {
+                stream_id: 1,
+                codec_epoch: 1,
+                frame_id: 7,
+                kind: MediaKind::Video as u8,
+            })
+        ));
+        assert!(!is_skippable_ingest_error(
+            &TransportError::UnsupportedParity
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_fragment_aborts_the_access_unit() {
+        let (host, client) = product_pair(1_450).await;
+        let frame = vec![0xA5; 8_000];
+        let now_ns = host.local_now_ns();
+        let error = host
+            .send_media_frame_at(
+                video_spec(99),
+                &frame,
+                Duration::from_millis(250),
+                now_ns,
+                |index| {
+                    if index == 0 {
+                        now_ns
+                    } else {
+                        u64::MAX
+                    }
+                },
+            )
+            .expect_err("dropped fragment must not report AU success");
+        assert!(matches!(
+            error,
+            ProductSessionError::MediaSendAborted {
+                outcome: MediaSendOutcome::DroppedExpired,
+                fragments_sent: 1,
+                fragments_total,
+            } if fragments_total > 1
+        ));
+
+        host.send_media_frame(video_spec(100), &[0x11; 64], Duration::from_millis(250))
+            .expect("session still sends after abort");
+        let received = tokio::time::timeout(Duration::from_secs(2), client.receive_media_frame())
+            .await
+            .expect("later frame arrival")
+            .expect("later frame remains deliverable");
+        assert_eq!(received.header.frame_id, 100);
+        assert_eq!(received.bytes, vec![0x11; 64]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_and_conflict_ingest_does_not_close_session() {
+        let pair = connected_pair(1_450).await;
+        let raw_host = pair.server.clone();
+        let (host, client) = tokio::join!(
+            ProductSession::host(pair.server, NonZeroU64::new(61).expect("nonzero")),
+            ProductSession::client(pair.client),
+        );
+        let host = host.expect("host session");
+        let client = client.expect("client session");
+
+        let send_raw = |encoded: &[u8]| {
+            let packet = MediaPacket::decode(encoded).expect("inner packet");
+            MediaDatagram::encode(host.stamp(), 1_000_000_000, packet.header, packet.payload)
+                .expect("outer datagram")
+        };
+
+        let conflict_packets = fragment_frame_with_packet_budget(
+            video_spec(20),
+            &[0x22; 2_048],
+            MEDIA_HEADER_LEN + 256,
+        )
+        .expect("conflict fragments");
+        assert!(conflict_packets.len() > 1);
+        assert_eq!(
+            raw_host
+                .send_media(
+                    Bytes::from(send_raw(&conflict_packets[0])),
+                    0,
+                    1_000_000_000
+                )
+                .expect("partial"),
+            MediaSendOutcome::Sent
+        );
+        let first = MediaPacket::decode(&conflict_packets[0]).expect("decode first");
+        let mut conflicting_header = first.header;
+        conflicting_header.frame_len = first.header.frame_len.saturating_add(64);
+        let conflicting =
+            MediaPacket::encode(conflicting_header, first.payload).expect("conflict packet");
+        assert_eq!(
+            raw_host
+                .send_media(Bytes::from(send_raw(&conflicting)), 0, 1_000_000_000)
+                .expect("conflict send"),
+            MediaSendOutcome::Sent
+        );
+
+        host.send_media_frame(video_spec(21), &[0x33; 128], Duration::from_millis(250))
+            .expect("valid frame after conflict");
+        let received = tokio::time::timeout(Duration::from_secs(2), client.receive_media_frame())
+            .await
+            .expect("receiver must skip conflict")
+            .expect("valid frame remains deliverable");
+        assert_eq!(received.header.frame_id, 21);
+        assert_eq!(received.bytes, vec![0x33; 128]);
+
+        {
+            let mut bumped = video_spec(50);
+            bumped.codec_epoch = 2;
+            let epoch2 =
+                fragment_frame_with_packet_budget(bumped, &[0xAA; 128], MEDIA_HEADER_LEN + 128)
+                    .expect("epoch bump packet")
+                    .remove(0);
+            let mut reassembler = client.reassembler.lock().await;
+            assert!(matches!(
+                reassembler.ingest(&epoch2, client.local_now_ns()),
+                Ok(IngestOutcome::Complete(_))
+            ));
+            assert_eq!(reassembler.active_codec_epoch(), 2);
+        }
+        host.send_media_frame(video_spec(22), &[0x44; 64], Duration::from_millis(250))
+            .expect("stale-epoch product frame");
+        let receive = client.receive_media_frame();
+        tokio::pin!(receive);
+        let mut stale_seen = false;
+        for _ in 0..20 {
+            match tokio::time::timeout(Duration::from_millis(25), &mut receive).await {
+                Ok(Ok(_)) => panic!("stale codec epoch must not complete a frame"),
+                Ok(Err(error)) => panic!("stale codec epoch must not fail the session: {error}"),
+                Err(_) => {}
+            }
+            if client
+                .reassembler
+                .lock()
+                .await
+                .stats()
+                .stale_epoch_datagrams
+                > 0
+            {
+                stale_seen = true;
+                break;
+            }
+        }
+        assert!(
+            stale_seen,
+            "receive loop must ingest the stale-epoch datagram"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut receive)
+                .await
+                .is_err(),
+            "stale codec epoch must be skipped, not delivered or fatal"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), host.connection.closed())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), client.connection.closed())
+                .await
+                .is_err()
         );
     }
 }
