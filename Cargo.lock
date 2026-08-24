@@ -413,6 +413,7 @@ dependencies = [
 name = "latencydesk-h264"
 version = "0.1.0-alpha.2"
 dependencies = [
+ "latencydesk-codec",
  "latencydesk-media",
 ]
 
@@ -422,6 +423,7 @@ version = "0.1.0-alpha.2"
 dependencies = [
  "bytes",
  "latencydesk-codec",
+ "latencydesk-frame",
  "latencydesk-h264",
  "latencydesk-input",
  "latencydesk-media",
@@ -490,6 +492,7 @@ version = "0.1.0-alpha.2"
 dependencies = [
  "cxx",
  "cxx-build",
+ "latencydesk-frame",
  "latencydesk-h264",
  "latencydesk-input",
  "latencydesk-media",

@@ -42,8 +42,8 @@ Options:\n  \
   --identity-key <PATH>     Host private key (PKCS#8 DER; required securely)\n  \
   --peer-cert <PATH>        Exact trusted client certificate (DER; required securely)\n  \
   --pairing-timeout <SECS>  TLS connection timeout, 1..=3600 (default 60)\n  \
-  --max-width <PIXELS>      Secure Linux X11 capture canvas width (default 1280, even)\n  \
-  --max-height <PIXELS>     Secure Linux X11 capture canvas height (default 720, even)\n  \
+  --max-width <PIXELS>      Secure Linux X11 / Windows capture canvas width (default 1280, even)\n  \
+  --max-height <PIXELS>     Secure Linux X11 / Windows capture canvas height (default 720, even)\n  \
   --fps <FPS>               Secure capture frame rate, 1..=240 (default 60)\n  \
   --frames <COUNT>          Stop streaming after N frames\n  \
   --role host               Explicit role assertion\n  \
@@ -60,7 +60,7 @@ Options:\n  \
   --help, -h                Show this help message\n\n\
 Generate identities with `latencydesk-identity generate`, exchange only the\n\
 certificate files, and keep private keys on their originating machines.\n\
-Secure hosting currently requires Linux X11. --unsafe-udp-lab is plaintext\n\
+Secure hosting requires Linux X11 or Windows GDI capture. --unsafe-udp-lab is plaintext\n\
 compatibility mode and must never be exposed to an untrusted network.";
 
 #[derive(Debug, Clone)]
@@ -979,8 +979,15 @@ mod tests {
                 "legacy help line is not fail-closed: {line}"
             );
         }
-        assert!(HOST_HELP.contains("--max-width <PIXELS>      Secure Linux X11 capture"));
+        assert!(HOST_HELP.contains("--max-width <PIXELS>      Secure Linux X11 / Windows capture"));
         assert!(HOST_HELP.contains("--fps <FPS>               Secure capture frame rate"));
+        assert!(HOST_HELP.contains("Windows GDI capture"));
+    }
+
+    #[test]
+    fn help_text_mentions_windows_capture() {
+        assert!(HOST_HELP.contains("Windows GDI capture"));
+        assert!(HOST_HELP.contains("Windows capture canvas"));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! provider policy, rejects access units that introduce decoder reordering, and
 //! emits conservative frame-dependency metadata for loss recovery.
 
+use latencydesk_codec::{CodecError, CodecId, EncodedAccessUnit};
 use latencydesk_media::EncodedFrameMeta;
 use std::fmt;
 
@@ -367,6 +368,32 @@ impl ContinuityPlanner {
     }
 }
 
+/// Wraps a validated Annex-B access unit with conservative continuity metadata.
+pub fn wrap_access_unit(
+    planner: &mut ContinuityPlanner,
+    bytes: &[u8],
+    capture_sequence: u64,
+    capture_timestamp_ns: u64,
+) -> Result<EncodedAccessUnit, H264Error> {
+    let meta = planner.accept(bytes)?;
+    let unit = EncodedAccessUnit {
+        codec: CodecId::H264,
+        stream_id: 1,
+        capture_sequence,
+        capture_timestamp_ns,
+        meta,
+        bytes: bytes.to_vec(),
+    };
+    unit.validate().map_err(|err| match err {
+        CodecError::EncodedSize(len) => H264Error::AccessUnitSize(len),
+        CodecError::ForwardDependency | CodecError::RecoveryPointHasDependency => {
+            H264Error::InvalidDependency
+        }
+        _ => H264Error::Malformed,
+    })?;
+    Ok(unit)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum H264Error {
     AccessUnitSize(usize),
@@ -441,5 +468,44 @@ mod tests {
             ..policy
         };
         assert_eq!(invalid.validate(), Err(H264Error::BFrameForbidden));
+    }
+
+    #[test]
+    fn wrap_access_unit_validates_idr_p_and_rejects_b() {
+        let mut planner = ContinuityPlanner::new(1, 10);
+        let idr = wrap_access_unit(&mut planner, IDR, 7, 1_000).expect("idr");
+        assert_eq!(idr.codec, CodecId::H264);
+        assert_eq!(idr.stream_id, 1);
+        assert_eq!(idr.capture_sequence, 7);
+        assert_eq!(idr.capture_timestamp_ns, 1_000);
+        assert_eq!(idr.bytes, IDR);
+        assert!(idr.meta.recovery_point);
+        assert_eq!(idr.meta.dependency_frame_id, None);
+        idr.validate().expect("validated idr");
+        assert!(!planner.recovery_requested());
+
+        let p = wrap_access_unit(&mut planner, P, 8, 2_000).expect("p");
+        assert_eq!(p.codec, CodecId::H264);
+        assert_eq!(p.meta.dependency_frame_id, Some(10));
+        assert!(!p.meta.recovery_point);
+        p.validate().expect("validated p");
+
+        planner.note_output_drop();
+        planner.note_output_drop();
+        assert!(planner.recovery_requested());
+        assert_eq!(
+            wrap_access_unit(&mut planner, P, 9, 3_000),
+            Err(H264Error::RecoveryPointRequired)
+        );
+
+        let recovered = wrap_access_unit(&mut planner, IDR, 10, 4_000).expect("recovery");
+        assert!(recovered.meta.recovery_point);
+        recovered.validate().expect("validated recovery");
+        assert!(!planner.recovery_requested());
+
+        assert_eq!(
+            wrap_access_unit(&mut planner, B, 11, 5_000),
+            Err(H264Error::BFrameDetected)
+        );
     }
 }

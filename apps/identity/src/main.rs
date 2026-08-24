@@ -288,8 +288,90 @@ fn restrict_new_directory_permissions(path: &Path) -> Result<(), CliError> {
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn restrict_new_directory_permissions(path: &Path) -> Result<(), CliError> {
+    let user = current_windows_account().map_err(|source| CliError::Io {
+        operation: "determine current Windows account for",
+        path: path.to_owned(),
+        source,
+    })?;
+    let grant = format!("{user}:(R,W)");
+    run_icacls(
+        path,
+        &["/grant:r", grant.as_str()],
+        "restrict output directory ACL on",
+    )?;
+    run_icacls(
+        path,
+        &["/inheritance:r"],
+        "disable output directory ACL inheritance on",
+    )?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn restrict_new_directory_permissions(_path: &Path) -> Result<(), CliError> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn current_windows_account() -> io::Result<String> {
+    let output = std::process::Command::new(system32_tool("whoami.exe")).output()?;
+    if output.status.success() {
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !name.is_empty() {
+            return Ok(name);
+        }
+    }
+    match (env::var("USERDOMAIN"), env::var("USERNAME")) {
+        (Ok(domain), Ok(user)) if !user.is_empty() => {
+            if domain.is_empty() {
+                Ok(user)
+            } else {
+                Ok(format!("{domain}\\{user}"))
+            }
+        }
+        (_, Ok(user)) if !user.is_empty() => Ok(user),
+        _ => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "current Windows account is unavailable",
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn system32_tool(name: &str) -> PathBuf {
+    match env::var_os("SystemRoot") {
+        Some(root) => PathBuf::from(root).join("System32").join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+#[cfg(windows)]
+fn run_icacls(path: &Path, extra_args: &[&str], operation: &'static str) -> Result<(), CliError> {
+    let mut command = std::process::Command::new(system32_tool("icacls.exe"));
+    command.arg(path);
+    for arg in extra_args {
+        command.arg(arg);
+    }
+    let output = command.output().map_err(|source| CliError::Io {
+        operation,
+        path: path.to_owned(),
+        source,
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let details = if stderr.trim().is_empty() {
+            format!("icacls exited with {}", output.status)
+        } else {
+            format!("icacls exited with {}: {}", output.status, stderr.trim())
+        };
+        return Err(CliError::Io {
+            operation,
+            path: path.to_owned(),
+            source: io::Error::other(details),
+        });
+    }
     Ok(())
 }
 
@@ -391,6 +473,31 @@ mod tests {
 
     fn os_strings<const N: usize>(values: [&str; N]) -> Vec<OsString> {
         values.into_iter().map(OsString::from).collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn generate_restricts_new_output_directory_acl() {
+        let directory = unique_temporary_directory();
+        let generated = generate_identity("acl-device", &directory).expect("generate identity");
+        TlsIdentity::load_der(&generated.certificate_path, &generated.private_key_path)
+            .expect("generated key ACL must be accepted");
+
+        let listing = std::process::Command::new(system32_tool("icacls.exe"))
+            .arg(&directory)
+            .output()
+            .expect("inspect directory ACL");
+        assert!(
+            listing.status.success(),
+            "icacls directory listing failed: {}",
+            String::from_utf8_lossy(&listing.stderr)
+        );
+        let text = String::from_utf8_lossy(&listing.stdout).to_ascii_lowercase();
+        assert!(!text.contains("everyone:("), "{text}");
+        assert!(!text.contains("authenticated users:("), "{text}");
+        assert!(!text.contains("builtin\\users:("), "{text}");
+
+        fs::remove_dir_all(&directory).expect("remove owned temporary directory");
     }
 
     fn unique_temporary_directory() -> PathBuf {

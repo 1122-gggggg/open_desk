@@ -25,8 +25,10 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+mod desktop;
 #[cfg(windows)]
 mod native;
+pub use desktop::{WindowsDesktopError, WindowsDesktopSession};
 
 #[cfg(windows)]
 pub const WINDOW_INPUT_EVENT_BYTES: usize = 20;
