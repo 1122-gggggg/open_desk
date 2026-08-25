@@ -143,45 +143,33 @@ pub fn letterbox_geom(
     max_width: u32,
     max_height: u32,
 ) -> Result<LetterboxGeom, ConvertError> {
-    let out_width = even_dimension(max_width);
-    let out_height = even_dimension(max_height);
-    if src_width == 0 || src_height == 0 || out_width < 2 || out_height < 2 {
+    let max_w = even_dimension(max_width);
+    let max_h = even_dimension(max_height);
+    if src_width == 0 || src_height == 0 || max_w < 2 || max_h < 2 {
         return Err(ConvertError::InvalidDimensions);
     }
-    let scale_num = u64::from(out_width).min(
-        (u64::from(out_width) * u64::from(src_height))
-            .min(u64::from(out_height) * u64::from(src_width)),
-    );
-    let mut content_width = even_dimension(
-        ((u64::from(src_width) * u64::from(out_height)) / u64::from(src_height))
-            .min(u64::from(out_width)) as u32,
-    );
-    let mut content_height = even_dimension(
-        ((u64::from(src_height) * u64::from(out_width)) / u64::from(src_width))
-            .min(u64::from(out_height)) as u32,
-    );
-    if content_width == 0 {
-        content_width = 2;
-    }
-    if content_height == 0 {
-        content_height = 2;
-    }
-    if content_width > out_width {
-        content_width = out_width;
-    }
-    if content_height > out_height {
-        content_height = out_height;
-    }
-    let _ = scale_num;
-    let offset_x = even_dimension((out_width - content_width) / 2);
-    let offset_y = even_dimension((out_height - content_height) / 2);
+    let src_w = u64::from(src_width);
+    let src_h = u64::from(src_height);
+    let max_w64 = u64::from(max_w);
+    let max_h64 = u64::from(max_h);
+    let (out_width, out_height) = if src_w * max_h64 >= src_h * max_w64 {
+        let height = even_dimension(((src_h * max_w64) / src_w) as u32)
+            .max(2)
+            .min(max_h);
+        (max_w, height)
+    } else {
+        let width = even_dimension(((src_w * max_h64) / src_h) as u32)
+            .max(2)
+            .min(max_w);
+        (width, max_h)
+    };
     Ok(LetterboxGeom {
         out_width,
         out_height,
-        content_width,
-        content_height,
-        offset_x,
-        offset_y,
+        content_width: out_width,
+        content_height: out_height,
+        offset_x: 0,
+        offset_y: 0,
     })
 }
 
@@ -213,24 +201,42 @@ pub fn letterbox_scale_bgra(
 
     let out_w = geom.out_width as usize;
     let out_h = geom.out_height as usize;
-    let mut out = vec![0u8; out_w * out_h * 4];
-    let content_w = geom.content_width.max(1) as usize;
-    let content_h = geom.content_height.max(1) as usize;
-    let off_x = geom.offset_x as usize;
-    let off_y = geom.offset_y as usize;
-
+    let mut out = vec![0u8; out_w.saturating_mul(out_h).saturating_mul(4)];
+    if out_w == 0 || out_h == 0 {
+        return Ok((geom, out));
+    }
     for y in 0..out_h {
+        let y0 = (y * src_h) / out_h;
+        let y1 = ((y + 1) * src_h) / out_h;
+        let y1 = y1.max(y0 + 1).min(src_h);
         for x in 0..out_w {
+            let x0 = (x * src_w) / out_w;
+            let x1 = ((x + 1) * src_w) / out_w;
+            let x1 = x1.max(x0 + 1).min(src_w);
+            let mut blue = 0_u32;
+            let mut green = 0_u32;
+            let mut red = 0_u32;
+            let mut alpha = 0_u32;
+            let mut count = 0_u32;
+            for sy in y0..y1 {
+                let row = sy * src_stride;
+                for sx in x0..x1 {
+                    let src_px = row + sx * 4;
+                    blue += u32::from(src[src_px]);
+                    green += u32::from(src[src_px + 1]);
+                    red += u32::from(src[src_px + 2]);
+                    alpha += u32::from(src[src_px + 3]);
+                    count += 1;
+                }
+            }
             let dst = (y * out_w + x) * 4;
-            if x < off_x || y < off_y || x >= off_x + content_w || y >= off_y + content_h {
+            if count == 0 {
                 continue;
             }
-            let sx = ((x - off_x) * src_w) / content_w;
-            let sy = ((y - off_y) * src_h) / content_h;
-            let sx = sx.min(src_w - 1);
-            let sy = sy.min(src_h - 1);
-            let src_px = sy * src_stride + sx * 4;
-            out[dst..dst + 4].copy_from_slice(&src[src_px..src_px + 4]);
+            out[dst] = (blue / count) as u8;
+            out[dst + 1] = (green / count) as u8;
+            out[dst + 2] = (red / count) as u8;
+            out[dst + 3] = (alpha / count) as u8;
         }
     }
     Ok((geom, out))
@@ -323,4 +329,13 @@ mod tests {
         assert!(geom.content_width <= 1280);
         assert!(geom.content_height <= 720);
     }
+
+    #[test]
+    fn letterbox_preserves_sixteen_by_ten() {
+        let geom = letterbox_geom(1920, 1200, 640, 360).expect("geom");
+        assert_eq!((geom.out_width, geom.out_height), (576, 360));
+        assert_eq!(geom.offset_x, 0);
+        assert_eq!(geom.offset_y, 0);
+    }
+
 }

@@ -277,57 +277,35 @@ impl X11DesktopSession {
         self.screen_height = u32::from(geometry.height).max(2);
         let width = self.screen_width.min(u32::from(u16::MAX));
         let height = self.screen_height.min(u32::from(u16::MAX));
-        let depth = geometry.depth;
-        let pixmap = self.conn.generate_id().map_err(protocol)?;
-        self.conn
-            .create_pixmap(depth, pixmap, self.root, width as u16, height as u16)
+        let reply = self
+            .conn
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                self.root,
+                0,
+                0,
+                width as u16,
+                height as u16,
+                !0,
+            )
+            .map_err(protocol)?
+            .reply()
             .map_err(protocol)?;
-        let gc = self.conn.generate_id().map_err(protocol)?;
-        self.conn
-            .create_gc(gc, self.root, &xproto::CreateGCAux::new())
-            .map_err(protocol)?;
-        let copy = self.conn.copy_area(
-            self.root,
-            pixmap,
-            gc,
-            0,
-            0,
-            0,
-            0,
-            width as u16,
-            height as u16,
-        );
-        let image = self.conn.get_image(
-            ImageFormat::Z_PIXMAP,
-            pixmap,
-            0,
-            0,
-            width as u16,
-            height as u16,
-            !0,
-        );
-        let result = (|| {
-            copy.map_err(protocol)?;
-            let reply = image.map_err(protocol)?.reply().map_err(protocol)?;
-            let mut bgra = vec![0u8; width as usize * height as usize * 4];
-            unpack_zpixmap_bgra(
-                &reply.data,
-                width,
-                height,
-                ZPixmapFormat {
-                    bits_per_pixel: self.bits_per_pixel,
-                    lsb_first: self.image_lsb_first,
-                    red_mask: self.red_mask,
-                    green_mask: self.green_mask,
-                    blue_mask: self.blue_mask,
-                },
-                &mut bgra,
-            )?;
-            Ok(bgra)
-        })();
-        let _ = self.conn.free_gc(gc);
-        let _ = self.conn.free_pixmap(pixmap);
-        result
+        let mut bgra = vec![0u8; width as usize * height as usize * 4];
+        unpack_zpixmap_bgra(
+            &reply.data,
+            width,
+            height,
+            ZPixmapFormat {
+                bits_per_pixel: self.bits_per_pixel,
+                lsb_first: self.image_lsb_first,
+                red_mask: self.red_mask,
+                green_mask: self.green_mask,
+                blue_mask: self.blue_mask,
+            },
+            &mut bgra,
+        )?;
+        Ok(bgra)
     }
 }
 

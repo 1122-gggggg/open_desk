@@ -279,7 +279,7 @@ class RendererImpl final {
       return BridgeStatus::DeviceLost;
     }
     context_->CopyResource(back_buffer.Get(), surface.impl_->texture());
-    hr = swap_chain_->Present(0, 0);
+    hr = swap_chain_->Present(1, 0);
     if (FAILED(hr)) {
       if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
         return BridgeStatus::DeviceLost;
@@ -360,7 +360,7 @@ class RendererImpl final {
     }
 
     context_->CopyResource(back_buffer.Get(), dynamic_bgra_texture_.Get());
-    hr = swap_chain_->Present(0, 0);
+    hr = swap_chain_->Present(1, 0);
     if (FAILED(hr)) {
       if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
         return BridgeStatus::DeviceLost;
@@ -420,6 +420,15 @@ class RendererImpl final {
     }
     if (self != nullptr) {
       self->on_message(msg, wparam, lparam);
+    }
+    if (msg == WM_ERASEBKGND) {
+      return 1;
+    }
+    if (msg == WM_PAINT) {
+      PAINTSTRUCT paint{};
+      BeginPaint(hwnd, &paint);
+      EndPaint(hwnd, &paint);
+      return 0;
     }
     if (msg == WM_DESTROY) {
       PostQuitMessage(0);
@@ -555,18 +564,20 @@ class RendererImpl final {
 
   void initialize() {
     WNDCLASSW wc{};
+    wc.style = CS_OWNDC;
     wc.lpfnWndProc = WndProc;
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+    wc.hbrBackground = nullptr;
     wc.lpszClassName = L"LatencyDeskRendererWindowClassV2";
     RegisterClassW(&wc);
-
+    const DWORD window_style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE;
     RECT client_rect{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
-    AdjustWindowRectEx(&client_rect, WS_OVERLAPPEDWINDOW, FALSE, 0);
+    AdjustWindowRectEx(&client_rect, window_style, FALSE, 0);
 
     window_ = CreateWindowExW(
         0, L"LatencyDeskRendererWindowClassV2", L"LatencyDesk Remote Desktop",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
+        window_style, CW_USEDEFAULT, CW_USEDEFAULT,
         client_rect.right - client_rect.left, client_rect.bottom - client_rect.top,
         nullptr, nullptr, wc.hInstance, this);
     if (window_ == nullptr) {
@@ -607,9 +618,9 @@ class RendererImpl final {
     desc.SampleDesc.Count = 1;
     desc.SampleDesc.Quality = 0;
     desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    desc.BufferCount = 2;
+    desc.BufferCount = 3;
     desc.Scaling = DXGI_SCALING_STRETCH;
-    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     desc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
 
     hr = factory->CreateSwapChainForHwnd(device_.Get(), window_, &desc, nullptr, nullptr, &swap_chain_);
