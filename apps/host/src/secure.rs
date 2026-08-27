@@ -1061,6 +1061,7 @@ mod windows {
     enum ScheduledWork {
         Shutdown(std::io::Result<()>),
         Media,
+        EncoderOutput,
         Input(Option<InputLaneEvent>),
     }
 
@@ -1460,12 +1461,14 @@ mod windows {
                     biased;
                     signal_result = &mut shutdown => ScheduledWork::Shutdown(signal_result),
                     _ = ticker.tick() => ScheduledWork::Media,
+                    _ = std::future::ready(()), if video.has_pending_output() => ScheduledWork::EncoderOutput,
                     input = input_rx.recv() => ScheduledWork::Input(input),
                 },
                 WorkPriority::Input => tokio::select! {
                     biased;
                     signal_result = &mut shutdown => ScheduledWork::Shutdown(signal_result),
                     input = input_rx.recv() => ScheduledWork::Input(input),
+                    _ = std::future::ready(()), if video.has_pending_output() => ScheduledWork::EncoderOutput,
                     _ = ticker.tick() => ScheduledWork::Media,
                 },
             };
@@ -1498,8 +1501,20 @@ mod windows {
                 ScheduledWork::Input(None) => {
                     return Err("reliable input lane task terminated unexpectedly".into());
                 }
-                ScheduledWork::Media => {
-                    let Some(frame) = video.poll_access_unit()? else {
+                ScheduledWork::Media | ScheduledWork::EncoderOutput => {
+                    let frame = match work {
+                        ScheduledWork::Media => video.poll_access_unit()?,
+                        ScheduledWork::EncoderOutput => video.poll_pending_access_unit()?,
+                        _ => unreachable!("media arm accepts only media work"),
+                    };
+                    if frame.is_none() && video.has_pending_output() {
+                        // Media Foundation completes asynchronous transforms on
+                        // a provider thread. Yield this OS time slice after a
+                        // miss so aggressive low-latency polling cannot starve
+                        // the very worker that produces the output.
+                        std::thread::yield_now();
+                    }
+                    let Some(frame) = frame else {
                         let recovery_drops = video.take_recovery_output_drops();
                         if recovery_drops != 0 {
                             eprintln!(
@@ -1562,11 +1577,13 @@ mod windows {
                     }
                     if frame_log_due(frame_id) {
                         println!(
-                            "streaming: H.264 AU frame={frame_id} bytes={} keyframe={} dependency={:?} capture_sequence={} fragments={} path_datagram_limit={}",
+                            "streaming: H.264 AU frame={frame_id} bytes={} keyframe={} dependency={:?} capture_sequence={} encode_submit_to_collect_us={} encode_output_poll_misses={} fragments={} path_datagram_limit={}",
                             frame.bytes.len(),
                             frame.meta.recovery_point,
                             frame.meta.dependency_frame_id,
                             frame.capture_sequence,
+                            frame.encode_submit_to_collect_ns / 1_000,
+                            frame.encode_output_poll_misses,
                             report.fragments_sent,
                             report.path_max_datagram_bytes
                         );

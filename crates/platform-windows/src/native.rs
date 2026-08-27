@@ -20,14 +20,13 @@ use latencydesk_media::{
 };
 use latencydesk_surface::SurfacePayload;
 use std::fmt;
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 pub(crate) fn monotonic_now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
+    static PROCESS_CLOCK_ORIGIN: OnceLock<Instant> = OnceLock::new();
+    let origin = PROCESS_CLOCK_ORIGIN.get_or_init(Instant::now);
+    u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 #[allow(dead_code)]
 pub(crate) const BRIDGE_ABI_VERSION: u32 = 3;
@@ -1026,6 +1025,17 @@ mod tests {
     #[test]
     fn bridge_abi_is_linked_through_cxx() {
         assert_eq!(ffi::bridge_abi_version(), BRIDGE_ABI_VERSION);
+    }
+
+    #[test]
+    fn provider_clock_is_process_relative_and_monotonic() {
+        let first = monotonic_now_ns();
+        let second = monotonic_now_ns();
+        assert!(second >= first);
+        assert!(
+            second < 86_400_000_000_000,
+            "provider timestamps must not contain the Unix wall-clock epoch"
+        );
     }
 
     #[test]

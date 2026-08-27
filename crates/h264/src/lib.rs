@@ -42,7 +42,10 @@ impl LowDelayPolicy {
             profile: H264Profile::High,
             b_frames: 0,
             lookahead_frames: 0,
-            max_provider_queue: 2,
+            // A second queued surface is a hidden frame of latency. The
+            // product path drops/catches up at frame boundaries instead of
+            // allowing an encoder or decoder backlog to form.
+            max_provider_queue: 1,
             intra_period_frames,
             repeat_parameter_sets: true,
         }
@@ -478,6 +481,7 @@ mod tests {
     fn policy_forbids_hidden_latency() {
         let policy = LowDelayPolicy::baseline(120);
         assert_eq!(policy.validate(), Ok(policy));
+        assert_eq!(policy.max_provider_queue, 1);
         let invalid = LowDelayPolicy {
             b_frames: 1,
             ..policy

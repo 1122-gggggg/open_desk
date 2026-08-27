@@ -21,6 +21,7 @@ pub use latencydesk_platform::{CursorMode, CursorUpdate};
 use latencydesk_surface::{
     CaptureLease, DestinationSurfaceSpec, OwnedSurface, SurfaceError, SurfacePayload, SurfacePool,
 };
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -267,6 +268,13 @@ pub struct WindowsEncodedH264Frame {
     pub bytes: Vec<u8>,
     pub capture_sequence: u64,
     pub capture_timestamp_ns: u64,
+    /// Host-local time from encoder submission to application collection.
+    /// This includes hardware encode work plus any scheduler delay before the
+    /// asynchronous MFT output is polled.
+    pub encode_submit_to_collect_ns: u64,
+    /// Number of nonblocking output polls that observed no completed access
+    /// unit before this frame was collected.
+    pub encode_output_poll_misses: u64,
     pub width: u32,
     pub height: u32,
 }
@@ -285,8 +293,20 @@ pub struct WindowsDdaH264Encoder {
     encoded_height: u32,
     capture_sequence: u64,
     force_idr_pending: bool,
+    pending_outputs: u8,
+    submission_sequences: VecDeque<u64>,
+    pending_output_poll_misses: u64,
     recovery_outputs_dropped: u64,
     output_buffer: Vec<u8>,
+}
+
+#[cfg(windows)]
+const fn should_capture_after_encoder_poll(
+    output_ready: bool,
+    pending_outputs: u8,
+    max_provider_queue: u8,
+) -> bool {
+    !output_ready && pending_outputs < max_provider_queue
 }
 
 #[cfg(windows)]
@@ -333,6 +353,9 @@ impl WindowsDdaH264Encoder {
             target_bitrate_bps,
             capture_sequence: 0,
             force_idr_pending: true,
+            pending_outputs: 0,
+            submission_sequences: VecDeque::with_capacity(usize::from(policy.max_provider_queue)),
+            pending_output_poll_misses: 0,
             encoded_width: 0,
             encoded_height: 0,
             recovery_outputs_dropped: 0,
@@ -344,6 +367,19 @@ impl WindowsDdaH264Encoder {
         &mut self,
     ) -> Result<Option<WindowsEncodedH264Frame>, WindowsBackendError> {
         let ready_output = self.poll_encoder_output()?;
+        // Never put capture/conversion work in front of an access unit that is
+        // already ready to send. Likewise, do not detach another DDA surface
+        // while the low-delay provider queue is full: that GPU work can wait
+        // on the surface still owned by Media Foundation and turn a few
+        // milliseconds of asynchronous encoding into seconds of head-of-line
+        // blocking.
+        if !should_capture_after_encoder_poll(
+            ready_output.is_some(),
+            self.pending_outputs,
+            self.policy.max_provider_queue,
+        ) {
+            return Ok(ready_output);
+        }
 
         let status = native::ffi::capture_poll(self.capture.pin_mut(), 0);
         match status {
@@ -430,6 +466,12 @@ impl WindowsDdaH264Encoder {
         match encode_status {
             native::STATUS_OK => {
                 self.capture_sequence = capture_sequence;
+                self.pending_outputs = self
+                    .pending_outputs
+                    .checked_add(1)
+                    .filter(|pending| *pending <= self.policy.max_provider_queue)
+                    .ok_or(WindowsBackendError::InvalidState)?;
+                self.submission_sequences.push_back(capture_sequence);
             }
             native::STATUS_QUEUE_FULL => return Ok(ready_output),
             other => {
@@ -440,6 +482,27 @@ impl WindowsDdaH264Encoder {
             Some(frame) => Ok(Some(frame)),
             None => self.poll_encoder_output(),
         }
+    }
+
+    /// Reports whether the asynchronous MFT still owns an accepted input whose
+    /// output has not been collected. Product schedulers use this to poll the
+    /// encoder independently from the next capture tick.
+    #[must_use]
+    pub const fn has_pending_output(&self) -> bool {
+        self.pending_outputs != 0
+    }
+
+    /// Polls only the asynchronous encoder output. Unlike
+    /// [`Self::poll_access_unit`], this never captures or submits another
+    /// desktop frame, so callers can collect a completed access unit as soon as
+    /// it is ready without increasing the capture rate.
+    pub fn poll_pending_access_unit(
+        &mut self,
+    ) -> Result<Option<WindowsEncodedH264Frame>, WindowsBackendError> {
+        if !self.has_pending_output() {
+            return Ok(None);
+        }
+        self.poll_encoder_output()
     }
 
     pub fn request_idr(&mut self) -> Result<(), WindowsBackendError> {
@@ -502,8 +565,27 @@ impl WindowsDdaH264Encoder {
             &mut capture_timestamp_ns,
         );
         match status {
-            native::STATUS_NO_FRAME => Ok(None),
+            native::STATUS_NO_FRAME => {
+                if self.has_pending_output() {
+                    self.pending_output_poll_misses =
+                        self.pending_output_poll_misses.saturating_add(1);
+                }
+                Ok(None)
+            }
             native::STATUS_OK => {
+                self.pending_outputs = self
+                    .pending_outputs
+                    .checked_sub(1)
+                    .ok_or(WindowsBackendError::InvalidState)?;
+                let submitted_sequence = self
+                    .submission_sequences
+                    .pop_front()
+                    .ok_or(WindowsBackendError::InvalidState)?;
+                if submitted_sequence != capture_sequence {
+                    return Err(WindowsBackendError::InvalidState);
+                }
+                let collected_ns = native::monotonic_now_ns();
+                let output_poll_misses = std::mem::take(&mut self.pending_output_poll_misses);
                 let bytes = self
                     .output_buffer
                     .get(..output_size)
@@ -526,6 +608,8 @@ impl WindowsDdaH264Encoder {
                     bytes,
                     capture_sequence,
                     capture_timestamp_ns,
+                    encode_submit_to_collect_ns: collected_ns.saturating_sub(capture_timestamp_ns),
+                    encode_output_poll_misses: output_poll_misses,
                     width: self.encoded_width,
                     height: self.encoded_height,
                 }))
@@ -4648,6 +4732,15 @@ mod tests {
             bounded_even_geometry(2_560, 1_600, 1_920, 1_080),
             Ok((1_920, 1_080))
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn product_encoder_never_captures_ahead_of_ready_or_full_output() {
+        assert!(should_capture_after_encoder_poll(false, 0, 1));
+        assert!(!should_capture_after_encoder_poll(true, 0, 1));
+        assert!(!should_capture_after_encoder_poll(false, 1, 1));
+        assert!(!should_capture_after_encoder_poll(true, 1, 1));
     }
 
     fn empty_metadata() -> DesktopMetadata {
