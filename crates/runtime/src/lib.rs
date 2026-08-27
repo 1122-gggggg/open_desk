@@ -673,7 +673,8 @@ where
             IngestOutcome::Pending { .. } => Ok(ClientMediaAction::ReassemblyPending),
             IngestOutcome::Duplicate { .. } => Ok(ClientMediaAction::Duplicate),
             IngestOutcome::Complete(frame) => {
-                let action = self.continuity.inspect(encoded_meta(header));
+                let meta = encoded_meta(header);
+                let action = self.continuity.classify(meta);
                 if action == ContinuityAction::DropAndRequestRecovery {
                     self.enter_recovery(now_ns)?;
                     return Ok(ClientMediaAction::RecoveryRequired);
@@ -686,6 +687,10 @@ where
                     Err(error) => return self.recover_after(now_ns, error),
                 };
                 if !matches_presentable(&presentable, stamp, header) {
+                    drop(presentable);
+                    return self.recover_after(now_ns, RuntimeError::DecodedFrameMismatch);
+                }
+                if self.continuity.commit_decoded(meta).is_err() {
                     drop(presentable);
                     return self.recover_after(now_ns, RuntimeError::DecodedFrameMismatch);
                 }

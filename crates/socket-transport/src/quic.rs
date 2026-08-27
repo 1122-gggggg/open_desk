@@ -37,6 +37,16 @@ pub enum MediaSendOutcome {
     Unsupported,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuicPathStats {
+    pub rtt: Duration,
+    pub sent_packets: u64,
+    pub lost_packets: u64,
+    pub congestion_events: u64,
+    pub cwnd_bytes: u64,
+    pub current_mtu: u16,
+}
+
 /// One complete validated record read from a reliable application lane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceivedStreamRecord {
@@ -300,6 +310,19 @@ impl QuicConnection {
     #[must_use]
     pub fn max_datagram_size(&self) -> Option<usize> {
         self.connection.max_datagram_size()
+    }
+
+    #[must_use]
+    pub(crate) fn path_stats(&self) -> QuicPathStats {
+        let stats = self.connection.stats();
+        QuicPathStats {
+            rtt: stats.path.rtt,
+            sent_packets: stats.path.sent_packets,
+            lost_packets: stats.path.lost_packets,
+            congestion_events: stats.path.congestion_events,
+            cwnd_bytes: stats.path.cwnd,
+            current_mtu: stats.path.current_mtu,
+        }
     }
 
     /// Returns the verified certificate chain Quinn obtained during the TLS

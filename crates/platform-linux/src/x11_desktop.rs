@@ -1,8 +1,8 @@
 //! X11 root capture and XTEST injection for the first remote-control slice.
 
 use crate::desktop_convert::{
-    bgra_to_nv12_bt601_limited, letterbox_geom, letterbox_scale_bgra, map_letterboxed_pointer,
-    LetterboxGeom,
+    bgra_to_nv12_bt601_limited_into, letterbox_can_skip_scale, letterbox_geom,
+    letterbox_identity_geom, letterbox_scale_bgra_into, map_letterboxed_pointer, LetterboxGeom,
 };
 use crate::hid_to_evdev;
 use latencydesk_input::AppliedInput;
@@ -62,6 +62,9 @@ pub struct X11DesktopSession {
     green_mask: u32,
     blue_mask: u32,
     last_geom: Option<LetterboxGeom>,
+    bgra_scratch: Vec<u8>,
+    nv12_scratch: Vec<u8>,
+    scaled_scratch: Vec<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -125,6 +128,9 @@ impl X11DesktopSession {
             green_mask: visual.green_mask,
             blue_mask: visual.blue_mask,
             last_geom: None,
+            bgra_scratch: Vec::new(),
+            nv12_scratch: Vec::new(),
+            scaled_scratch: Vec::new(),
             conn,
         })
     }
@@ -139,28 +145,47 @@ impl X11DesktopSession {
         max_width: u32,
         max_height: u32,
     ) -> Result<(u32, u32, Vec<u8>), X11DesktopError> {
-        let bgra = self.capture_root_bgra()?;
+        self.capture_root_bgra()?;
         let src_w = self.screen_width;
         let src_h = self.screen_height;
-        if src_w == 0 || src_h == 0 {
+        if src_w < 2 || src_h < 2 {
             return Err(X11DesktopError::InvalidDimensions);
         }
-        let (geom, scaled) = letterbox_scale_bgra(
-            &bgra,
+        let src_stride = src_w as usize * 4;
+        let bgra_needed = src_stride.saturating_mul(src_h as usize);
+        if self.bgra_scratch.len() < bgra_needed {
+            return Err(X11DesktopError::InvalidDimensions);
+        }
+        if letterbox_can_skip_scale(src_w, src_h, max_width, max_height) {
+            let geom = letterbox_identity_geom(src_w, src_h);
+            self.last_geom = Some(geom);
+            bgra_to_nv12_bt601_limited_into(
+                src_w,
+                src_h,
+                &self.bgra_scratch,
+                src_stride,
+                &mut self.nv12_scratch,
+            )?;
+            return Ok((src_w, src_h, self.nv12_scratch.clone()));
+        }
+        let geom = letterbox_scale_bgra_into(
+            &self.bgra_scratch,
             src_w,
             src_h,
-            src_w as usize * 4,
+            src_stride,
             max_width,
             max_height,
+            &mut self.scaled_scratch,
         )?;
         self.last_geom = Some(geom);
-        let nv12 = bgra_to_nv12_bt601_limited(
+        bgra_to_nv12_bt601_limited_into(
             geom.out_width,
             geom.out_height,
-            &scaled,
+            &self.scaled_scratch,
             geom.out_width as usize * 4,
+            &mut self.nv12_scratch,
         )?;
-        Ok((geom.out_width, geom.out_height, nv12))
+        Ok((geom.out_width, geom.out_height, self.nv12_scratch.clone()))
     }
 
     pub fn inject(&mut self, action: AppliedInput) -> Result<(), X11DesktopError> {
@@ -176,13 +201,8 @@ impl X11DesktopSession {
                     .map_err(protocol)?;
             }
             AppliedInput::PointerButton { button, pressed } => {
-                let x_button = match button {
-                    1 => 1,
-                    2 => 3,
-                    3 => 2,
-                    4 => 4,
-                    5 => 5,
-                    _ => return Ok(()),
+                let Some(x_button) = pointer_button_to_x11(button) else {
+                    return Ok(());
                 };
                 let kind = if pressed {
                     X_BUTTON_PRESS
@@ -210,18 +230,22 @@ impl X11DesktopSession {
                 width,
                 height,
             } => {
-                let geom = self.last_geom.unwrap_or_else(|| {
-                    letterbox_geom(self.screen_width, self.screen_height, width, height).unwrap_or(
-                        LetterboxGeom {
+                let geom = match self.last_geom {
+                    Some(geom)
+                        if geom.out_width == width.max(1) && geom.out_height == height.max(1) =>
+                    {
+                        geom
+                    }
+                    _ => letterbox_geom(self.screen_width, self.screen_height, width, height)
+                        .unwrap_or(LetterboxGeom {
                             out_width: width.max(2),
                             out_height: height.max(2),
                             content_width: width.max(2),
                             content_height: height.max(2),
                             offset_x: 0,
                             offset_y: 0,
-                        },
-                    )
-                });
+                        }),
+                };
                 let (sx, sy) = map_letterboxed_pointer(
                     x,
                     y,
@@ -266,15 +290,25 @@ impl X11DesktopSession {
         Ok(())
     }
 
-    fn capture_root_bgra(&mut self) -> Result<Vec<u8>, X11DesktopError> {
+    fn refresh_root_geometry(&mut self) -> Result<bool, X11DesktopError> {
         let geometry = self
             .conn
             .get_geometry(self.root)
             .map_err(protocol)?
             .reply()
             .map_err(protocol)?;
-        self.screen_width = u32::from(geometry.width).max(2);
-        self.screen_height = u32::from(geometry.height).max(2);
+        let width = u32::from(geometry.width).max(2);
+        let height = u32::from(geometry.height).max(2);
+        let changed = width != self.screen_width || height != self.screen_height;
+        if changed {
+            self.screen_width = width;
+            self.screen_height = height;
+            self.last_geom = None;
+        }
+        Ok(changed)
+    }
+
+    fn get_image_unpacked(&mut self) -> Result<(), X11DesktopError> {
         let width = self.screen_width.min(u32::from(u16::MAX));
         let height = self.screen_height.min(u32::from(u16::MAX));
         let reply = self
@@ -291,7 +325,12 @@ impl X11DesktopSession {
             .map_err(protocol)?
             .reply()
             .map_err(protocol)?;
-        let mut bgra = vec![0u8; width as usize * height as usize * 4];
+        let needed = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4);
+        if self.bgra_scratch.len() < needed {
+            self.bgra_scratch.resize(needed, 0);
+        }
         unpack_zpixmap_bgra(
             &reply.data,
             width,
@@ -303,9 +342,31 @@ impl X11DesktopSession {
                 green_mask: self.green_mask,
                 blue_mask: self.blue_mask,
             },
-            &mut bgra,
+            &mut self.bgra_scratch,
         )?;
-        Ok(bgra)
+        Ok(())
+    }
+
+    fn capture_root_bgra(&mut self) -> Result<(), X11DesktopError> {
+        self.refresh_root_geometry()?;
+        match self.get_image_unpacked() {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                self.refresh_root_geometry()?;
+                self.get_image_unpacked()
+            }
+        }
+    }
+}
+
+fn pointer_button_to_x11(button: u8) -> Option<u8> {
+    match button {
+        0 => Some(1),
+        1 => Some(3),
+        2 => Some(2),
+        3 => Some(8),
+        4 => Some(9),
+        _ => None,
     }
 }
 
@@ -403,7 +464,17 @@ fn extract_channel(pixel: u32, mask: u32) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{absolute_pointer_coordinate, relative_pointer_coordinate};
+    use super::{absolute_pointer_coordinate, pointer_button_to_x11, relative_pointer_coordinate};
+
+    #[test]
+    fn producer_pointer_buttons_map_to_x11_buttons() {
+        assert_eq!(pointer_button_to_x11(0), Some(1));
+        assert_eq!(pointer_button_to_x11(1), Some(3));
+        assert_eq!(pointer_button_to_x11(2), Some(2));
+        assert_eq!(pointer_button_to_x11(3), Some(8));
+        assert_eq!(pointer_button_to_x11(4), Some(9));
+        assert_eq!(pointer_button_to_x11(5), None);
+    }
 
     #[test]
     fn relative_pointer_extremes_saturate_without_overflow() {

@@ -50,6 +50,8 @@ pub const QUIC_DATAGRAM_SEND_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 const QUIC_CRYPTO_BUFFER_BYTES: usize = 64 * 1024;
 const QUIC_IDLE_TIMEOUT_MILLIS: u32 = 30_000;
 const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const QUIC_INITIAL_RTT: Duration = Duration::from_millis(5);
+const QUIC_MAX_ACK_DELAY: Duration = Duration::from_millis(1);
 const QUIC_MINIMUM_MTU: u16 = 1_200;
 const QUIC_MAXIMUM_MTU: u16 = 1_452;
 const PEER_IDENTITY_ERROR_CODE: u32 = 0x101;
@@ -682,6 +684,9 @@ pub fn bounded_transport_config() -> quinn::TransportConfig {
     let mut mtu_discovery = quinn::MtuDiscoveryConfig::default();
     mtu_discovery.upper_bound(QUIC_MAXIMUM_MTU);
 
+    let mut ack_frequency = quinn::AckFrequencyConfig::default();
+    ack_frequency.max_ack_delay(Some(QUIC_MAX_ACK_DELAY));
+
     let mut configuration = quinn::TransportConfig::default();
     configuration
         .max_concurrent_bidi_streams(quinn::VarInt::from_u32(MAX_QUIC_BIDIRECTIONAL_STREAMS))
@@ -698,6 +703,8 @@ pub fn bounded_transport_config() -> quinn::TransportConfig {
         .keep_alive_interval(Some(QUIC_KEEP_ALIVE_INTERVAL))
         .crypto_buffer_size(QUIC_CRYPTO_BUFFER_BYTES)
         .allow_spin(false)
+        .initial_rtt(QUIC_INITIAL_RTT)
+        .ack_frequency_config(Some(ack_frequency))
         .datagram_receive_buffer_size(Some(QUIC_DATAGRAM_RECEIVE_BUFFER_BYTES))
         .datagram_send_buffer_size(QUIC_DATAGRAM_SEND_BUFFER_BYTES);
     configuration

@@ -30,7 +30,7 @@ pub(crate) fn monotonic_now_ns() -> u64 {
         .unwrap_or(0)
 }
 #[allow(dead_code)]
-pub(crate) const BRIDGE_ABI_VERSION: u32 = 2;
+pub(crate) const BRIDGE_ABI_VERSION: u32 = 3;
 pub(crate) const STATUS_OK: u32 = 0;
 pub(crate) const STATUS_NO_FRAME: u32 = 1;
 pub(crate) const STATUS_ACCESS_LOST: u32 = 2;
@@ -152,6 +152,7 @@ pub(crate) mod ffi {
         type Capture;
         type Surface;
         type Encoder;
+        type Decoder;
         type Renderer;
         type Input;
 
@@ -192,6 +193,15 @@ pub(crate) mod ffi {
             max_queue_depth: u32,
             status: &mut u32,
         ) -> UniquePtr<Encoder>;
+        fn make_mf_h264_encoder_for_surface(
+            surface: &Surface,
+            width: u32,
+            height: u32,
+            target_bitrate_bps: u32,
+            fps: u32,
+            max_queue_depth: u32,
+            status: &mut u32,
+        ) -> UniquePtr<Encoder>;
         fn encoder_encode(
             encoder: Pin<&mut Encoder>,
             surface: &Surface,
@@ -210,6 +220,29 @@ pub(crate) mod ffi {
         fn encoder_update_bitrate(encoder: Pin<&mut Encoder>, target_bitrate_bps: u32) -> u32;
         fn encoder_drain(encoder: Pin<&mut Encoder>) -> u32;
         fn encoder_quiesce(encoder: Pin<&mut Encoder>) -> u32;
+        fn make_mf_h264_decoder(
+            renderer: Pin<&mut Renderer>,
+            width: u32,
+            height: u32,
+            fps: u32,
+            max_queue_depth: u32,
+            status: &mut u32,
+        ) -> UniquePtr<Decoder>;
+        fn decoder_decode(
+            decoder: Pin<&mut Decoder>,
+            annex_b: &[u8],
+            frame_id: u64,
+            timestamp_ns: u64,
+        ) -> u32;
+        fn decoder_poll_output(
+            decoder: Pin<&mut Decoder>,
+            frame_id: &mut u64,
+            timestamp_ns: &mut u64,
+            status: &mut u32,
+        ) -> UniquePtr<Surface>;
+        fn decoder_flush(decoder: Pin<&mut Decoder>) -> u32;
+        fn decoder_quiesce(decoder: Pin<&mut Decoder>) -> u32;
+        fn decoder_hardware_accelerated(decoder: &Decoder) -> bool;
         fn make_d3d11_renderer(width: u32, height: u32, status: &mut u32) -> UniquePtr<Renderer>;
         fn renderer_pump_messages(renderer: Pin<&mut Renderer>) -> bool;
         fn renderer_present(renderer: Pin<&mut Renderer>, surface: &Surface) -> u32;
@@ -253,10 +286,17 @@ unsafe impl Send for ffi::Surface {}
 #[allow(unsafe_code)]
 unsafe impl Send for ffi::Encoder {}
 #[allow(unsafe_code)]
+unsafe impl Send for ffi::Decoder {}
+#[allow(unsafe_code)]
 unsafe impl Send for ffi::Renderer {}
 impl fmt::Debug for ffi::Encoder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Encoder").finish_non_exhaustive()
+    }
+}
+impl fmt::Debug for ffi::Decoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Decoder").finish_non_exhaustive()
     }
 }
 

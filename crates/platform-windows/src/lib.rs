@@ -127,6 +127,447 @@ impl D3D11WindowRenderer {
         }
     }
 }
+
+#[cfg(windows)]
+pub struct DecodedD3D11Frame {
+    surface: cxx::UniquePtr<native::ffi::Surface>,
+    pub frame_id: u64,
+    pub timestamp_ns: u64,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct WindowsH264Decoder {
+    inner: cxx::UniquePtr<native::ffi::Decoder>,
+    policy: LowDelayPolicy,
+}
+
+#[cfg(windows)]
+impl WindowsH264Decoder {
+    pub fn new(
+        renderer: &mut D3D11WindowRenderer,
+        width: u32,
+        height: u32,
+        fps: u32,
+        policy: LowDelayPolicy,
+    ) -> Result<Self, WindowsBackendError> {
+        let policy = policy.validate().map_err(WindowsBackendError::H264)?;
+        let mut status = native::STATUS_OK;
+        let decoder = native::ffi::make_mf_h264_decoder(
+            renderer.inner.pin_mut(),
+            width,
+            height,
+            fps,
+            u32::from(policy.max_provider_queue),
+            &mut status,
+        );
+        if status != native::STATUS_OK || decoder.is_null() {
+            return Err(WindowsBackendError::Unsupported);
+        }
+        Ok(Self {
+            inner: decoder,
+            policy,
+        })
+    }
+
+    pub fn submit(
+        &mut self,
+        annex_b: &[u8],
+        frame_id: u64,
+        timestamp_ns: u64,
+    ) -> Result<(), WindowsBackendError> {
+        validate_encoded_h264(self.policy, annex_b)?;
+        if self.inner.is_null() || frame_id == 0 {
+            return Err(WindowsBackendError::InvalidState);
+        }
+        let status =
+            native::ffi::decoder_decode(self.inner.pin_mut(), annex_b, frame_id, timestamp_ns);
+        match status {
+            native::STATUS_OK => Ok(()),
+            native::STATUS_QUEUE_FULL => Err(WindowsBackendError::QueueFull),
+            native::STATUS_UNSUPPORTED => Err(WindowsBackendError::Unsupported),
+            _ => Err(WindowsBackendError::InvalidState),
+        }
+    }
+
+    pub fn poll_output(&mut self) -> Result<Option<DecodedD3D11Frame>, WindowsBackendError> {
+        if self.inner.is_null() {
+            return Err(WindowsBackendError::InvalidState);
+        }
+        let mut status = native::STATUS_OK;
+        let mut frame_id = 0;
+        let mut timestamp_ns = 0;
+        let surface = native::ffi::decoder_poll_output(
+            self.inner.pin_mut(),
+            &mut frame_id,
+            &mut timestamp_ns,
+            &mut status,
+        );
+        match status {
+            native::STATUS_OK if !surface.is_null() => Ok(Some(DecodedD3D11Frame {
+                surface,
+                frame_id,
+                timestamp_ns,
+            })),
+            native::STATUS_NO_FRAME => Ok(None),
+            native::STATUS_UNSUPPORTED => Err(WindowsBackendError::Unsupported),
+            native::STATUS_QUEUE_FULL => Err(WindowsBackendError::QueueFull),
+            _ => Err(WindowsBackendError::InvalidState),
+        }
+    }
+
+    pub fn is_hardware_accelerated(&self) -> bool {
+        !self.inner.is_null() && native::ffi::decoder_hardware_accelerated(&self.inner)
+    }
+
+    pub fn flush(&mut self) -> Result<(), WindowsBackendError> {
+        if self.inner.is_null() {
+            return Err(WindowsBackendError::InvalidState);
+        }
+        let status = native::ffi::decoder_flush(self.inner.pin_mut());
+        if status == native::STATUS_OK {
+            Ok(())
+        } else {
+            Err(WindowsBackendError::InvalidState)
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsH264Decoder {
+    fn drop(&mut self) {
+        if !self.inner.is_null() {
+            let _ = native::ffi::decoder_quiesce(self.inner.pin_mut());
+        }
+    }
+}
+
+#[cfg(windows)]
+impl D3D11WindowRenderer {
+    pub fn present_decoded(
+        &mut self,
+        frame: &DecodedD3D11Frame,
+    ) -> Result<(), WindowsBackendError> {
+        if self.inner.is_null() || frame.surface.is_null() {
+            return Err(WindowsBackendError::InvalidState);
+        }
+        let status = native::ffi::renderer_present(self.inner.pin_mut(), &frame.surface);
+        match status {
+            native::STATUS_OK => Ok(()),
+            native::STATUS_UNSUPPORTED => Err(WindowsBackendError::Unsupported),
+            _ => Err(WindowsBackendError::InvalidState),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct WindowsEncodedH264Frame {
+    pub meta: EncodedFrameMeta,
+    pub bytes: Vec<u8>,
+    pub capture_sequence: u64,
+    pub capture_timestamp_ns: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[cfg(windows)]
+pub struct WindowsDdaH264Encoder {
+    capture: cxx::UniquePtr<native::ffi::Capture>,
+    encoder: Option<cxx::UniquePtr<native::ffi::Encoder>>,
+    policy: LowDelayPolicy,
+    planner: ContinuityPlanner,
+    max_width: u32,
+    max_height: u32,
+    fps: u32,
+    target_bitrate_bps: u32,
+    encoded_width: u32,
+    encoded_height: u32,
+    capture_sequence: u64,
+    force_idr_pending: bool,
+    recovery_outputs_dropped: u64,
+    output_buffer: Vec<u8>,
+}
+
+#[cfg(windows)]
+impl WindowsDdaH264Encoder {
+    pub fn new(
+        max_width: u32,
+        max_height: u32,
+        fps: u32,
+        target_bitrate_bps: u32,
+        codec_epoch: u32,
+        policy: LowDelayPolicy,
+    ) -> Result<Self, WindowsBackendError> {
+        let policy = policy.validate().map_err(WindowsBackendError::H264)?;
+        if max_width == 0
+            || max_height == 0
+            || max_width % 2 != 0
+            || max_height % 2 != 0
+            || fps == 0
+            || target_bitrate_bps == 0
+            || codec_epoch == 0
+        {
+            return Err(WindowsBackendError::InvalidState);
+        }
+        let mut status = native::STATUS_OK;
+        let mut capture = native::ffi::make_desktop_duplication_capture(0, 0, 1, &mut status);
+        if status != native::STATUS_OK || capture.is_null() {
+            return Err(WindowsBackendError::NativeFailure(
+                "make_desktop_duplication_capture",
+                status,
+            ));
+        }
+        let status = native::ffi::capture_start(capture.pin_mut());
+        if status != native::STATUS_OK {
+            return Err(WindowsBackendError::NativeFailure("capture_start", status));
+        }
+        Ok(Self {
+            capture,
+            encoder: None,
+            policy,
+            planner: ContinuityPlanner::new(codec_epoch, 1),
+            max_width,
+            max_height,
+            fps,
+            target_bitrate_bps,
+            capture_sequence: 0,
+            force_idr_pending: true,
+            encoded_width: 0,
+            encoded_height: 0,
+            recovery_outputs_dropped: 0,
+            output_buffer: vec![0; latencydesk_h264::MAX_ACCESS_UNIT_BYTES],
+        })
+    }
+
+    pub fn poll_access_unit(
+        &mut self,
+    ) -> Result<Option<WindowsEncodedH264Frame>, WindowsBackendError> {
+        let ready_output = self.poll_encoder_output()?;
+
+        let status = native::ffi::capture_poll(self.capture.pin_mut(), 0);
+        match status {
+            native::STATUS_NO_FRAME => return Ok(ready_output),
+            native::STATUS_OK => {}
+            other => {
+                return Err(WindowsBackendError::NativeFailure("capture_poll", other));
+            }
+        }
+
+        let source_width = native::ffi::capture_pending_width(&self.capture);
+        let source_height = native::ffi::capture_pending_height(&self.capture);
+        let (width, height) =
+            bounded_even_geometry(source_width, source_height, self.max_width, self.max_height)?;
+        let mut detach_status = native::STATUS_OK;
+        let surface = native::ffi::capture_detach(
+            self.capture.pin_mut(),
+            u32::from_le_bytes(*b"NV12"),
+            width,
+            height,
+            &mut detach_status,
+        );
+        if detach_status != native::STATUS_OK || surface.is_null() {
+            return Err(WindowsBackendError::NativeFailure(
+                "capture_detach_nv12",
+                detach_status,
+            ));
+        }
+        if self.encoder.is_some() && (self.encoded_width != width || self.encoded_height != height)
+        {
+            return Err(WindowsBackendError::NativeFailure(
+                "capture_geometry_changed",
+                native::STATUS_SESSION_CHANGED,
+            ));
+        }
+
+        if self.encoder.is_none() {
+            let mut encoder_status = native::STATUS_OK;
+            let mut encoder = native::ffi::make_mf_h264_encoder_for_surface(
+                &surface,
+                width,
+                height,
+                self.target_bitrate_bps,
+                self.fps,
+                u32::from(self.policy.max_provider_queue),
+                &mut encoder_status,
+            );
+            if encoder_status != native::STATUS_OK || encoder.is_null() {
+                return Err(WindowsBackendError::NativeFailure(
+                    "make_mf_h264_encoder",
+                    encoder_status,
+                ));
+            }
+            if self.force_idr_pending {
+                let status = native::ffi::encoder_request_idr(encoder.pin_mut());
+                if status != native::STATUS_OK {
+                    return Err(WindowsBackendError::NativeFailure(
+                        "encoder_request_idr",
+                        status,
+                    ));
+                }
+                self.force_idr_pending = false;
+            }
+            self.encoded_width = width;
+            self.encoded_height = height;
+            self.encoder = Some(encoder);
+        }
+
+        let capture_sequence = self
+            .capture_sequence
+            .checked_add(1)
+            .ok_or(WindowsBackendError::GenerationExhausted)?;
+        let timestamp_ns = native::monotonic_now_ns();
+        let encoder = self
+            .encoder
+            .as_mut()
+            .ok_or(WindowsBackendError::InvalidState)?;
+        let encode_status = native::ffi::encoder_encode(
+            encoder.pin_mut(),
+            &surface,
+            capture_sequence,
+            timestamp_ns,
+        );
+        match encode_status {
+            native::STATUS_OK => {
+                self.capture_sequence = capture_sequence;
+            }
+            native::STATUS_QUEUE_FULL => return Ok(ready_output),
+            other => {
+                return Err(WindowsBackendError::NativeFailure("encoder_encode", other));
+            }
+        }
+        match ready_output {
+            Some(frame) => Ok(Some(frame)),
+            None => self.poll_encoder_output(),
+        }
+    }
+
+    pub fn request_idr(&mut self) -> Result<(), WindowsBackendError> {
+        self.planner.note_output_drop();
+        self.force_idr_pending = true;
+        if let Some(encoder) = self.encoder.as_mut() {
+            let status = native::ffi::encoder_request_idr(encoder.pin_mut());
+            if status != native::STATUS_OK {
+                return Err(WindowsBackendError::NativeFailure(
+                    "encoder_request_idr",
+                    status,
+                ));
+            }
+            self.force_idr_pending = false;
+        }
+        Ok(())
+    }
+
+    pub fn note_encoded_but_unsent(&mut self) -> Result<(), WindowsBackendError> {
+        self.request_idr()
+    }
+
+    pub fn update_bitrate(&mut self, target_bitrate_bps: u32) -> Result<(), WindowsBackendError> {
+        if target_bitrate_bps == 0 {
+            return Err(WindowsBackendError::InvalidState);
+        }
+        self.target_bitrate_bps = target_bitrate_bps;
+        if let Some(encoder) = self.encoder.as_mut() {
+            let status = native::ffi::encoder_update_bitrate(encoder.pin_mut(), target_bitrate_bps);
+            if status != native::STATUS_OK {
+                return Err(WindowsBackendError::NativeFailure(
+                    "encoder_update_bitrate",
+                    status,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn take_recovery_output_drops(&mut self) -> u64 {
+        std::mem::take(&mut self.recovery_outputs_dropped)
+    }
+
+    fn poll_encoder_output(
+        &mut self,
+    ) -> Result<Option<WindowsEncodedH264Frame>, WindowsBackendError> {
+        let Some(encoder) = self.encoder.as_mut() else {
+            return Ok(None);
+        };
+        let mut output_size = 0;
+        let mut native_keyframe = false;
+        let mut capture_sequence = 0;
+        let mut capture_timestamp_ns = 0;
+        let status = native::ffi::encoder_poll_output(
+            encoder.pin_mut(),
+            &mut self.output_buffer,
+            &mut output_size,
+            &mut native_keyframe,
+            &mut capture_sequence,
+            &mut capture_timestamp_ns,
+        );
+        match status {
+            native::STATUS_NO_FRAME => Ok(None),
+            native::STATUS_OK => {
+                let bytes = self
+                    .output_buffer
+                    .get(..output_size)
+                    .ok_or(WindowsBackendError::InvalidState)?
+                    .to_vec();
+                let meta = match self.planner.accept(&bytes) {
+                    Ok(meta) => meta,
+                    Err(H264Error::RecoveryPointRequired) => {
+                        self.recovery_outputs_dropped =
+                            self.recovery_outputs_dropped.saturating_add(1);
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(WindowsBackendError::H264(error)),
+                };
+                if native_keyframe != meta.recovery_point {
+                    return Err(WindowsBackendError::InvalidState);
+                }
+                Ok(Some(WindowsEncodedH264Frame {
+                    meta,
+                    bytes,
+                    capture_sequence,
+                    capture_timestamp_ns,
+                    width: self.encoded_width,
+                    height: self.encoded_height,
+                }))
+            }
+            other => Err(WindowsBackendError::NativeFailure(
+                "encoder_poll_output",
+                other,
+            )),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsDdaH264Encoder {
+    fn drop(&mut self) {
+        if let Some(encoder) = self.encoder.as_mut() {
+            let _ = native::ffi::encoder_quiesce(encoder.pin_mut());
+        }
+        if !self.capture.is_null() {
+            let _ = native::ffi::capture_stop(self.capture.pin_mut());
+        }
+    }
+}
+
+#[cfg(windows)]
+fn bounded_even_geometry(
+    source_width: u32,
+    source_height: u32,
+    max_width: u32,
+    max_height: u32,
+) -> Result<(u32, u32), WindowsBackendError> {
+    if source_width == 0
+        || source_height == 0
+        || max_width == 0
+        || max_height == 0
+        || max_width % 2 != 0
+        || max_height % 2 != 0
+    {
+        return Err(WindowsBackendError::InvalidState);
+    }
+    Ok((max_width, max_height))
+}
 #[cfg(windows)]
 pub(crate) use native::DesktopDuplicationCaptureSource;
 
@@ -3239,9 +3680,11 @@ impl Drop for WindowsCaptureBackend {
 fn platform_error_for_windows_backend(error: &WindowsBackendError) -> PlatformError {
     match error {
         WindowsBackendError::InvalidState
+        | WindowsBackendError::NativeFailure(_, _)
         | WindowsBackendError::RetryNotReady
         | WindowsBackendError::GenerationExhausted
         | WindowsBackendError::DrainInProgress => PlatformError::InvalidState,
+        WindowsBackendError::QueueFull => PlatformError::QueueFull,
         WindowsBackendError::Unsupported => PlatformError::Unsupported,
         WindowsBackendError::MetadataLimit
         | WindowsBackendError::MetadataBounds
@@ -3269,9 +3712,18 @@ pub fn validate_encoded_h264(
 /// Windows Media Foundation hardware H.264 encoder backend.
 ///
 /// Manages GPU surface submissions and tracks low-delay continuity metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsEncodeMode {
+    Native,
+    /// Exercises submission ownership only, completes synchronously, and never
+    /// produces an encoded bitstream.
+    PolicyOnlyNoOutput,
+}
+
 #[derive(Debug)]
 pub struct WindowsEncodeBackend {
     policy: LowDelayPolicy,
+    mode: WindowsEncodeMode,
     device: DeviceIdentity,
     planner: ContinuityPlanner,
     #[cfg(windows)]
@@ -3298,10 +3750,37 @@ impl WindowsEncodeBackend {
         policy: LowDelayPolicy,
         codec_epoch: u32,
     ) -> Result<Self, WindowsBackendError> {
+        Self::new_with_mode(device, policy, codec_epoch, WindowsEncodeMode::Native)
+    }
+
+    /// Constructs a policy-only backend for deterministic submission lifecycle
+    /// checks. Accepted submissions complete synchronously, and
+    /// [`Self::take_output`] always returns `None` because no bitstream exists.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new_policy_only(
+        device: DeviceIdentity,
+        policy: LowDelayPolicy,
+        codec_epoch: u32,
+    ) -> Result<Self, WindowsBackendError> {
+        Self::new_with_mode(
+            device,
+            policy,
+            codec_epoch,
+            WindowsEncodeMode::PolicyOnlyNoOutput,
+        )
+    }
+
+    fn new_with_mode(
+        device: DeviceIdentity,
+        policy: LowDelayPolicy,
+        codec_epoch: u32,
+        mode: WindowsEncodeMode,
+    ) -> Result<Self, WindowsBackendError> {
         let policy = policy.validate().map_err(WindowsBackendError::H264)?;
         Ok(Self {
             policy,
             device,
+            mode,
             planner: ContinuityPlanner::new(codec_epoch, 1),
             #[cfg(windows)]
             native_encoder: None,
@@ -3370,63 +3849,75 @@ impl EncodeBackend for WindowsEncodeBackend {
         submission: EncoderSubmissionGuard,
     ) -> Result<EncodeSubmission, EncodeFailure> {
         let preflight = submission.preflight();
-        if preflight.descriptor.memory_domain != MemoryDomain::D3D11
-            && preflight.descriptor.memory_domain != MemoryDomain::Cpu
-        {
+        if preflight.descriptor.memory_domain != MemoryDomain::D3D11 {
             return Err(submission.reject(PlatformError::InvalidSurface));
-        }
-
-        #[cfg(windows)]
-        if self.native_encoder.is_none()
-            && preflight.descriptor.memory_domain == MemoryDomain::D3D11
-        {
-            let mut status = native::STATUS_OK;
-            let adapter_index = match self.device {
-                DeviceIdentity::Opaque(idx) => idx as u32,
-                _ => 0,
-            };
-            let encoder = native::ffi::make_mf_h264_encoder(
-                adapter_index,
-                preflight.descriptor.width,
-                preflight.descriptor.height,
-                5_000_000,
-                30,
-                self.policy.max_provider_queue as u32,
-                &mut status,
-            );
-            if status == native::STATUS_OK && !encoder.is_null() {
-                self.native_encoder = Some(encoder);
-            }
         }
 
         let sub = submission.submit()?;
 
+        if self.mode == WindowsEncodeMode::PolicyOnlyNoOutput {
+            self.completed = true;
+            return Ok(sub);
+        }
+
+        #[cfg(not(windows))]
+        {
+            return Err(sub.reject(PlatformError::InvalidSurface));
+        }
+
         #[cfg(windows)]
-        if let Some(encoder) = self.native_encoder.as_mut() {
-            if let Some(cxx_surface) = sub
+        {
+            let native_surface = match sub
                 .frame()
                 .surface()
                 .payload::<crate::native::CxxSurfacePayload>()
             {
-                let status = native::ffi::encoder_encode(
-                    encoder.pin_mut(),
-                    cxx_surface.surface(),
-                    preflight.descriptor.capture_sequence,
-                    preflight.descriptor.capture_timestamp_ns,
-                );
-                if status == native::STATUS_QUEUE_FULL {
-                    return Err(sub.reject(PlatformError::QueueFull));
-                }
-                if status != native::STATUS_OK {
-                    return Err(sub.reject(PlatformError::InvalidSurface));
-                }
-                self.completed = false;
-                return Ok(sub);
-            }
-        }
+                Some(surface) => surface,
+                None => return Err(sub.reject(PlatformError::InvalidSurface)),
+            };
 
-        self.completed = true;
-        Ok(sub)
+            if self.native_encoder.is_none() {
+                let mut status = native::STATUS_OK;
+                let adapter_index = match self.device {
+                    DeviceIdentity::Opaque(idx) => idx as u32,
+                    _ => 0,
+                };
+                let fps = 60;
+                let target_bitrate_bps = 30_000_000;
+                let encoder = native::ffi::make_mf_h264_encoder(
+                    adapter_index,
+                    preflight.descriptor.width,
+                    preflight.descriptor.height,
+                    target_bitrate_bps,
+                    fps,
+                    self.policy.max_provider_queue as u32,
+                    &mut status,
+                );
+                if status != native::STATUS_OK || encoder.is_null() {
+                    return Err(sub.reject(PlatformError::InvalidState));
+                }
+                self.native_encoder = Some(encoder);
+            }
+
+            let encoder = self
+                .native_encoder
+                .as_mut()
+                .expect("native encoder must exist after successful creation");
+            let status = native::ffi::encoder_encode(
+                encoder.pin_mut(),
+                native_surface.surface(),
+                preflight.descriptor.capture_sequence,
+                preflight.descriptor.capture_timestamp_ns,
+            );
+            if status == native::STATUS_QUEUE_FULL {
+                return Err(sub.reject(PlatformError::QueueFull));
+            }
+            if status != native::STATUS_OK {
+                return Err(sub.reject(PlatformError::InvalidSurface));
+            }
+            self.completed = false;
+            Ok(sub)
+        }
     }
 
     fn poll_encode_completion(
@@ -4107,6 +4598,8 @@ impl RenderBackend for WindowsRenderBackend {
 pub enum WindowsBackendError {
     InvalidState,
     Unsupported,
+    QueueFull,
+    NativeFailure(&'static str, u32),
     RetryNotReady,
     GenerationExhausted,
     DrainInProgress,
@@ -4147,6 +4640,15 @@ mod tests {
         SurfaceLayout, SynchronizationProof, TransferEdge,
     };
     use latencydesk_platform::ProviderState;
+
+    #[cfg(windows)]
+    #[test]
+    fn product_encoder_uses_the_exact_negotiated_geometry() {
+        assert_eq!(
+            bounded_even_geometry(2_560, 1_600, 1_920, 1_080),
+            Ok((1_920, 1_080))
+        );
+    }
 
     fn empty_metadata() -> DesktopMetadata {
         DesktopMetadata {
@@ -7204,7 +7706,7 @@ mod lifecycle_review_regressions {
         );
     }
     #[test]
-    fn windows_encode_backend_encodes_submission_and_completes() {
+    fn windows_encode_backend_default_fails_closed_and_policy_only_completes() {
         let (broker, binding) = authenticated_broker();
         let source = ReviewNativeSource::new();
         let state = Arc::clone(&source.state);
@@ -7227,26 +7729,52 @@ mod lifecycle_review_regressions {
         .expect("authorized backend");
         backend.start().expect("start");
         let identity = started_identity(&state);
-        state
-            .lock()
-            .expect("source state")
-            .events
-            .push_back(Ok(Some(frame_event(identity, 1, 93))));
+        {
+            let mut source_state = state.lock().expect("source state");
+            source_state
+                .events
+                .push_back(Ok(Some(frame_event(identity, 1, 93))));
+            source_state
+                .events
+                .push_back(Ok(Some(frame_event(identity, 1, 94))));
+        }
         let Some(CaptureEvent::Frame(frame)) = backend.poll(0).expect("frame") else {
             panic!("expected frame");
         };
 
-        let mut encoder =
+        let mut native_encoder =
             WindowsEncodeBackend::new(DeviceIdentity::Opaque(1), LowDelayPolicy::baseline(60), 1)
-                .expect("encoder");
+                .expect("native encoder");
+        let guard = native_encoder.prepare(frame).expect("prepare native");
+        let failure = native_encoder
+            .encode(guard)
+            .expect_err("payload-less D3D11 surface must fail closed");
+        assert_eq!(failure.error, PlatformError::InvalidSurface);
+        drop(failure);
+        assert_eq!(pool.in_use(), 0);
+
+        let Some(CaptureEvent::Frame(frame)) = backend.poll(0).expect("second frame") else {
+            panic!("expected second frame");
+        };
+        let mut encoder = WindowsEncodeBackend::new_policy_only(
+            DeviceIdentity::Opaque(1),
+            LowDelayPolicy::baseline(60),
+            1,
+        )
+        .expect("policy-only encoder");
         assert_eq!(encoder.device(), DeviceIdentity::Opaque(1));
         assert_eq!(encoder.policy(), LowDelayPolicy::baseline(60));
 
-        let guard = encoder.prepare(frame).expect("prepare");
-        let submission = encoder.encode(guard).expect("encode");
+        let guard = encoder.prepare(frame).expect("prepare policy-only");
+        let submission = encoder.encode(guard).expect("policy-only encode");
         assert_eq!(
             encoder.poll_encode_completion(&submission).expect("poll"),
             NativePresentationCompletion::Complete
+        );
+        assert_eq!(
+            encoder.take_output(),
+            None,
+            "policy-only mode produces no bitstream"
         );
         encoder.release_encoded(submission).expect("release");
         assert_eq!(pool.in_use(), 0);

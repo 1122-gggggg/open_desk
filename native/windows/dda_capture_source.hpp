@@ -2,6 +2,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <d3d10_1.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
@@ -100,9 +101,10 @@ class DdaCaptureSource final {
  private:
   void release_pending();
   void require_started() const;
-  [[nodiscard]] DdaFrameMetadata read_metadata(const DXGI_OUTDUPL_FRAME_INFO& info) const;
+  [[nodiscard]] DdaFrameMetadata read_metadata(const DXGI_OUTDUPL_FRAME_INFO& info);
   void ensure_video_processor(DXGI_FORMAT input_format, DXGI_FORMAT output_format,
-                              UINT width, UINT height);
+                              UINT input_width, UINT input_height,
+                              UINT output_width, UINT output_height);
   void ensure_intermediate_input(const D3D11_TEXTURE2D_DESC& description);
   void destroy_unusable() noexcept;
 
@@ -115,6 +117,7 @@ class DdaCaptureSource final {
   Microsoft::WRL::ComPtr<ID3D11Query> copy_completion_query_;
   Microsoft::WRL::ComPtr<ID3D11Texture2D> pending_texture_;
   D3D11_TEXTURE2D_DESC pending_description_{};
+  std::vector<std::uint8_t> metadata_buffer_;
   bool copy_started_{};
   bool copy_completed_{};
   bool unusable_{};
@@ -126,8 +129,10 @@ class DdaCaptureSource final {
   D3D11_TEXTURE2D_DESC intermediate_description_{};
   DXGI_FORMAT video_processor_input_format_{};
   DXGI_FORMAT video_processor_output_format_{};
-  UINT video_processor_width_{};
-  UINT video_processor_height_{};
+  UINT video_processor_input_width_{};
+  UINT video_processor_input_height_{};
+  UINT video_processor_output_width_{};
+  UINT video_processor_output_height_{};
 };
 
 }  // namespace latencydesk

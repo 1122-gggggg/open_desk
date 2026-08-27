@@ -8,6 +8,71 @@ use std::error::Error;
 #[cfg(not(any(target_os = "linux", windows)))]
 const UNSUPPORTED_PLATFORM: &str = "secure hosting is currently supported only on Linux X11 and Windows; other platforms are rejected before opening a socket because their product capture/input providers are not implemented (use --unsafe-udp-lab only for isolated compatibility testing)";
 
+const CLEAN_APPLICATION_CLOSE_CODE: u32 = 0;
+const HOST_FAILURE_APPLICATION_CLOSE_CODE: u32 = 1;
+
+const fn host_application_close_code(succeeded: bool) -> u32 {
+    if succeeded {
+        CLEAN_APPLICATION_CLOSE_CODE
+    } else {
+        HOST_FAILURE_APPLICATION_CLOSE_CODE
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[derive(Clone, Debug)]
+struct InputLaneFailure(std::sync::Arc<InputLaneFailureState>);
+
+#[cfg(any(target_os = "linux", windows))]
+#[derive(Debug)]
+struct InputLaneFailureState {
+    message: String,
+    observed_by_stream: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(any(target_os = "linux", windows))]
+impl InputLaneFailure {
+    fn new(message: String) -> Self {
+        Self(std::sync::Arc::new(InputLaneFailureState {
+            message,
+            observed_by_stream: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+
+    fn mark_observed(&self) {
+        self.0
+            .observed_by_stream
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn was_observed(&self) -> bool {
+        self.0
+            .observed_by_stream
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+impl std::fmt::Display for InputLaneFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0.message)
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+impl std::error::Error for InputLaneFailure {}
+
+#[cfg(test)]
+mod close_code_tests {
+    use super::*;
+
+    #[test]
+    fn application_close_code_is_zero_only_for_host_success() {
+        assert_eq!(host_application_close_code(true), 0);
+        assert_eq!(host_application_close_code(false), 1);
+    }
+}
+
 /// Runs the secure product path. Unsupported platforms fail before loading
 /// credentials, creating a socket, or opening a capture/input provider.
 #[cfg(not(any(target_os = "linux", windows)))]
@@ -20,8 +85,11 @@ mod linux {
     use super::HostArgs;
     use bytes::Bytes;
     use latencydesk_input::{InputMessage, InputReconciler, ReconcileOutcome};
-    use latencydesk_platform_linux::{pack_nv12_access_unit, X11DesktopSession};
-    use latencydesk_protocol::{media_flags, MediaKind};
+    use latencydesk_platform_linux::{letterbox_geom, pack_nv12_access_unit, X11DesktopSession};
+    use latencydesk_protocol::{
+        media_flags, video_capability_flags, ControlKind, MediaKind, VideoCodec,
+        VideoCodecCapabilities, VideoProfile, VideoStreamConfig, VIDEO_CODEC_CONTRACT_VERSION,
+    };
     use latencydesk_socket_transport::identity::{
         accept_exact_peer_with_timeout, certificate_fingerprint, load_certificate_der,
         mtls_server_config, IdentityError, TlsIdentity,
@@ -36,15 +104,45 @@ mod linux {
     use tokio::sync::mpsc;
     use tokio::time::MissedTickBehavior;
 
-    const MEDIA_MAX_AGE: Duration = Duration::from_millis(250);
     const INPUT_CHANNEL_CAPACITY: usize = 64;
     const INPUT_BUDGET_PER_TURN: usize = 8;
     const LOG_FRAME_INTERVAL: u64 = 60;
     const AUTHENTICATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 
+    fn frame_period(fps: u32) -> Option<Duration> {
+        let fps = NonZeroU64::new(u64::from(fps))?;
+        Some(Duration::from_nanos(1_000_000_000_u64.div_ceil(fps.get())))
+    }
+
+    const fn frame_log_due(frame_id: u64) -> bool {
+        frame_id == 1 || frame_id % LOG_FRAME_INTERVAL == 0
+    }
+
+    #[derive(Default)]
+    struct MediaDropLog {
+        pending: u64,
+    }
+
+    impl MediaDropLog {
+        fn record(&mut self, frame_id: u64) -> Option<u64> {
+            self.pending = self.pending.saturating_add(1);
+            self.take_if_due(frame_id)
+        }
+
+        fn take_if_due(&mut self, frame_id: u64) -> Option<u64> {
+            if self.pending == 0 || !frame_log_due(frame_id) {
+                return None;
+            }
+            Some(std::mem::take(&mut self.pending))
+        }
+    }
+
     macro_rules! close_endpoint {
-        ($endpoint:expr, $reason:expr) => {{
-            $endpoint.close(0_u32.into(), $reason);
+        ($endpoint:expr, $succeeded:expr, $reason:expr) => {{
+            $endpoint.close(
+                super::host_application_close_code($succeeded).into(),
+                $reason,
+            );
             $endpoint.wait_idle().await;
         }};
     }
@@ -52,7 +150,7 @@ mod linux {
     enum InputLaneEvent {
         Payload(Bytes),
         Completed,
-        Failed(String),
+        Failed(super::InputLaneFailure),
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +216,7 @@ mod linux {
         let connection = loop {
             let now = tokio::time::Instant::now();
             if now >= pairing_deadline {
-                close_endpoint!(endpoint, b"peer authentication timed out");
+                close_endpoint!(endpoint, false, b"peer authentication timed out");
                 return Err(pairing_timeout_error(args, rejected_connections).into());
             }
 
@@ -136,7 +234,7 @@ mod linux {
                 Ok(Err(error))
                     if classify_accept_failure(&error) == AcceptFailureDisposition::Fatal =>
                 {
-                    close_endpoint!(endpoint, b"QUIC listener failed");
+                    close_endpoint!(endpoint, false, b"QUIC listener failed");
                     return Err(format!(
                         "secure QUIC listener failed after rejecting {rejected_connections} unauthenticated connection(s): {error}"
                     )
@@ -151,7 +249,7 @@ mod linux {
                     }
                 }
                 Err(_) => {
-                    close_endpoint!(endpoint, b"peer authentication timed out");
+                    close_endpoint!(endpoint, false, b"peer authentication timed out");
                     return Err(pairing_timeout_error(args, rejected_connections).into());
                 }
             }
@@ -165,25 +263,93 @@ mod linux {
         let mut desktop = match X11DesktopSession::open() {
             Ok(desktop) => desktop,
             Err(error) => {
-                close_endpoint!(endpoint, b"capture provider initialization failed");
+                close_endpoint!(endpoint, false, b"capture provider initialization failed");
                 return Err(error.into());
             }
         };
         let session_id = match NonZeroU64::new(super::super::assign_session_id()) {
             Some(session_id) => session_id,
             None => {
-                close_endpoint!(endpoint, b"session id allocation failed");
+                close_endpoint!(endpoint, false, b"session id allocation failed");
                 return Err("failed to allocate a nonzero session id".into());
             }
         };
         let session = match ProductSession::host(connection, session_id).await {
             Ok(session) => session,
             Err(error) => {
-                close_endpoint!(endpoint, b"product session activation failed");
+                close_endpoint!(endpoint, false, b"product session activation failed");
                 return Err(error.into());
             }
         };
         println!("session: active session_id={session_id}");
+        let negotiation_result = async {
+            let mut control_receiver = tokio::time::timeout(
+                AUTHENTICATION_ATTEMPT_TIMEOUT,
+                session.accept_control_receiver(),
+            )
+            .await
+            .map_err(|_| "timed out waiting for client codec capabilities")??;
+            let capabilities_message = tokio::time::timeout(
+                AUTHENTICATION_ATTEMPT_TIMEOUT,
+                control_receiver.next_control(),
+            )
+            .await
+            .map_err(|_| "timed out waiting for client codec capabilities")??;
+            if capabilities_message.kind != ControlKind::Capabilities {
+                return Err(format!(
+                    "expected codec capabilities, received {:?}",
+                    capabilities_message.kind
+                )
+                .into());
+            }
+            let capabilities = VideoCodecCapabilities::decode(&capabilities_message.payload)?;
+            if capabilities.flags & video_capability_flags::RAW_NV12 == 0 {
+                return Err("client did not explicitly offer raw NV12 compatibility".into());
+            }
+            let max_width = args.max_width.min(capabilities.max_width) & !1;
+            let max_height = args.max_height.min(capabilities.max_height) & !1;
+            let fps = args.fps.min(capabilities.max_fps);
+            let (screen_width, screen_height) = desktop.screen_size();
+            let geometry =
+                letterbox_geom(screen_width, screen_height, max_width, max_height)?;
+            let raw_bitrate_bps = u32::try_from(
+                u64::from(geometry.out_width)
+                    .saturating_mul(u64::from(geometry.out_height))
+                    .saturating_mul(12)
+                    .saturating_mul(u64::from(fps)),
+            )
+            .unwrap_or(u32::MAX)
+            .max(1);
+            let config = VideoStreamConfig {
+                contract_version: VIDEO_CODEC_CONTRACT_VERSION,
+                codec: VideoCodec::RawNv12,
+                profile: VideoProfile::RawNv12,
+                pixel_format: u32::from_le_bytes(*b"NV12"),
+                stream_id: 1,
+                codec_epoch: session.stamp().codec_epoch,
+                width: geometry.out_width,
+                height: geometry.out_height,
+                fps,
+                target_bitrate_bps: raw_bitrate_bps,
+                flags: 0,
+            };
+            session
+                .send_control(ControlKind::ConfigureStream, &config.encode()?)
+                .await?;
+            println!(
+                "codec: negotiated contract v{VIDEO_CODEC_CONTRACT_VERSION} explicit Raw NV12 {}x{}@{}",
+                config.width, config.height, config.fps
+            );
+            Ok::<_, Box<dyn Error>>((control_receiver, config))
+        }
+        .await;
+        let (_control_receiver, stream_config) = match negotiation_result {
+            Ok(negotiated) => negotiated,
+            Err(error) => {
+                close_endpoint!(endpoint, false, b"codec negotiation failed");
+                return Err(error);
+            }
+        };
 
         let (input_tx, mut input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
         let input_session = session.clone();
@@ -192,15 +358,14 @@ mod linux {
                 Ok(receiver) => receiver,
                 Err(error) if is_clean_session_close(&error) => {
                     let _ = input_tx.send(InputLaneEvent::Completed).await;
-                    return;
+                    return Ok(());
                 }
                 Err(error) => {
-                    let _ = input_tx
-                        .send(InputLaneEvent::Failed(format!(
-                            "failed to establish the reliable input lane: {error}"
-                        )))
-                        .await;
-                    return;
+                    let failure = super::InputLaneFailure::new(format!(
+                        "failed to establish the reliable input lane: {error}"
+                    ));
+                    let _ = input_tx.try_send(InputLaneEvent::Failed(failure.clone()));
+                    return Err(failure);
                 }
             };
 
@@ -212,48 +377,62 @@ mod linux {
                             .await
                             .is_err()
                         {
-                            return;
+                            return Ok(());
                         }
                     }
                     Err(error) if is_clean_session_close(&error) => {
                         let _ = input_tx.send(InputLaneEvent::Completed).await;
-                        return;
+                        return Ok(());
                     }
                     Err(error) => {
-                        let _ = input_tx
-                            .send(InputLaneEvent::Failed(format!(
-                                "reliable input lane disconnected: {error}"
-                            )))
-                            .await;
-                        return;
+                        let failure = super::InputLaneFailure::new(format!(
+                            "reliable input lane disconnected: {error}"
+                        ));
+                        let _ = input_tx.try_send(InputLaneEvent::Failed(failure.clone()));
+                        return Err(failure);
                     }
                 }
             }
         });
 
         let mut reconciler = InputReconciler::default();
-        let stream_result =
-            stream_desktop(args, &session, &mut input_rx, &mut reconciler, &mut desktop).await;
+        let stream_result = stream_desktop(
+            args,
+            &session,
+            &mut input_rx,
+            &mut reconciler,
+            &mut desktop,
+            stream_config,
+        )
+        .await;
 
         input_task.abort();
         let input_task_result = match input_task.await {
-            Ok(()) => Ok(()),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if error.was_observed() => Ok(()),
+            Ok(Err(error)) => Err(error.into()),
             Err(error) if error.is_cancelled() => Ok(()),
             Err(error) => Err(format!("reliable input task failed: {error}").into()),
         };
         let release_result = release_all(&mut reconciler, &mut desktop);
-        close_endpoint!(endpoint, b"host session ended");
-
         let shutdown_result = merge_results(
             input_task_result,
             release_result,
             "input cleanup also failed",
         );
-        merge_results(
+        let final_result = merge_results(
             stream_result,
             shutdown_result,
             "session shutdown also failed",
-        )
+        );
+        let succeeded = final_result.is_ok();
+        let close_reason: &[u8] = if succeeded {
+            b"host session ended"
+        } else {
+            b"host session failed"
+        };
+        close_endpoint!(endpoint, succeeded, close_reason);
+        final_result
     }
 
     async fn stream_desktop(
@@ -262,12 +441,10 @@ mod linux {
         input_rx: &mut mpsc::Receiver<InputLaneEvent>,
         reconciler: &mut InputReconciler,
         desktop: &mut X11DesktopSession,
+        stream_config: VideoStreamConfig,
     ) -> Result<(), Box<dyn Error>> {
-        let frame_period = Duration::from_nanos(
-            1_000_000_000_u64
-                .checked_div(u64::from(args.fps))
-                .ok_or("fps must be positive and nonzero")?,
-        );
+        let frame_period =
+            frame_period(stream_config.fps).ok_or("fps must be positive and nonzero")?;
         let mut ticker = tokio::time::interval(frame_period);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let shutdown = tokio::signal::ctrl_c();
@@ -277,6 +454,7 @@ mod linux {
         let mut frame_id = 0_u64;
         let mut announced_stream = false;
         let mut priority = WorkPriority::Input;
+        let mut media_drop_log = MediaDropLog::default();
 
         loop {
             // Shutdown is first in both biased selections. When media and
@@ -328,10 +506,17 @@ mod linux {
                 }
                 ScheduledWork::Media => {
                     frame_id = frame_id.checked_add(1).ok_or("frame id exhausted")?;
-                    let keyframe_interval = u64::from(args.fps).saturating_mul(2).max(1);
+                    let keyframe_interval = u64::from(stream_config.fps).saturating_mul(2).max(1);
                     let is_keyframe = frame_id == 1 || frame_id % keyframe_interval == 0;
                     let (width, height, nv12) =
-                        desktop.capture_nv12(args.max_width, args.max_height)?;
+                        desktop.capture_nv12(stream_config.width, stream_config.height)?;
+                    if (width, height) != (stream_config.width, stream_config.height) {
+                        return Err(format!(
+                            "raw NV12 capture geometry changed from negotiated {}x{} to {width}x{height}",
+                            stream_config.width, stream_config.height
+                        )
+                        .into());
+                    }
                     let frame = pack_nv12_access_unit(width, height, &nv12);
                     let report = match session.send_media_frame(
                         FragmentSpec {
@@ -341,27 +526,42 @@ mod linux {
                             } else {
                                 0
                             },
-                            stream_id: 1,
-                            codec_epoch: session.stamp().codec_epoch,
+                            stream_id: stream_config.stream_id,
+                            codec_epoch: stream_config.codec_epoch,
                             frame_id,
                             dependency_frame_id: (!is_keyframe).then_some(frame_id - 1),
                         },
                         &frame,
-                        MEDIA_MAX_AGE,
+                        frame_period,
                     ) {
                         Ok(report) => report,
                         Err(error) if is_clean_session_close(&error) => {
                             println!("session: peer completed normally");
                             return Ok(());
                         }
+                        Err(error) if is_transient_media_send(&error) => {
+                            if let Some(dropped) = media_drop_log.record(frame_id) {
+                                eprintln!(
+                                    "media: dropped {dropped} frame(s) through frame {frame_id}: {error}"
+                                );
+                            }
+                            if args.max_frames.is_some_and(|maximum| frame_id >= maximum) {
+                                return Ok(());
+                            }
+                            priority = WorkPriority::after_media();
+                            continue;
+                        }
                         Err(error) => return Err(error.into()),
                     };
 
                     if !announced_stream {
-                        println!("stream: NV12 {width}x{height} over QUIC DATAGRAM");
+                        println!("stream: explicit Raw NV12 {width}x{height} over QUIC DATAGRAM");
                         announced_stream = true;
                     }
-                    if frame_id == 1 || frame_id % LOG_FRAME_INTERVAL == 0 {
+                    if let Some(dropped) = media_drop_log.take_if_due(frame_id) {
+                        eprintln!("media: dropped {dropped} frame(s) through frame {frame_id}");
+                    }
+                    if frame_log_due(frame_id) {
                         println!(
                             "streaming: frame {frame_id} bytes={} fragments={} path_datagram_limit={}",
                             frame.len(),
@@ -393,7 +593,10 @@ mod linux {
                     apply_input(&payload, expected_input_epoch, reconciler, desktop)?;
                 }
                 InputLaneEvent::Completed => return Ok(InputBatchOutcome::PeerCompleted),
-                InputLaneEvent::Failed(error) => return Err(error.into()),
+                InputLaneEvent::Failed(error) => {
+                    error.mark_observed();
+                    return Err(error.into());
+                }
             }
         }
         if disconnected {
@@ -443,8 +646,13 @@ mod linux {
 
         match reconciler.apply(message)? {
             ReconcileOutcome::Applied(actions) => {
-                for action in actions {
-                    desktop.inject(action)?;
+                if let Err((failed_actions, first_error)) =
+                    attempt_all_injections(actions, |action| desktop.inject(action))
+                {
+                    return Err(format!(
+                        "input attempted every action but {failed_actions} injections failed; first error: {first_error}"
+                    )
+                    .into());
                 }
             }
             ReconcileOutcome::IgnoredStaleSequence | ReconcileOutcome::IgnoredStaleEpoch => {}
@@ -457,25 +665,39 @@ mod linux {
         desktop: &mut X11DesktopSession,
     ) -> Result<(), Box<dyn Error>> {
         let actions = reconciler.disconnect_release_plan();
+        if let Err((failed_actions, first_error)) =
+            attempt_all_injections(actions, |action| desktop.inject(action))
+        {
+            return Err(format!(
+                "ReleaseAll attempted every held input but {failed_actions} injections failed; first error: {first_error}"
+            )
+            .into());
+        }
+        println!("input: ReleaseAll applied");
+        Ok(())
+    }
+
+    fn attempt_all_injections<A, E: ToString>(
+        actions: impl IntoIterator<Item = A>,
+        mut inject: impl FnMut(A) -> Result<(), E>,
+    ) -> Result<(), (usize, String)> {
         let mut failed_actions = 0_usize;
         let mut first_error = None;
         for action in actions {
-            if let Err(error) = desktop.inject(action) {
+            if let Err(error) = inject(action) {
                 failed_actions += 1;
                 if first_error.is_none() {
                     first_error = Some(error.to_string());
                 }
             }
         }
-        if failed_actions != 0 {
-            return Err(format!(
-                "ReleaseAll attempted every held input but {failed_actions} injections failed; first error: {}",
-                first_error.as_deref().unwrap_or("unknown X11 injection error")
-            )
-            .into());
+        match failed_actions {
+            0 => Ok(()),
+            _ => Err((
+                failed_actions,
+                first_error.unwrap_or_else(|| "unknown injection error".to_owned()),
+            )),
         }
-        println!("input: ReleaseAll applied");
-        Ok(())
     }
 
     fn merge_results(
@@ -530,6 +752,14 @@ mod linux {
         matches!(
             error,
             ProductSessionError::Quic(transport) if transport.is_clean_application_close()
+        )
+    }
+
+    fn is_transient_media_send(error: &ProductSessionError) -> bool {
+        matches!(
+            error,
+            ProductSessionError::MediaSendAborted { .. }
+                | ProductSessionError::MediaDeadlineOverflow
         )
     }
 
@@ -656,6 +886,58 @@ mod linux {
         }
 
         #[test]
+        fn media_max_age_is_the_ceiling_of_the_runtime_frame_period() {
+            assert_eq!(frame_period(60), Some(Duration::from_nanos(16_666_667)));
+            assert_eq!(frame_period(120), Some(Duration::from_nanos(8_333_334)));
+            assert_eq!(frame_period(0), None);
+        }
+
+        #[test]
+        fn media_drop_logging_accumulates_until_the_frame_log_cadence() {
+            let mut log = MediaDropLog::default();
+            for frame_id in 2..LOG_FRAME_INTERVAL {
+                assert_eq!(log.record(frame_id), None);
+            }
+            assert_eq!(log.record(LOG_FRAME_INTERVAL), Some(LOG_FRAME_INTERVAL - 1));
+            assert_eq!(log.record(LOG_FRAME_INTERVAL + 1), None);
+            assert_eq!(log.take_if_due(LOG_FRAME_INTERVAL * 2), Some(1));
+        }
+
+        #[test]
+        fn media_send_abort_does_not_count_as_session_close() {
+            use latencydesk_socket_transport::quic::MediaSendOutcome;
+
+            let aborted = ProductSessionError::MediaSendAborted {
+                outcome: MediaSendOutcome::DroppedExpired,
+                fragments_sent: 1,
+                fragments_total: 4,
+            };
+            assert!(is_transient_media_send(&aborted));
+            assert!(!is_clean_session_close(&aborted));
+            assert!(is_transient_media_send(
+                &ProductSessionError::MediaDeadlineOverflow
+            ));
+            assert!(!is_transient_media_send(
+                &ProductSessionError::InvalidMediaMaxAge
+            ));
+        }
+
+        #[test]
+        fn first_inject_failure_still_attempts_remaining_actions() {
+            let mut attempted = Vec::new();
+            let result = attempt_all_injections([10, 20, 30], |action| {
+                attempted.push(action);
+                if action == 10 {
+                    Err("lost")
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(attempted, vec![10, 20, 30]);
+            assert_eq!(result, Err((1, "lost".to_owned())));
+        }
+
+        #[test]
         fn timeout_error_reports_rejected_connection_count() {
             let args = HostArgs {
                 pairing_timeout_secs: 7,
@@ -675,17 +957,23 @@ pub use linux::run;
 mod windows {
     use super::HostArgs;
     use bytes::Bytes;
-    use latencydesk_frame::pack_nv12_access_unit;
+    use latencydesk_h264::LowDelayPolicy;
     use latencydesk_input::{InputMessage, InputReconciler, ReconcileOutcome};
-    use latencydesk_platform_windows::WindowsDesktopSession;
-    use latencydesk_protocol::{media_flags, MediaKind};
+    use latencydesk_platform_windows::{WindowsDdaH264Encoder, WindowsDesktopSession};
+    use latencydesk_protocol::{
+        media_flags, video_capability_flags, CongestionFeedbackMessage, ControlKind, MediaKind,
+        RateUpdateMessage, RecoveryRequest, VideoCodec, VideoCodecCapabilities, VideoProfile,
+        VideoStreamConfig, VIDEO_CODEC_CONTRACT_VERSION,
+    };
     use latencydesk_socket_transport::identity::{
         accept_exact_peer_with_timeout, certificate_fingerprint, load_certificate_der,
         mtls_server_config, IdentityError, TlsIdentity,
     };
     use latencydesk_socket_transport::product::{ProductSession, ProductSessionError};
     use latencydesk_socket_transport::quic::{bind_server, QuicTransportError};
-    use latencydesk_transport::FragmentSpec;
+    use latencydesk_transport::{
+        AdaptiveCongestionConfig, AdaptiveCongestionController, FragmentSpec,
+    };
     use std::error::Error;
     use std::num::NonZeroU64;
     use std::path::Path;
@@ -693,21 +981,63 @@ mod windows {
     use tokio::sync::mpsc;
     use tokio::time::MissedTickBehavior;
 
-    const MEDIA_MAX_AGE: Duration = Duration::from_millis(250);
     const INPUT_CHANNEL_CAPACITY: usize = 64;
     const INPUT_BUDGET_PER_TURN: usize = 8;
     const LOG_FRAME_INTERVAL: u64 = 60;
     const AUTHENTICATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 
+    const CONTROL_CHANNEL_CAPACITY: usize = 16;
+    const INITIAL_VIDEO_BITRATE_BPS: u32 = 15_000_000;
+    const LAN_QUALITY_FLOOR_BPS: u32 = 15_000_000;
+    const MAX_VIDEO_BITRATE_BPS: u32 = 60_000_000;
+    const STREAM_ID: u32 = 1;
+    fn frame_period(fps: u32) -> Option<Duration> {
+        let fps = NonZeroU64::new(u64::from(fps))?;
+        Some(Duration::from_nanos(1_000_000_000_u64.div_ceil(fps.get())))
+    }
+
+    const fn frame_log_due(frame_id: u64) -> bool {
+        frame_id == 1 || frame_id % LOG_FRAME_INTERVAL == 0
+    }
+
+    #[derive(Default)]
+    struct MediaDropLog {
+        pending: u64,
+    }
+
+    impl MediaDropLog {
+        fn record(&mut self, frame_id: u64) -> Option<u64> {
+            self.pending = self.pending.saturating_add(1);
+            self.take_if_due(frame_id)
+        }
+
+        fn take_if_due(&mut self, frame_id: u64) -> Option<u64> {
+            if self.pending == 0 || !frame_log_due(frame_id) {
+                return None;
+            }
+            Some(std::mem::take(&mut self.pending))
+        }
+    }
+
     macro_rules! close_endpoint {
-        ($endpoint:expr, $reason:expr) => {{
-            $endpoint.close(0_u32.into(), $reason);
+        ($endpoint:expr, $succeeded:expr, $reason:expr) => {{
+            $endpoint.close(
+                super::host_application_close_code($succeeded).into(),
+                $reason,
+            );
             $endpoint.wait_idle().await;
         }};
     }
 
     enum InputLaneEvent {
         Payload(Bytes),
+        Completed,
+        Failed(super::InputLaneFailure),
+    }
+
+    enum ControlLaneEvent {
+        Recovery(RecoveryRequest),
+        Feedback(CongestionFeedbackMessage),
         Completed,
         Failed(String),
     }
@@ -768,7 +1098,7 @@ mod windows {
         let connection = loop {
             let now = tokio::time::Instant::now();
             if now >= pairing_deadline {
-                close_endpoint!(endpoint, b"peer authentication timed out");
+                close_endpoint!(endpoint, false, b"peer authentication timed out");
                 return Err(pairing_timeout_error(args, rejected_connections).into());
             }
 
@@ -786,7 +1116,7 @@ mod windows {
                 Ok(Err(error))
                     if classify_accept_failure(&error) == AcceptFailureDisposition::Fatal =>
                 {
-                    close_endpoint!(endpoint, b"QUIC listener failed");
+                    close_endpoint!(endpoint, false, b"QUIC listener failed");
                     return Err(format!(
                         "secure QUIC listener failed after rejecting {rejected_connections} unauthenticated connection(s): {error}"
                     )
@@ -801,7 +1131,7 @@ mod windows {
                     }
                 }
                 Err(_) => {
-                    close_endpoint!(endpoint, b"peer authentication timed out");
+                    close_endpoint!(endpoint, false, b"peer authentication timed out");
                     return Err(pairing_timeout_error(args, rejected_connections).into());
                 }
             }
@@ -813,25 +1143,135 @@ mod windows {
         let mut desktop = match WindowsDesktopSession::open() {
             Ok(desktop) => desktop,
             Err(error) => {
-                close_endpoint!(endpoint, b"capture provider initialization failed");
+                close_endpoint!(endpoint, false, b"capture provider initialization failed");
                 return Err(error.into());
             }
         };
         let session_id = match NonZeroU64::new(super::super::assign_session_id()) {
             Some(session_id) => session_id,
             None => {
-                close_endpoint!(endpoint, b"session id allocation failed");
+                close_endpoint!(endpoint, false, b"session id allocation failed");
                 return Err("failed to allocate a nonzero session id".into());
             }
         };
         let session = match ProductSession::host(connection, session_id).await {
             Ok(session) => session,
             Err(error) => {
-                close_endpoint!(endpoint, b"product session activation failed");
+                close_endpoint!(endpoint, false, b"product session activation failed");
                 return Err(error.into());
             }
         };
         println!("session: active session_id={session_id}");
+        let negotiation_result = async {
+            let mut control_receiver = tokio::time::timeout(
+                AUTHENTICATION_ATTEMPT_TIMEOUT,
+                session.accept_control_receiver(),
+            )
+            .await
+            .map_err(|_| "timed out waiting for client codec capabilities")??;
+            let capabilities_message = tokio::time::timeout(
+                AUTHENTICATION_ATTEMPT_TIMEOUT,
+                control_receiver.next_control(),
+            )
+            .await
+            .map_err(|_| "timed out waiting for client codec capabilities")??;
+            if capabilities_message.kind != ControlKind::Capabilities {
+                return Err(format!(
+                    "expected codec capabilities, received {:?}",
+                    capabilities_message.kind
+                )
+                .into());
+            }
+            let capabilities = VideoCodecCapabilities::decode(&capabilities_message.payload)?;
+            if capabilities.flags & video_capability_flags::H264_HIGH_420 == 0 {
+                return Err(
+                    "client does not declare H.264 High 4:2:0 hardware decode support".into(),
+                );
+            }
+            let width = args.max_width.min(capabilities.max_width) & !1;
+            let height = args.max_height.min(capabilities.max_height) & !1;
+            let fps = args.fps.min(capabilities.max_fps);
+            let policy = LowDelayPolicy::baseline(fps.saturating_mul(2)).validate()?;
+            let video = WindowsDdaH264Encoder::new(
+                width,
+                height,
+                fps,
+                INITIAL_VIDEO_BITRATE_BPS,
+                session.stamp().codec_epoch,
+                policy,
+            )
+            .map_err(|error| {
+                format!(
+                    "Windows secure video requires DDA plus a Media Foundation hardware H.264 encoder: {error}"
+                )
+            })?;
+            let stream_config = VideoStreamConfig {
+                contract_version: VIDEO_CODEC_CONTRACT_VERSION,
+                codec: VideoCodec::H264,
+                profile: VideoProfile::H264High420,
+                pixel_format: u32::from_le_bytes(*b"NV12"),
+                stream_id: STREAM_ID,
+                codec_epoch: session.stamp().codec_epoch,
+                width,
+                height,
+                fps,
+                target_bitrate_bps: INITIAL_VIDEO_BITRATE_BPS,
+                flags: 0,
+            };
+            session
+                .send_control(ControlKind::ConfigureStream, &stream_config.encode()?)
+                .await?;
+            println!(
+                "codec: negotiated contract v{VIDEO_CODEC_CONTRACT_VERSION} H.264 High 4:2:0 {width}x{height}@{fps} target={INITIAL_VIDEO_BITRATE_BPS}bps"
+            );
+            Ok::<_, Box<dyn Error>>((control_receiver, video))
+        }
+        .await;
+        let (mut control_receiver, mut video) = match negotiation_result {
+            Ok(negotiated) => negotiated,
+            Err(error) => {
+                close_endpoint!(endpoint, false, b"codec negotiation failed");
+                return Err(error);
+            }
+        };
+
+        let (control_tx, mut control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
+        let control_task = tokio::spawn(async move {
+            loop {
+                let event = match control_receiver.next_control().await {
+                    Ok(message) if message.kind == ControlKind::RecoveryRequest => {
+                        RecoveryRequest::decode(&message.payload)
+                            .map(ControlLaneEvent::Recovery)
+                            .map_err(|error| error.to_string())
+                    }
+                    Ok(message) if message.kind == ControlKind::CongestionFeedback => {
+                        CongestionFeedbackMessage::decode(&message.payload)
+                            .map(ControlLaneEvent::Feedback)
+                            .map_err(|error| error.to_string())
+                    }
+                    Ok(message) => Err(format!(
+                        "unexpected client control message {:?}",
+                        message.kind
+                    )),
+                    Err(error) if is_clean_session_close(&error) => {
+                        let _ = control_tx.send(ControlLaneEvent::Completed).await;
+                        return;
+                    }
+                    Err(error) => Err(error.to_string()),
+                };
+                match event {
+                    Ok(event) => {
+                        if control_tx.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = control_tx.send(ControlLaneEvent::Failed(error)).await;
+                        return;
+                    }
+                }
+            }
+        });
 
         let (input_tx, mut input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
         let input_session = session.clone();
@@ -840,15 +1280,14 @@ mod windows {
                 Ok(receiver) => receiver,
                 Err(error) if is_clean_session_close(&error) => {
                     let _ = input_tx.send(InputLaneEvent::Completed).await;
-                    return;
+                    return Ok(());
                 }
                 Err(error) => {
-                    let _ = input_tx
-                        .send(InputLaneEvent::Failed(format!(
-                            "failed to establish the reliable input lane: {error}"
-                        )))
-                        .await;
-                    return;
+                    let failure = super::InputLaneFailure::new(format!(
+                        "failed to establish the reliable input lane: {error}"
+                    ));
+                    let _ = input_tx.try_send(InputLaneEvent::Failed(failure.clone()));
+                    return Err(failure);
                 }
             };
 
@@ -860,73 +1299,162 @@ mod windows {
                             .await
                             .is_err()
                         {
-                            return;
+                            return Ok(());
                         }
                     }
                     Err(error) if is_clean_session_close(&error) => {
                         let _ = input_tx.send(InputLaneEvent::Completed).await;
-                        return;
+                        return Ok(());
                     }
                     Err(error) => {
-                        let _ = input_tx
-                            .send(InputLaneEvent::Failed(format!(
-                                "reliable input lane disconnected: {error}"
-                            )))
-                            .await;
-                        return;
+                        let failure = super::InputLaneFailure::new(format!(
+                            "reliable input lane disconnected: {error}"
+                        ));
+                        let _ = input_tx.try_send(InputLaneEvent::Failed(failure.clone()));
+                        return Err(failure);
                     }
                 }
             }
         });
 
         let mut reconciler = InputReconciler::default();
-        let stream_result =
-            stream_desktop(args, &session, &mut input_rx, &mut reconciler, &mut desktop).await;
+        let stream_result = stream_desktop(
+            args,
+            &session,
+            &mut input_rx,
+            &mut control_rx,
+            &mut reconciler,
+            &mut desktop,
+            &mut video,
+        )
+        .await;
+        control_task.abort();
 
         input_task.abort();
         let input_task_result = match input_task.await {
-            Ok(()) => Ok(()),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if error.was_observed() => Ok(()),
+            Ok(Err(error)) => Err(error.into()),
             Err(error) if error.is_cancelled() => Ok(()),
             Err(error) => Err(format!("reliable input task failed: {error}").into()),
         };
         let release_result = release_all(&mut reconciler, &mut desktop);
-        close_endpoint!(endpoint, b"host session ended");
-
         let shutdown_result = merge_results(
             input_task_result,
             release_result,
             "input cleanup also failed",
         );
-        merge_results(
+        let final_result = merge_results(
             stream_result,
             shutdown_result,
             "session shutdown also failed",
-        )
+        );
+        let succeeded = final_result.is_ok();
+        let close_reason: &[u8] = if succeeded {
+            b"host session ended"
+        } else {
+            b"host session failed"
+        };
+        close_endpoint!(endpoint, succeeded, close_reason);
+        final_result
     }
 
     async fn stream_desktop(
         args: &HostArgs,
         session: &ProductSession,
         input_rx: &mut mpsc::Receiver<InputLaneEvent>,
+        control_rx: &mut mpsc::Receiver<ControlLaneEvent>,
         reconciler: &mut InputReconciler,
         desktop: &mut WindowsDesktopSession,
+        video: &mut WindowsDdaH264Encoder,
     ) -> Result<(), Box<dyn Error>> {
-        let frame_period = Duration::from_nanos(
-            1_000_000_000_u64
-                .checked_div(u64::from(args.fps))
-                .ok_or("fps must be positive and nonzero")?,
-        );
+        let frame_period = frame_period(args.fps).ok_or("fps must be positive and nonzero")?;
         let mut ticker = tokio::time::interval(frame_period);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let shutdown = tokio::signal::ctrl_c();
         tokio::pin!(shutdown);
 
+        let mut congestion = AdaptiveCongestionController::new(AdaptiveCongestionConfig {
+            min_bitrate_bps: LAN_QUALITY_FLOOR_BPS,
+            max_bitrate_bps: MAX_VIDEO_BITRATE_BPS,
+            initial_bitrate_bps: INITIAL_VIDEO_BITRATE_BPS,
+            min_fps: 15,
+            max_fps: 120,
+            initial_fps: args.fps.clamp(15, 120),
+            ..AdaptiveCongestionConfig::default()
+        })?;
+        let feedback_clock = std::time::Instant::now();
         let expected_input_epoch = session.stamp().authorization_epoch;
-        let mut frame_id = 0_u64;
         let mut announced_stream = false;
         let mut priority = WorkPriority::Input;
+        let mut media_drop_log = MediaDropLog::default();
 
         loop {
+            while let Ok(event) = control_rx.try_recv() {
+                match event {
+                    ControlLaneEvent::Recovery(request)
+                        if request.stream_id == STREAM_ID
+                            && request.codec_epoch == session.stamp().codec_epoch =>
+                    {
+                        video.request_idr()?;
+                        println!(
+                            "recovery: force IDR after missing frame {} (last_good={})",
+                            request.first_missing_frame_id, request.last_good_frame_id
+                        );
+                    }
+                    ControlLaneEvent::Recovery(request) => {
+                        return Err(format!(
+                            "recovery request targets stale stream/epoch stream={} epoch={}",
+                            request.stream_id, request.codec_epoch
+                        )
+                        .into());
+                    }
+                    ControlLaneEvent::Feedback(feedback) => {
+                        let decision = congestion.on_sample(
+                            u64::from(feedback.rtt_ns),
+                            feedback.loss_per_million,
+                            u64::from(feedback.jitter_ns),
+                            u64::try_from(feedback_clock.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        );
+                        video.update_bitrate(decision.target_bitrate_bps)?;
+                        if decision.force_keyframe {
+                            video.request_idr()?;
+                        }
+                        if decision.requires_codec_reconfigure || decision.force_keyframe {
+                            let update = RateUpdateMessage {
+                                stream_id: STREAM_ID,
+                                codec_epoch: session.stamp().codec_epoch,
+                                target_bitrate_bps: decision.target_bitrate_bps,
+                                max_bitrate_bps: decision.max_bitrate_bps,
+                                target_fps: decision.target_fps,
+                                flags: if decision.force_keyframe {
+                                    latencydesk_protocol::rate_flags::FORCE_KEYFRAME
+                                } else {
+                                    0
+                                },
+                            };
+                            session
+                                .send_control(ControlKind::RateUpdate, &update.encode())
+                                .await?;
+                            println!(
+                                "adaptation: bitrate={}bps rtt={}ns loss_ppm={} force_idr={}",
+                                decision.target_bitrate_bps,
+                                decision.smoothed_rtt_ns,
+                                decision.smoothed_loss_million,
+                                decision.force_keyframe
+                            );
+                        }
+                    }
+                    ControlLaneEvent::Completed => {
+                        println!("session: peer completed normally");
+                        return Ok(());
+                    }
+                    ControlLaneEvent::Failed(error) => {
+                        return Err(format!("reliable control lane failed: {error}").into());
+                    }
+                }
+            }
+
             let work = match priority {
                 WorkPriority::Media => tokio::select! {
                     biased;
@@ -971,44 +1499,74 @@ mod windows {
                     return Err("reliable input lane task terminated unexpectedly".into());
                 }
                 ScheduledWork::Media => {
-                    frame_id = frame_id.checked_add(1).ok_or("frame id exhausted")?;
-                    let keyframe_interval = u64::from(args.fps).saturating_mul(2).max(1);
-                    let is_keyframe = frame_id == 1 || frame_id % keyframe_interval == 0;
-                    let (width, height, nv12) =
-                        desktop.capture_nv12(args.max_width, args.max_height)?;
-                    let frame = pack_nv12_access_unit(width, height, &nv12);
+                    let Some(frame) = video.poll_access_unit()? else {
+                        let recovery_drops = video.take_recovery_output_drops();
+                        if recovery_drops != 0 {
+                            eprintln!(
+                                "media: dropped {recovery_drops} dependent encoded AU(s) while awaiting forced IDR"
+                            );
+                        }
+                        priority = WorkPriority::after_media();
+                        continue;
+                    };
+                    let frame_id = frame.meta.frame_id;
                     let report = match session.send_media_frame(
                         FragmentSpec {
                             kind: MediaKind::Video,
-                            flags: if is_keyframe {
+                            flags: if frame.meta.recovery_point {
                                 media_flags::KEYFRAME
                             } else {
                                 0
                             },
-                            stream_id: 1,
-                            codec_epoch: session.stamp().codec_epoch,
+                            stream_id: STREAM_ID,
+                            codec_epoch: frame.meta.codec_epoch,
                             frame_id,
-                            dependency_frame_id: (!is_keyframe).then_some(frame_id - 1),
+                            dependency_frame_id: frame.meta.dependency_frame_id,
                         },
-                        &frame,
-                        MEDIA_MAX_AGE,
+                        &frame.bytes,
+                        frame_period,
                     ) {
                         Ok(report) => report,
                         Err(error) if is_clean_session_close(&error) => {
                             println!("session: peer completed normally");
                             return Ok(());
                         }
-                        Err(error) => return Err(error.into()),
+                        Err(error) if is_transient_media_send(&error) => {
+                            video.note_encoded_but_unsent()?;
+                            if let Some(dropped) = media_drop_log.record(frame_id) {
+                                eprintln!(
+                                    "media: dropped {dropped} H.264 AU(s) through frame {frame_id}; next output forced IDR: {error}"
+                                );
+                            }
+                            if args.max_frames.is_some_and(|maximum| frame_id >= maximum) {
+                                return Ok(());
+                            }
+                            priority = WorkPriority::after_media();
+                            continue;
+                        }
+                        Err(error) => {
+                            video.note_encoded_but_unsent()?;
+                            return Err(error.into());
+                        }
                     };
 
                     if !announced_stream {
-                        println!("stream: NV12 {width}x{height} over QUIC DATAGRAM");
+                        println!(
+                            "stream: H.264 High 4:2:0 {}x{} over QUIC DATAGRAM (raw NV12 disabled)",
+                            frame.width, frame.height
+                        );
                         announced_stream = true;
                     }
-                    if frame_id == 1 || frame_id % LOG_FRAME_INTERVAL == 0 {
+                    if let Some(dropped) = media_drop_log.take_if_due(frame_id) {
+                        eprintln!("media: dropped {dropped} H.264 AU(s) through frame {frame_id}");
+                    }
+                    if frame_log_due(frame_id) {
                         println!(
-                            "streaming: frame {frame_id} bytes={} fragments={} path_datagram_limit={}",
-                            frame.len(),
+                            "streaming: H.264 AU frame={frame_id} bytes={} keyframe={} dependency={:?} capture_sequence={} fragments={} path_datagram_limit={}",
+                            frame.bytes.len(),
+                            frame.meta.recovery_point,
+                            frame.meta.dependency_frame_id,
+                            frame.capture_sequence,
                             report.fragments_sent,
                             report.path_max_datagram_bytes
                         );
@@ -1037,7 +1595,10 @@ mod windows {
                     apply_input(&payload, expected_input_epoch, reconciler, desktop)?;
                 }
                 InputLaneEvent::Completed => return Ok(InputBatchOutcome::PeerCompleted),
-                InputLaneEvent::Failed(error) => return Err(error.into()),
+                InputLaneEvent::Failed(error) => {
+                    error.mark_observed();
+                    return Err(error.into());
+                }
             }
         }
         if disconnected {
@@ -1084,8 +1645,13 @@ mod windows {
 
         match reconciler.apply(message)? {
             ReconcileOutcome::Applied(actions) => {
-                for action in actions {
-                    desktop.inject(action)?;
+                if let Err((failed_actions, first_error)) =
+                    attempt_all_injections(actions, |action| desktop.inject(action))
+                {
+                    return Err(format!(
+                        "input attempted every action but {failed_actions} injections failed; first error: {first_error}"
+                    )
+                    .into());
                 }
             }
             ReconcileOutcome::IgnoredStaleSequence | ReconcileOutcome::IgnoredStaleEpoch => {}
@@ -1098,25 +1664,39 @@ mod windows {
         desktop: &mut WindowsDesktopSession,
     ) -> Result<(), Box<dyn Error>> {
         let actions = reconciler.disconnect_release_plan();
+        if let Err((failed_actions, first_error)) =
+            attempt_all_injections(actions, |action| desktop.inject(action))
+        {
+            return Err(format!(
+                "ReleaseAll attempted every held input but {failed_actions} injections failed; first error: {first_error}"
+            )
+            .into());
+        }
+        println!("input: ReleaseAll applied");
+        Ok(())
+    }
+
+    fn attempt_all_injections<A, E: ToString>(
+        actions: impl IntoIterator<Item = A>,
+        mut inject: impl FnMut(A) -> Result<(), E>,
+    ) -> Result<(), (usize, String)> {
         let mut failed_actions = 0_usize;
         let mut first_error = None;
         for action in actions {
-            if let Err(error) = desktop.inject(action) {
+            if let Err(error) = inject(action) {
                 failed_actions += 1;
                 if first_error.is_none() {
                     first_error = Some(error.to_string());
                 }
             }
         }
-        if failed_actions != 0 {
-            return Err(format!(
-                "ReleaseAll attempted every held input but {failed_actions} injections failed; first error: {}",
-                first_error.as_deref().unwrap_or("unknown Windows injection error")
-            )
-            .into());
+        match failed_actions {
+            0 => Ok(()),
+            _ => Err((
+                failed_actions,
+                first_error.unwrap_or_else(|| "unknown injection error".to_owned()),
+            )),
         }
-        println!("input: ReleaseAll applied");
-        Ok(())
     }
 
     fn merge_results(
@@ -1172,6 +1752,14 @@ mod windows {
         matches!(
             error,
             ProductSessionError::Quic(transport) if transport.is_clean_application_close()
+        )
+    }
+
+    fn is_transient_media_send(error: &ProductSessionError) -> bool {
+        matches!(
+            error,
+            ProductSessionError::MediaSendAborted { .. }
+                | ProductSessionError::MediaDeadlineOverflow
         )
     }
 
@@ -1308,6 +1896,58 @@ mod windows {
         fn ready_work_priority_alternates_deterministically() {
             assert_eq!(WorkPriority::after_input(), WorkPriority::Media);
             assert_eq!(WorkPriority::after_media(), WorkPriority::Input);
+        }
+
+        #[test]
+        fn media_max_age_is_the_ceiling_of_the_runtime_frame_period() {
+            assert_eq!(frame_period(60), Some(Duration::from_nanos(16_666_667)));
+            assert_eq!(frame_period(120), Some(Duration::from_nanos(8_333_334)));
+            assert_eq!(frame_period(0), None);
+        }
+
+        #[test]
+        fn media_drop_logging_accumulates_until_the_frame_log_cadence() {
+            let mut log = MediaDropLog::default();
+            for frame_id in 2..LOG_FRAME_INTERVAL {
+                assert_eq!(log.record(frame_id), None);
+            }
+            assert_eq!(log.record(LOG_FRAME_INTERVAL), Some(LOG_FRAME_INTERVAL - 1));
+            assert_eq!(log.record(LOG_FRAME_INTERVAL + 1), None);
+            assert_eq!(log.take_if_due(LOG_FRAME_INTERVAL * 2), Some(1));
+        }
+
+        #[test]
+        fn media_send_abort_does_not_count_as_session_close() {
+            use latencydesk_socket_transport::quic::MediaSendOutcome;
+
+            let aborted = ProductSessionError::MediaSendAborted {
+                outcome: MediaSendOutcome::DroppedExpired,
+                fragments_sent: 1,
+                fragments_total: 4,
+            };
+            assert!(is_transient_media_send(&aborted));
+            assert!(!is_clean_session_close(&aborted));
+            assert!(is_transient_media_send(
+                &ProductSessionError::MediaDeadlineOverflow
+            ));
+            assert!(!is_transient_media_send(
+                &ProductSessionError::InvalidMediaMaxAge
+            ));
+        }
+
+        #[test]
+        fn first_inject_failure_still_attempts_remaining_actions() {
+            let mut attempted = Vec::new();
+            let result = attempt_all_injections([10, 20, 30], |action| {
+                attempted.push(action);
+                if action == 10 {
+                    Err("lost")
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(attempted, vec![10, 20, 30]);
+            assert_eq!(result, Err((1, "lost".to_owned())));
         }
 
         #[test]

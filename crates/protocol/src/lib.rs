@@ -420,6 +420,210 @@ impl RecoveryRequest {
         Ok(request)
     }
 }
+/// Version of the explicit video-codec negotiation contract carried on the
+/// reliable control lane. Media DATAGRAM payloads never identify their codec.
+pub const VIDEO_CODEC_CONTRACT_VERSION: u16 = 1;
+
+/// Capabilities declared by a secure video receiver.
+pub mod video_capability_flags {
+    /// H.264 High profile with 8-bit 4:2:0 output.
+    pub const H264_HIGH_420: u16 = 1 << 0;
+    /// Packed raw NV12 compatibility. Product peers must never infer this bit.
+    pub const RAW_NV12: u16 = 1 << 1;
+}
+
+/// Fixed-size receiver codec offer carried by [`ControlKind::Capabilities`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoCodecCapabilities {
+    pub contract_version: u16,
+    pub flags: u16,
+    pub max_width: u32,
+    pub max_height: u32,
+    pub max_fps: u32,
+}
+
+impl VideoCodecCapabilities {
+    pub const ENCODED_LEN: usize = 16;
+
+    pub fn encode(self) -> Result<[u8; Self::ENCODED_LEN], ProtocolError> {
+        self.validate()?;
+        let mut out = [0_u8; Self::ENCODED_LEN];
+        out[0..2].copy_from_slice(&self.contract_version.to_be_bytes());
+        out[2..4].copy_from_slice(&self.flags.to_be_bytes());
+        out[4..8].copy_from_slice(&self.max_width.to_be_bytes());
+        out[8..12].copy_from_slice(&self.max_height.to_be_bytes());
+        out[12..16].copy_from_slice(&self.max_fps.to_be_bytes());
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        if bytes.len() != Self::ENCODED_LEN {
+            return Err(ProtocolError::PayloadLength {
+                expected: Self::ENCODED_LEN,
+                actual: bytes.len(),
+            });
+        }
+        let capabilities = Self {
+            contract_version: read_u16(bytes, 0),
+            flags: read_u16(bytes, 2),
+            max_width: read_u32(bytes, 4),
+            max_height: read_u32(bytes, 8),
+            max_fps: read_u32(bytes, 12),
+        };
+        capabilities.validate()?;
+        Ok(capabilities)
+    }
+
+    fn validate(self) -> Result<(), ProtocolError> {
+        let known = video_capability_flags::H264_HIGH_420 | video_capability_flags::RAW_NV12;
+        if self.contract_version != VIDEO_CODEC_CONTRACT_VERSION {
+            return Err(ProtocolError::UnsupportedCodecContract(
+                self.contract_version,
+            ));
+        }
+        if self.flags == 0 || self.flags & !known != 0 {
+            return Err(ProtocolError::InvalidCodecCapabilities(self.flags));
+        }
+        if self.max_width == 0
+            || self.max_height == 0
+            || self.max_width % 2 != 0
+            || self.max_height % 2 != 0
+            || self.max_fps == 0
+        {
+            return Err(ProtocolError::InvalidVideoGeometry);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VideoCodec {
+    H264 = 1,
+    RawNv12 = 2,
+}
+
+impl TryFrom<u8> for VideoCodec {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::H264),
+            2 => Ok(Self::RawNv12),
+            other => Err(ProtocolError::UnknownVideoCodec(other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VideoProfile {
+    H264High420 = 1,
+    RawNv12 = 2,
+}
+
+impl TryFrom<u8> for VideoProfile {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::H264High420),
+            2 => Ok(Self::RawNv12),
+            other => Err(ProtocolError::UnknownVideoProfile(other)),
+        }
+    }
+}
+
+/// Host-selected stream format carried by [`ControlKind::ConfigureStream`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoStreamConfig {
+    pub contract_version: u16,
+    pub codec: VideoCodec,
+    pub profile: VideoProfile,
+    pub pixel_format: u32,
+    pub stream_id: u32,
+    pub codec_epoch: u32,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub target_bitrate_bps: u32,
+    pub flags: u32,
+}
+
+impl VideoStreamConfig {
+    pub const ENCODED_LEN: usize = 36;
+
+    pub fn encode(self) -> Result<[u8; Self::ENCODED_LEN], ProtocolError> {
+        self.validate()?;
+        let mut out = [0_u8; Self::ENCODED_LEN];
+        out[0..2].copy_from_slice(&self.contract_version.to_be_bytes());
+        out[2] = self.codec as u8;
+        out[3] = self.profile as u8;
+        out[4..8].copy_from_slice(&self.pixel_format.to_be_bytes());
+        out[8..12].copy_from_slice(&self.stream_id.to_be_bytes());
+        out[12..16].copy_from_slice(&self.codec_epoch.to_be_bytes());
+        out[16..20].copy_from_slice(&self.width.to_be_bytes());
+        out[20..24].copy_from_slice(&self.height.to_be_bytes());
+        out[24..28].copy_from_slice(&self.fps.to_be_bytes());
+        out[28..32].copy_from_slice(&self.target_bitrate_bps.to_be_bytes());
+        out[32..36].copy_from_slice(&self.flags.to_be_bytes());
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        if bytes.len() != Self::ENCODED_LEN {
+            return Err(ProtocolError::PayloadLength {
+                expected: Self::ENCODED_LEN,
+                actual: bytes.len(),
+            });
+        }
+        let config = Self {
+            contract_version: read_u16(bytes, 0),
+            codec: VideoCodec::try_from(bytes[2])?,
+            profile: VideoProfile::try_from(bytes[3])?,
+            pixel_format: read_u32(bytes, 4),
+            stream_id: read_u32(bytes, 8),
+            codec_epoch: read_u32(bytes, 12),
+            width: read_u32(bytes, 16),
+            height: read_u32(bytes, 20),
+            fps: read_u32(bytes, 24),
+            target_bitrate_bps: read_u32(bytes, 28),
+            flags: read_u32(bytes, 32),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(self) -> Result<(), ProtocolError> {
+        if self.contract_version != VIDEO_CODEC_CONTRACT_VERSION {
+            return Err(ProtocolError::UnsupportedCodecContract(
+                self.contract_version,
+            ));
+        }
+        let valid_pair = matches!(
+            (self.codec, self.profile),
+            (VideoCodec::H264, VideoProfile::H264High420)
+                | (VideoCodec::RawNv12, VideoProfile::RawNv12)
+        );
+        if !valid_pair || self.pixel_format != u32::from_le_bytes(*b"NV12") {
+            return Err(ProtocolError::InvalidVideoProfile);
+        }
+        if self.stream_id == 0
+            || self.codec_epoch == 0
+            || self.width == 0
+            || self.height == 0
+            || self.width % 2 != 0
+            || self.height % 2 != 0
+            || self.fps == 0
+            || self.target_bitrate_bps == 0
+            || self.flags != 0
+        {
+            return Err(ProtocolError::InvalidVideoGeometry);
+        }
+        Ok(())
+    }
+}
+
 /// Flags used by [`RateUpdateMessage`].
 pub mod rate_flags {
     /// Forces the next encoded frame to be a keyframe (IDR / recovery point).
@@ -1483,6 +1687,12 @@ pub enum ProtocolError {
         dependency_frame_id: u64,
     },
     InvalidRecoveryRange,
+    UnsupportedCodecContract(u16),
+    InvalidCodecCapabilities(u16),
+    UnknownVideoCodec(u8),
+    UnknownVideoProfile(u8),
+    InvalidVideoProfile,
+    InvalidVideoGeometry,
     InvalidHandshake,
     ReplayedPacket(u64),
     StaleEpoch {
@@ -1609,6 +1819,57 @@ mod tests {
             RecoveryRequest::decode(&bad.encode()),
             Err(ProtocolError::InvalidRecoveryRange)
         );
+    }
+
+    #[test]
+    fn video_codec_contract_round_trip_is_explicit() {
+        let capabilities = VideoCodecCapabilities {
+            contract_version: VIDEO_CODEC_CONTRACT_VERSION,
+            flags: video_capability_flags::H264_HIGH_420,
+            max_width: 3_840,
+            max_height: 2_160,
+            max_fps: 120,
+        };
+        assert_eq!(
+            VideoCodecCapabilities::decode(&capabilities.encode().expect("capabilities")),
+            Ok(capabilities)
+        );
+
+        let config = VideoStreamConfig {
+            contract_version: VIDEO_CODEC_CONTRACT_VERSION,
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264High420,
+            pixel_format: u32::from_le_bytes(*b"NV12"),
+            stream_id: 1,
+            codec_epoch: 7,
+            width: 1_920,
+            height: 1_080,
+            fps: 60,
+            target_bitrate_bps: 30_000_000,
+            flags: 0,
+        };
+        assert_eq!(
+            VideoStreamConfig::decode(&config.encode().expect("config")),
+            Ok(config)
+        );
+    }
+
+    #[test]
+    fn raw_nv12_requires_an_explicit_codec_profile_pair() {
+        let mismatched = VideoStreamConfig {
+            contract_version: VIDEO_CODEC_CONTRACT_VERSION,
+            codec: VideoCodec::RawNv12,
+            profile: VideoProfile::H264High420,
+            pixel_format: u32::from_le_bytes(*b"NV12"),
+            stream_id: 1,
+            codec_epoch: 1,
+            width: 1_280,
+            height: 720,
+            fps: 60,
+            target_bitrate_bps: 30_000_000,
+            flags: 0,
+        };
+        assert_eq!(mismatched.encode(), Err(ProtocolError::InvalidVideoProfile));
     }
 
     #[test]

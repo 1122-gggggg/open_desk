@@ -5,6 +5,7 @@ use latencydesk_media::{
     FrameDescriptor, IdleRefinementStatus, MemoryDomain, TileCacheStats, TileCoord,
     TileRefinementMeta,
 };
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -414,6 +415,18 @@ pub fn bgra_to_nv12_bt601_limited(
     bgra: &[u8],
     src_stride: usize,
 ) -> Result<Vec<u8>, ConvertError> {
+    let mut nv12 = Vec::new();
+    bgra_to_nv12_bt601_limited_into(width, height, bgra, src_stride, &mut nv12)?;
+    Ok(nv12)
+}
+
+pub fn bgra_to_nv12_bt601_limited_into(
+    width: u32,
+    height: u32,
+    bgra: &[u8],
+    src_stride: usize,
+    nv12: &mut Vec<u8>,
+) -> Result<(), ConvertError> {
     if width < 2 || height < 2 || width % 2 != 0 || height % 2 != 0 {
         return Err(ConvertError::InvalidDimensions);
     }
@@ -434,7 +447,9 @@ pub fn bgra_to_nv12_bt601_limited(
         });
     }
 
-    let mut nv12 = vec![128u8; nv12_len(width, height)];
+    let len = nv12_len(width, height);
+    nv12.clear();
+    nv12.resize(len, 128);
     let luma = width_us * height_us;
     for y in 0..height_us {
         for x in 0..width_us {
@@ -451,7 +466,7 @@ pub fn bgra_to_nv12_bt601_limited(
             }
         }
     }
-    Ok(nv12)
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,6 +479,58 @@ pub struct LetterboxGeom {
     pub offset_y: u32,
 }
 
+#[must_use]
+pub fn letterbox_identity_geom(width: u32, height: u32) -> LetterboxGeom {
+    LetterboxGeom {
+        out_width: width,
+        out_height: height,
+        content_width: width,
+        content_height: height,
+        offset_x: 0,
+        offset_y: 0,
+    }
+}
+
+#[must_use]
+pub fn letterbox_can_skip_scale(
+    src_width: u32,
+    src_height: u32,
+    max_width: u32,
+    max_height: u32,
+) -> bool {
+    src_width >= 2
+        && src_height >= 2
+        && src_width % 2 == 0
+        && src_height % 2 == 0
+        && src_width <= max_width
+        && src_height <= max_height
+}
+
+fn validate_bgra_buffer(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    src_stride: usize,
+) -> Result<(usize, usize, usize), ConvertError> {
+    let src_w = src_width as usize;
+    let src_h = src_height as usize;
+    let min_stride = src_w.saturating_mul(4);
+    if src_stride < min_stride {
+        return Err(ConvertError::BufferTooSmall {
+            required: min_stride,
+            actual: src_stride,
+        });
+    }
+    let required = src_stride.saturating_mul(src_h);
+    if src.len() < required {
+        return Err(ConvertError::BufferTooSmall {
+            required,
+            actual: src.len(),
+        });
+    }
+    Ok((src_w, src_h, min_stride))
+}
+
 pub fn letterbox_geom(
     src_width: u32,
     src_height: u32,
@@ -474,6 +541,9 @@ pub fn letterbox_geom(
     let out_height = even_dimension(max_height);
     if src_width == 0 || src_height == 0 || out_width < 2 || out_height < 2 {
         return Err(ConvertError::InvalidDimensions);
+    }
+    if letterbox_can_skip_scale(src_width, src_height, max_width, max_height) {
+        return Ok(letterbox_identity_geom(src_width, src_height));
     }
     let scale_num = u64::from(out_width).min(
         (u64::from(out_width) * u64::from(src_height))
@@ -512,35 +582,56 @@ pub fn letterbox_geom(
     })
 }
 
-pub fn letterbox_scale_bgra(
+pub fn letterbox_scale_bgra<'a>(
+    src: &'a [u8],
+    src_width: u32,
+    src_height: u32,
+    src_stride: usize,
+    max_width: u32,
+    max_height: u32,
+) -> Result<(LetterboxGeom, Cow<'a, [u8]>), ConvertError> {
+    let (_src_w, src_h, min_stride) = validate_bgra_buffer(src, src_width, src_height, src_stride)?;
+    let required = src_stride.saturating_mul(src_h);
+    if letterbox_can_skip_scale(src_width, src_height, max_width, max_height) {
+        let geom = letterbox_identity_geom(src_width, src_height);
+        if src_stride == min_stride {
+            return Ok((geom, Cow::Borrowed(&src[..required])));
+        }
+        let mut packed = vec![0u8; min_stride.saturating_mul(src_h)];
+        for y in 0..src_h {
+            let dst = y * min_stride;
+            let src_row = y * src_stride;
+            packed[dst..dst + min_stride].copy_from_slice(&src[src_row..src_row + min_stride]);
+        }
+        return Ok((geom, Cow::Owned(packed)));
+    }
+
+    let mut out = Vec::new();
+    let geom = letterbox_scale_bgra_into(
+        src, src_width, src_height, src_stride, max_width, max_height, &mut out,
+    )?;
+    Ok((geom, Cow::Owned(out)))
+}
+
+pub fn letterbox_scale_bgra_into(
     src: &[u8],
     src_width: u32,
     src_height: u32,
     src_stride: usize,
     max_width: u32,
     max_height: u32,
-) -> Result<(LetterboxGeom, Vec<u8>), ConvertError> {
+    out: &mut Vec<u8>,
+) -> Result<LetterboxGeom, ConvertError> {
+    let (src_w, src_h, _min_stride) = validate_bgra_buffer(src, src_width, src_height, src_stride)?;
+    if letterbox_can_skip_scale(src_width, src_height, max_width, max_height) {
+        return Ok(letterbox_identity_geom(src_width, src_height));
+    }
     let geom = letterbox_geom(src_width, src_height, max_width, max_height)?;
-    let src_w = src_width as usize;
-    let src_h = src_height as usize;
-    let min_stride = src_w.saturating_mul(4);
-    if src_stride < min_stride {
-        return Err(ConvertError::BufferTooSmall {
-            required: min_stride,
-            actual: src_stride,
-        });
-    }
-    let required = src_stride.saturating_mul(src_h);
-    if src.len() < required {
-        return Err(ConvertError::BufferTooSmall {
-            required,
-            actual: src.len(),
-        });
-    }
-
     let out_w = geom.out_width as usize;
     let out_h = geom.out_height as usize;
-    let mut out = vec![0u8; out_w * out_h * 4];
+    let needed = out_w.saturating_mul(out_h).saturating_mul(4);
+    out.clear();
+    out.resize(needed, 0);
     let content_w = geom.content_width.max(1) as usize;
     let content_h = geom.content_height.max(1) as usize;
     let off_x = geom.offset_x as usize;
@@ -560,7 +651,7 @@ pub fn letterbox_scale_bgra(
             out[dst..dst + 4].copy_from_slice(&src[src_px..src_px + 4]);
         }
     }
-    Ok((geom, out))
+    Ok(geom)
 }
 
 pub fn map_letterboxed_pointer(
@@ -2084,5 +2175,80 @@ mod tests {
         assert_eq!((w, h), (2, 2));
         assert_eq!(body, payload.as_slice());
         assert!(parse_nv12_access_unit(&[0, 0, 0, 3, 0, 0, 0, 2, 1]).is_none());
+    }
+
+    #[test]
+    fn letterbox_skip_gates() {
+        assert!(letterbox_can_skip_scale(1920, 1080, 1920, 1080));
+        assert!(letterbox_can_skip_scale(1280, 720, 1920, 1080));
+        assert!(!letterbox_can_skip_scale(1920, 1080, 1280, 720));
+        assert!(!letterbox_can_skip_scale(1919, 1080, 1920, 1080));
+        assert!(!letterbox_can_skip_scale(1920, 1079, 1920, 1080));
+        assert!(!letterbox_can_skip_scale(2, 1, 1920, 1080));
+        assert!(!letterbox_can_skip_scale(0, 1080, 1920, 1080));
+    }
+
+    #[test]
+    fn letterbox_identity_skip_is_bit_identical() {
+        let width = 8_u32;
+        let height = 6_u32;
+        let mut src = vec![0u8; (width * height * 4) as usize];
+        for (index, byte) in src.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        let (geom, out) =
+            letterbox_scale_bgra(&src, width, height, (width * 4) as usize, 1920, 1080)
+                .expect("skip");
+        assert_eq!(geom, letterbox_identity_geom(width, height));
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), src.as_slice());
+    }
+
+    #[test]
+    fn letterbox_1080p_skip_borrows_source_without_canvas() {
+        let width = 1920_u32;
+        let height = 1080_u32;
+        let src = vec![0x5A_u8; (width * height * 4) as usize];
+        let (geom, out) =
+            letterbox_scale_bgra(&src, width, height, (width * 4) as usize, width, height)
+                .expect("1080p skip");
+        assert!(letterbox_can_skip_scale(width, height, width, height));
+        assert_eq!(geom, letterbox_identity_geom(width, height));
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), src.as_slice());
+    }
+
+    #[test]
+    fn letterbox_scale_preserves_aspect_no_stretch() {
+        let geom = letterbox_geom(1920, 1200, 640, 360).expect("geom");
+        assert_eq!(geom.content_width % 2, 0);
+        assert_eq!(geom.content_height % 2, 0);
+        assert!(geom.content_width <= 640);
+        assert!(geom.content_height <= 360);
+        assert!(geom.out_width <= 640);
+        assert!(geom.out_height <= 360);
+        let src_w = 8_u32;
+        let src_h = 4_u32;
+        let mut src = vec![0u8; (src_w * src_h * 4) as usize];
+        for y in 0..src_h {
+            for x in 0..src_w {
+                let index = ((y * src_w + x) * 4) as usize;
+                if x < src_w / 2 {
+                    src[index..index + 4].copy_from_slice(&[255, 255, 255, 255]);
+                }
+            }
+        }
+        let (geom, out) =
+            letterbox_scale_bgra(&src, src_w, src_h, (src_w * 4) as usize, 4, 2).expect("scale");
+        assert!(!letterbox_can_skip_scale(src_w, src_h, 4, 2));
+        assert_eq!((geom.out_width, geom.out_height), (4, 2));
+        assert!(matches!(out, Cow::Owned(_)));
+        assert_eq!(out.len(), 4 * 2 * 4);
+        let content_x0 = geom.offset_x as usize;
+        let left = (content_x0) * 4;
+        assert!(out[left] > 200);
+        let right_x = (geom.offset_x + geom.content_width.saturating_sub(1)) as usize;
+        let right = right_x * 4;
+        assert!(out[right] < 40);
     }
 }

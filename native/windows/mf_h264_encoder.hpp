@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -50,6 +51,12 @@ class MfH264Encoder final {
                 UINT target_bitrate_bps,
                 UINT fps,
                 UINT max_queue_depth);
+  MfH264Encoder(ID3D11Device* device,
+                UINT width,
+                UINT height,
+                UINT target_bitrate_bps,
+                UINT fps,
+                UINT max_queue_depth);
   ~MfH264Encoder();
 
   MfH264Encoder(const MfH264Encoder&) = delete;
@@ -79,7 +86,9 @@ class MfH264Encoder final {
   void initialize();
   void configure_media_types();
   void configure_codec_properties();
-  [[nodiscard]] bool convert_to_annex_b(const std::uint8_t* data, std::size_t size, std::vector<std::uint8_t>& out);
+  [[nodiscard]] MfEncoderStatus pump_events() noexcept;
+  [[nodiscard]] bool convert_to_annex_b(IMFSample* sample, const std::uint8_t* data,
+                                        std::size_t size, std::vector<std::uint8_t>& out);
 
   UINT adapter_index_;
   UINT width_;
@@ -93,6 +102,7 @@ class MfH264Encoder final {
   bool started_{};
   bool mf_started_{};
   bool idr_requested_{};
+  std::optional<UINT> pending_bitrate_bps_;
 
   Microsoft::WRL::ComPtr<ID3D11Device> device_;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
@@ -106,8 +116,14 @@ class MfH264Encoder final {
   bool nalu_lengths_requested_{};
 
   std::uint64_t current_in_flight_{};
-  std::vector<std::uint64_t> in_flight_sequences_;
-  std::vector<std::uint64_t> in_flight_timestamps_;
+  std::deque<std::uint64_t> in_flight_sequences_;
+  std::deque<std::uint64_t> in_flight_timestamps_;
+  Microsoft::WRL::ComPtr<IMFMediaEventGenerator> event_source_;
+  UINT need_input_tokens_{};
+  UINT have_output_tokens_{};
+  HRESULT async_error_{S_OK};
+  bool draining_{};
+  bool drain_complete_{};
 };
 
 }  // namespace latencydesk

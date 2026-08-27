@@ -3,13 +3,17 @@
 #include "dda_capture_source.hpp"
 #include "input_event_queue.hpp"
 #include "mf_h264_encoder.hpp"
+#include "mf_h264_decoder.hpp"
 
 #include <windows.h>
 #include <windowsx.h>
 #include <werapi.h>
+#include <dxgi1_4.h>
+
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -106,26 +110,42 @@ struct PendingFrame final {
 class SurfaceImpl final {
  public:
   SurfaceImpl(latencydesk::D3d11OwnedFrame frame, latencydesk::DdaFrameMetadata metadata)
-      : frame_(std::move(frame)), metadata_(std::move(metadata)) {}
+      : frame_(std::move(frame)), metadata_(std::move(metadata)) {
+    texture_ = frame_.texture();
+    description_ = frame_.description();
+    texture_->GetDevice(&device_);
+  }
+
+  SurfaceImpl(Microsoft::WRL::ComPtr<ID3D11Texture2D> texture,
+              D3D11_TEXTURE2D_DESC description)
+      : texture_(std::move(texture)), description_(description) {
+    if (texture_) texture_->GetDevice(&device_);
+  }
 
   [[nodiscard]] std::uint32_t width() const noexcept {
-    return frame_.description().Width;
+    return description_.Width;
   }
 
   [[nodiscard]] std::uint32_t height() const noexcept {
-    return frame_.description().Height;
+    return description_.Height;
   }
 
   [[nodiscard]] std::uint32_t format() const noexcept {
-    return static_cast<std::uint32_t>(frame_.description().Format);
+    return static_cast<std::uint32_t>(description_.Format);
   }
 
   [[nodiscard]] ID3D11Texture2D* texture() const noexcept {
-    return frame_.texture();
+    return texture_.Get();
+  }
+  [[nodiscard]] ID3D11Device* texture_device() const noexcept {
+    return device_.Get();
   }
  private:
   latencydesk::D3d11OwnedFrame frame_;
   latencydesk::DdaFrameMetadata metadata_;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> texture_;
+  Microsoft::WRL::ComPtr<ID3D11Device> device_;
+  D3D11_TEXTURE2D_DESC description_{};
 };
 
 Surface::Surface(std::unique_ptr<SurfaceImpl> impl) : impl_(std::move(impl)) {}
@@ -143,6 +163,11 @@ class EncoderImpl final {
   EncoderImpl(std::uint32_t adapter_index, std::uint32_t width, std::uint32_t height,
               std::uint32_t target_bitrate_bps, std::uint32_t fps, std::uint32_t max_queue_depth)
       : encoder_(adapter_index, width, height, target_bitrate_bps, fps, max_queue_depth) {}
+  EncoderImpl(const Surface& surface, std::uint32_t width, std::uint32_t height,
+              std::uint32_t target_bitrate_bps, std::uint32_t fps,
+              std::uint32_t max_queue_depth)
+      : encoder_(surface.impl_->texture_device(), width, height,
+                 target_bitrate_bps, fps, max_queue_depth) {}
 
   [[nodiscard]] BridgeStatus encode(const Surface& surface, std::uint64_t capture_sequence, std::uint64_t timestamp_ns) {
     std::scoped_lock lock(mutex_);
@@ -223,6 +248,13 @@ Encoder::Encoder(std::uint32_t adapter_index, std::uint32_t width, std::uint32_t
                  std::uint32_t target_bitrate_bps, std::uint32_t fps, std::uint32_t max_queue_depth)
     : impl_(std::make_unique<EncoderImpl>(adapter_index, width, height, target_bitrate_bps, fps, max_queue_depth)) {}
 
+Encoder::Encoder(const Surface& surface, std::uint32_t width, std::uint32_t height,
+                 std::uint32_t target_bitrate_bps, std::uint32_t fps,
+                 std::uint32_t max_queue_depth)
+    : impl_(std::make_unique<EncoderImpl>(surface, width, height,
+                                          target_bitrate_bps, fps,
+                                          max_queue_depth)) {}
+
 Encoder::~Encoder() = default;
 
 BridgeStatus Encoder::encode(const Surface& surface, std::uint64_t capture_sequence, std::uint64_t timestamp_ns) {
@@ -249,6 +281,8 @@ class RendererImpl final {
     initialize();
   }
 
+  [[nodiscard]] ID3D11Device* device() const noexcept { return device_.Get(); }
+
   ~RendererImpl() {
     close();
   }
@@ -267,26 +301,57 @@ class RendererImpl final {
   }
 
   [[nodiscard]] BridgeStatus present(const Surface& surface) {
-    if (!open_ || !swap_chain_ || !context_) {
+    if (!open_ || !swap_chain_ || !context_ || !video_device_ ||
+        !video_context_ || !video_enumerator_ || !video_processor_) {
       return BridgeStatus::InvalidState;
     }
-    if (surface.impl_ == nullptr || surface.impl_->texture() == nullptr) {
+    if (surface.impl_ == nullptr || surface.impl_->texture() == nullptr ||
+        surface.impl_->format() != static_cast<std::uint32_t>(DXGI_FORMAT_NV12)) {
       return BridgeStatus::InvalidArgument;
     }
+    const BridgeStatus wait_status = wait_for_present_slot();
+    if (wait_status != BridgeStatus::Ok) return wait_status;
+    retained_surface_input_view_ = nullptr;
+    retained_surface_output_view_ = nullptr;
+    retained_surface_texture_ = nullptr;
+
     Microsoft::WRL::ComPtr<ID3D11Texture2D> back_buffer;
-    HRESULT hr = swap_chain_->GetBuffer(0, IID_PPV_ARGS(&back_buffer));
-    if (FAILED(hr) || !back_buffer) {
-      return BridgeStatus::DeviceLost;
+    HRESULT hr = get_current_back_buffer(back_buffer);
+    if (FAILED(hr) || !back_buffer) return BridgeStatus::DeviceLost;
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_description{};
+    input_description.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    hr = video_device_->CreateVideoProcessorInputView(
+        surface.impl_->texture(), video_enumerator_.Get(), &input_description,
+        &retained_surface_input_view_);
+    if (FAILED(hr) || !retained_surface_input_view_) {
+      return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET
+                 ? BridgeStatus::DeviceLost
+                 : BridgeStatus::Unsupported;
     }
-    context_->CopyResource(back_buffer.Get(), surface.impl_->texture());
-    hr = swap_chain_->Present(1, 0);
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_description{};
+    output_description.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    output_description.Texture2D.MipSlice = 0;
+    hr = video_device_->CreateVideoProcessorOutputView(
+        back_buffer.Get(), video_enumerator_.Get(), &output_description,
+        &retained_surface_output_view_);
+    if (FAILED(hr) || !retained_surface_output_view_) {
+      return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET
+                 ? BridgeStatus::DeviceLost
+                 : BridgeStatus::Unsupported;
+    }
+    D3D11_VIDEO_PROCESSOR_STREAM stream{};
+    stream.Enable = TRUE;
+    stream.pInputSurface = retained_surface_input_view_.Get();
+    hr = video_context_->VideoProcessorBlt(
+        video_processor_.Get(), retained_surface_output_view_.Get(), 0, 1,
+        &stream);
     if (FAILED(hr)) {
-      if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
-        return BridgeStatus::DeviceLost;
-      }
-      return BridgeStatus::InternalFailure;
+      return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET
+                 ? BridgeStatus::DeviceLost
+                 : BridgeStatus::InternalFailure;
     }
-    return BridgeStatus::Ok;
+    retained_surface_texture_ = surface.impl_->texture();
+    return submit_present();
   }
 
   [[nodiscard]] BridgeStatus present_nv12(rust::Slice<const std::uint8_t> pixels) {
@@ -299,6 +364,43 @@ class RendererImpl final {
       return BridgeStatus::InvalidArgument;
     }
 
+    const BridgeStatus wait_status = wait_for_present_slot();
+    if (wait_status != BridgeStatus::Ok) {
+      return wait_status;
+    }
+
+    const bool use_video_processor =
+        video_context_ && video_processor_ && nv12_texture_ && nv12_input_view_ &&
+        output_view_;
+    if (use_video_processor) {
+      context_->UpdateSubresource(nv12_texture_.Get(), 0, nullptr, pixels.data(), width_,
+                                  static_cast<UINT>(luma_size));
+
+      D3D11_VIDEO_PROCESSOR_STREAM stream{};
+      stream.Enable = TRUE;
+      stream.pInputSurface = nv12_input_view_.Get();
+      const HRESULT hr = video_context_->VideoProcessorBlt(
+          video_processor_.Get(), output_view_.Get(), 0, 1, &stream);
+      if (SUCCEEDED(hr)) {
+        return submit_present();
+      }
+      if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+        return BridgeStatus::DeviceLost;
+      }
+      if (hr != DXGI_ERROR_UNSUPPORTED && hr != E_NOTIMPL &&
+          hr != HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)) {
+        return BridgeStatus::InternalFailure;
+      }
+
+      output_view_ = nullptr;
+      nv12_input_view_ = nullptr;
+      nv12_texture_ = nullptr;
+      video_processor_ = nullptr;
+      video_enumerator_ = nullptr;
+      video_context_ = nullptr;
+      video_device_ = nullptr;
+    }
+
     if (!dynamic_bgra_texture_) {
       D3D11_TEXTURE2D_DESC desc{};
       desc.Width = width_;
@@ -307,67 +409,66 @@ class RendererImpl final {
       desc.ArraySize = 1;
       desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
       desc.SampleDesc.Count = 1;
-      desc.SampleDesc.Quality = 0;
       desc.Usage = D3D11_USAGE_DYNAMIC;
-      desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
       desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-      HRESULT hr = device_->CreateTexture2D(&desc, nullptr, &dynamic_bgra_texture_);
-      if (FAILED(hr)) {
-        return BridgeStatus::DeviceLost;
+      const HRESULT hr = device_->CreateTexture2D(&desc, nullptr, &dynamic_bgra_texture_);
+      if (FAILED(hr) || !dynamic_bgra_texture_) {
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+          return BridgeStatus::DeviceLost;
+        }
+        return BridgeStatus::InternalFailure;
       }
     }
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    HRESULT hr = context_->Map(dynamic_bgra_texture_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (FAILED(hr)) {
-      return BridgeStatus::DeviceLost;
+    const HRESULT map_hr =
+        context_->Map(dynamic_bgra_texture_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(map_hr)) {
+      if (map_hr == DXGI_ERROR_DEVICE_REMOVED || map_hr == DXGI_ERROR_DEVICE_RESET) {
+        return BridgeStatus::DeviceLost;
+      }
+      return BridgeStatus::InternalFailure;
     }
 
     const std::uint8_t* src_y = pixels.data();
     const std::uint8_t* src_uv = pixels.data() + luma_size;
-    std::uint8_t* dst = static_cast<std::uint8_t*>(mapped.pData);
-
+    auto* dst = static_cast<std::uint8_t*>(mapped.pData);
     for (UINT y = 0; y < height_; ++y) {
-      const UINT uv_y = y / 2;
-      const std::uint8_t* row_y = src_y + y * width_;
-      const std::uint8_t* row_uv = src_uv + uv_y * width_;
-      std::uint8_t* row_dst = dst + y * mapped.RowPitch;
-
+      const std::uint8_t* row_y =
+          src_y + static_cast<std::size_t>(y) * width_;
+      const std::uint8_t* row_uv =
+          src_uv + static_cast<std::size_t>(y / 2) * width_;
+      std::uint8_t* row_dst =
+          dst + static_cast<std::size_t>(y) * mapped.RowPitch;
       for (UINT x = 0; x < width_; ++x) {
-        const int y_val = static_cast<int>(row_y[x]);
         const UINT uv_x = (x / 2) * 2;
-        const int u_val = static_cast<int>(row_uv[uv_x]) - 128;
-        const int v_val = static_cast<int>(row_uv[uv_x + 1]) - 128;
-
-        const int r = std::clamp(y_val + static_cast<int>(1.402f * v_val), 0, 255);
-        const int g = std::clamp(y_val - static_cast<int>(0.344136f * u_val + 0.714136f * v_val), 0, 255);
-        const int b = std::clamp(y_val + static_cast<int>(1.772f * u_val), 0, 255);
-
-        const std::size_t px = x * 4;
+        const int c = static_cast<int>(row_y[x]) - 16;
+        const int d = static_cast<int>(row_uv[uv_x]) - 128;
+        const int e = static_cast<int>(row_uv[uv_x + 1]) - 128;
+        const int r = std::clamp((298 * c + 409 * e + 128) / 256, 0, 255);
+        const int g =
+            std::clamp((298 * c - 100 * d - 208 * e + 128) / 256, 0, 255);
+        const int b = std::clamp((298 * c + 516 * d + 128) / 256, 0, 255);
+        const std::size_t px = static_cast<std::size_t>(x) * 4;
         row_dst[px] = static_cast<std::uint8_t>(b);
         row_dst[px + 1] = static_cast<std::uint8_t>(g);
         row_dst[px + 2] = static_cast<std::uint8_t>(r);
         row_dst[px + 3] = 255;
       }
     }
-
     context_->Unmap(dynamic_bgra_texture_.Get(), 0);
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> back_buffer;
-    hr = swap_chain_->GetBuffer(0, IID_PPV_ARGS(&back_buffer));
-    if (FAILED(hr) || !back_buffer) {
-      return BridgeStatus::DeviceLost;
-    }
-
-    context_->CopyResource(back_buffer.Get(), dynamic_bgra_texture_.Get());
-    hr = swap_chain_->Present(1, 0);
-    if (FAILED(hr)) {
-      if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+    const HRESULT buffer_hr = get_current_back_buffer(back_buffer);
+    if (FAILED(buffer_hr) || !back_buffer) {
+      if (buffer_hr == DXGI_ERROR_DEVICE_REMOVED ||
+          buffer_hr == DXGI_ERROR_DEVICE_RESET) {
         return BridgeStatus::DeviceLost;
       }
       return BridgeStatus::InternalFailure;
     }
-    return BridgeStatus::Ok;
+    context_->CopyResource(back_buffer.Get(), dynamic_bgra_texture_.Get());
+    return submit_present();
   }
 
   [[nodiscard]] std::uint32_t poll_inputs(rust::Slice<std::uint8_t> out) {
@@ -398,6 +499,22 @@ class RendererImpl final {
 
   void close() noexcept {
     open_ = false;
+    if (frame_latency_waitable_ != nullptr) {
+      CloseHandle(frame_latency_waitable_);
+      frame_latency_waitable_ = nullptr;
+    }
+    retained_surface_input_view_ = nullptr;
+    retained_surface_output_view_ = nullptr;
+    retained_surface_texture_ = nullptr;
+    output_view_ = nullptr;
+    nv12_input_view_ = nullptr;
+    video_processor_ = nullptr;
+    video_enumerator_ = nullptr;
+    video_context_ = nullptr;
+    video_device_ = nullptr;
+    nv12_texture_ = nullptr;
+    dynamic_bgra_texture_ = nullptr;
+    swap_chain3_ = nullptr;
     swap_chain_ = nullptr;
     context_ = nullptr;
     device_ = nullptr;
@@ -454,17 +571,16 @@ class RendererImpl final {
       case WM_MBUTTONUP: {
         const bool pressed =
             msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
-        std::uint8_t button = 1;
+        std::uint8_t button = 0;
         if (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP) {
-          button = 2;
+          button = 1;
         } else if (msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP) {
-          button = 3;
+          button = 2;
         }
         int x = GET_X_LPARAM(lparam);
         int y = GET_Y_LPARAM(lparam);
         map_client(x, y);
-        const std::uint8_t button_mask =
-            static_cast<std::uint8_t>(1U << static_cast<unsigned>(button - 1));
+        const std::uint8_t button_mask = static_cast<std::uint8_t>(1U << button);
         if (pressed) {
           pressed_buttons_ = static_cast<std::uint8_t>(pressed_buttons_ | button_mask);
           if (GetCapture() != window_) {
@@ -601,14 +717,21 @@ class RendererImpl final {
         D3D_FEATURE_LEVEL_11_0,
     };
     D3D_FEATURE_LEVEL selected_level{};
-    hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                           D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                           feature_levels, ARRAYSIZE(feature_levels),
-                           D3D11_SDK_VERSION, &device_, &selected_level, &context_);
+    hr = D3D11CreateDevice(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+        feature_levels, ARRAYSIZE(feature_levels), D3D11_SDK_VERSION, &device_,
+        &selected_level, &context_);
 
     if (FAILED(hr)) {
       throw std::runtime_error("D3D11CreateDevice failed for presentation renderer");
     }
+    Microsoft::WRL::ComPtr<ID3D10Multithread> multithread;
+    hr = device_.As(&multithread);
+    if (FAILED(hr) || !multithread) {
+      throw std::runtime_error("ID3D10Multithread is required for MF presentation");
+    }
+    static_cast<void>(multithread->SetMultithreadProtected(TRUE));
 
     DXGI_SWAP_CHAIN_DESC1 desc{};
     desc.Width = width_;
@@ -618,16 +741,198 @@ class RendererImpl final {
     desc.SampleDesc.Count = 1;
     desc.SampleDesc.Quality = 0;
     desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    desc.BufferCount = 3;
+    desc.BufferCount = 2;
     desc.Scaling = DXGI_SCALING_STRETCH;
-    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     desc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+    desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
     hr = factory->CreateSwapChainForHwnd(device_.Get(), window_, &desc, nullptr, nullptr, &swap_chain_);
     if (FAILED(hr)) {
       throw std::runtime_error("CreateSwapChainForHwnd failed");
     }
+
+    Microsoft::WRL::ComPtr<IDXGISwapChain2> swap_chain2;
+    hr = swap_chain_.As(&swap_chain2);
+    if (FAILED(hr) || !swap_chain2) {
+      throw std::runtime_error("IDXGISwapChain2 is required for frame-latency control");
+    }
+    hr = swap_chain2->SetMaximumFrameLatency(1);
+    if (FAILED(hr)) {
+      throw std::runtime_error("SetMaximumFrameLatency failed");
+    }
+    frame_latency_waitable_ = swap_chain2->GetFrameLatencyWaitableObject();
+    if (frame_latency_waitable_ == nullptr || frame_latency_waitable_ == INVALID_HANDLE_VALUE) {
+      frame_latency_waitable_ = nullptr;
+      throw std::runtime_error("GetFrameLatencyWaitableObject failed");
+    }
+    hr = swap_chain_.As(&swap_chain3_);
+    if (FAILED(hr) || !swap_chain3_) {
+      throw std::runtime_error("IDXGISwapChain3 is required for flip-model present");
+    }
+
+    create_video_processor();
   }
+
+  [[nodiscard]] BridgeStatus wait_for_present_slot() const {
+    if (frame_latency_waitable_ == nullptr) {
+      return BridgeStatus::InvalidState;
+    }
+    switch (WaitForSingleObject(frame_latency_waitable_, 1000)) {
+      case WAIT_OBJECT_0:
+        return BridgeStatus::Ok;
+      case WAIT_TIMEOUT:
+        return BridgeStatus::NoFrame;
+      case WAIT_FAILED:
+        return BridgeStatus::InternalFailure;
+      default:
+        return BridgeStatus::InternalFailure;
+    }
+  }
+
+  [[nodiscard]] HRESULT get_current_back_buffer(
+      Microsoft::WRL::ComPtr<ID3D11Texture2D>& back_buffer) const {
+    if (!swap_chain3_) return E_UNEXPECTED;
+    return swap_chain_->GetBuffer(swap_chain3_->GetCurrentBackBufferIndex(),
+                                  IID_PPV_ARGS(&back_buffer));
+  }
+
+  [[nodiscard]] BridgeStatus submit_present() {
+    const HRESULT hr = swap_chain_->Present(0, 0);
+    if (FAILED(hr)) {
+      if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+        return BridgeStatus::DeviceLost;
+      }
+      return BridgeStatus::InternalFailure;
+    }
+    return BridgeStatus::Ok;
+  }
+
+  void create_video_processor() {
+    const auto disable_video_processor = [this]() noexcept {
+      output_view_ = nullptr;
+      nv12_input_view_ = nullptr;
+      nv12_texture_ = nullptr;
+      video_processor_ = nullptr;
+      video_enumerator_ = nullptr;
+      video_context_ = nullptr;
+      video_device_ = nullptr;
+    };
+    disable_video_processor();
+
+    HRESULT hr = device_.As(&video_device_);
+    if (FAILED(hr) || !video_device_) {
+      disable_video_processor();
+      return;
+    }
+    hr = context_.As(&video_context_);
+    if (FAILED(hr) || !video_context_) {
+      disable_video_processor();
+      return;
+    }
+
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
+    content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    content.InputFrameRate.Numerator = 60;
+    content.InputFrameRate.Denominator = 1;
+    content.InputWidth = width_;
+    content.InputHeight = height_;
+    content.OutputFrameRate.Numerator = 60;
+    content.OutputFrameRate.Denominator = 1;
+    content.OutputWidth = width_;
+    content.OutputHeight = height_;
+    content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+    hr = video_device_->CreateVideoProcessorEnumerator(
+        &content, &video_enumerator_);
+    if (FAILED(hr) || !video_enumerator_) {
+      disable_video_processor();
+      return;
+    }
+
+    UINT input_support = 0;
+    hr = video_enumerator_->CheckVideoProcessorFormat(
+        DXGI_FORMAT_NV12, &input_support);
+    if (FAILED(hr) ||
+        (input_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) == 0) {
+      disable_video_processor();
+      return;
+    }
+    UINT output_support = 0;
+    hr = video_enumerator_->CheckVideoProcessorFormat(
+        DXGI_FORMAT_B8G8R8A8_UNORM, &output_support);
+    if (FAILED(hr) ||
+        (output_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) == 0) {
+      disable_video_processor();
+      return;
+    }
+
+    hr = video_device_->CreateVideoProcessor(
+        video_enumerator_.Get(), 0, &video_processor_);
+    if (FAILED(hr) || !video_processor_) {
+      disable_video_processor();
+      return;
+    }
+
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE input_color_space{};
+    input_color_space.YCbCr_Matrix = 0;
+    input_color_space.Nominal_Range =
+        D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+    video_context_->VideoProcessorSetStreamColorSpace(
+        video_processor_.Get(), 0, &input_color_space);
+    video_context_->VideoProcessorSetStreamAutoProcessingMode(
+        video_processor_.Get(), 0, FALSE);
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE output_color_space{};
+    output_color_space.RGB_Range = 0;
+    video_context_->VideoProcessorSetOutputColorSpace(
+        video_processor_.Get(), &output_color_space);
+    video_context_->VideoProcessorSetStreamFrameFormat(
+        video_processor_.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+    const RECT rect{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
+    video_context_->VideoProcessorSetStreamSourceRect(
+        video_processor_.Get(), 0, TRUE, &rect);
+    video_context_->VideoProcessorSetStreamDestRect(
+        video_processor_.Get(), 0, TRUE, &rect);
+
+    D3D11_TEXTURE2D_DESC nv12_desc{};
+    nv12_desc.Width = width_;
+    nv12_desc.Height = height_;
+    nv12_desc.MipLevels = 1;
+    nv12_desc.ArraySize = 1;
+    nv12_desc.Format = DXGI_FORMAT_NV12;
+    nv12_desc.SampleDesc.Count = 1;
+    nv12_desc.Usage = D3D11_USAGE_DEFAULT;
+    hr = device_->CreateTexture2D(&nv12_desc, nullptr, &nv12_texture_);
+    if (FAILED(hr) || !nv12_texture_) {
+      disable_video_processor();
+      return;
+    }
+
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_view_desc{};
+    input_view_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    hr = video_device_->CreateVideoProcessorInputView(
+        nv12_texture_.Get(), video_enumerator_.Get(), &input_view_desc,
+        &nv12_input_view_);
+    if (FAILED(hr) || !nv12_input_view_) {
+      disable_video_processor();
+      return;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> back_buffer;
+    hr = get_current_back_buffer(back_buffer);
+    if (FAILED(hr) || !back_buffer) {
+      disable_video_processor();
+      return;
+    }
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_view_desc{};
+    output_view_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    hr = video_device_->CreateVideoProcessorOutputView(
+        back_buffer.Get(), video_enumerator_.Get(), &output_view_desc,
+        &output_view_);
+    if (FAILED(hr) || !output_view_) {
+      disable_video_processor();
+    }
+  }
+
 
   std::uint32_t width_;
   std::uint32_t height_;
@@ -638,6 +943,20 @@ class RendererImpl final {
   Microsoft::WRL::ComPtr<ID3D11Device> device_;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
   Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain_;
+  Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain3_;
+  HANDLE frame_latency_waitable_{};
+  Microsoft::WRL::ComPtr<ID3D11VideoDevice> video_device_;
+  Microsoft::WRL::ComPtr<ID3D11VideoContext> video_context_;
+  Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> video_enumerator_;
+  Microsoft::WRL::ComPtr<ID3D11VideoProcessor> video_processor_;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> nv12_texture_;
+  Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> nv12_input_view_;
+  Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> output_view_;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> retained_surface_texture_;
+  Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView>
+      retained_surface_input_view_;
+  Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView>
+      retained_surface_output_view_;
   Microsoft::WRL::ComPtr<ID3D11Texture2D> dynamic_bgra_texture_;
   InputEventQueue input_queue_;
 };
@@ -654,6 +973,100 @@ BridgeStatus Renderer::present_nv12(rust::Slice<const std::uint8_t> pixels) { re
 std::uint32_t Renderer::poll_inputs(rust::Slice<std::uint8_t> out) { return impl_->poll_inputs(out); }
 bool Renderer::is_open() const noexcept { return impl_->is_open(); }
 void Renderer::close() noexcept { impl_->close(); }
+
+class DecoderImpl final {
+ public:
+  DecoderImpl(Renderer& renderer, std::uint32_t width, std::uint32_t height,
+              std::uint32_t fps, std::uint32_t max_queue_depth)
+      : decoder_(renderer.impl_->device(), width, height, fps, max_queue_depth) {}
+
+  [[nodiscard]] BridgeStatus decode(rust::Slice<const std::uint8_t> annex_b,
+                                    std::uint64_t frame_id,
+                                    std::uint64_t timestamp_ns) {
+    std::scoped_lock lock(mutex_);
+    return map_status(decoder_.decode(annex_b.data(), annex_b.size(), frame_id,
+                                      timestamp_ns));
+  }
+
+  [[nodiscard]] std::unique_ptr<Surface> poll_output(
+      std::uint64_t& frame_id, std::uint64_t& timestamp_ns) {
+    std::scoped_lock lock(mutex_);
+    std::optional<latencydesk::MfDecodedFrame> decoded;
+    const auto status = decoder_.poll_output(decoded);
+    if (status == latencydesk::MfDecoderStatus::NoOutput) return nullptr;
+    if (status != latencydesk::MfDecoderStatus::Ok || !decoded.has_value()) {
+      throw std::runtime_error("Media Foundation H.264 decode output failed");
+    }
+    frame_id = decoded->frame_id;
+    timestamp_ns = decoded->timestamp_ns;
+    auto impl = std::make_unique<SurfaceImpl>(std::move(decoded->texture),
+                                              decoded->description);
+    return std::unique_ptr<Surface>(new Surface(std::move(impl)));
+  }
+
+  [[nodiscard]] BridgeStatus flush() {
+    std::scoped_lock lock(mutex_);
+    return map_status(decoder_.flush());
+  }
+
+  [[nodiscard]] BridgeStatus quiesce() noexcept {
+    std::scoped_lock lock(mutex_);
+    return map_status(decoder_.quiesce());
+  }
+
+  [[nodiscard]] bool hardware_accelerated() const noexcept {
+    std::scoped_lock lock(mutex_);
+    return decoder_.hardware_accelerated();
+  }
+
+ private:
+  static BridgeStatus map_status(latencydesk::MfDecoderStatus status) noexcept {
+    switch (status) {
+      case latencydesk::MfDecoderStatus::Ok:
+        return BridgeStatus::Ok;
+      case latencydesk::MfDecoderStatus::NoOutput:
+        return BridgeStatus::NoFrame;
+      case latencydesk::MfDecoderStatus::QueueFull:
+        return BridgeStatus::QueueFull;
+      case latencydesk::MfDecoderStatus::Unsupported:
+        return BridgeStatus::Unsupported;
+      case latencydesk::MfDecoderStatus::InvalidState:
+        return BridgeStatus::InvalidState;
+      case latencydesk::MfDecoderStatus::InvalidArgument:
+        return BridgeStatus::InvalidArgument;
+      case latencydesk::MfDecoderStatus::DeviceLost:
+        return BridgeStatus::DeviceLost;
+      default:
+        return BridgeStatus::InternalFailure;
+    }
+  }
+
+  mutable std::mutex mutex_;
+  latencydesk::MfH264Decoder decoder_;
+};
+
+Decoder::Decoder(Renderer& renderer, std::uint32_t width, std::uint32_t height,
+                 std::uint32_t fps, std::uint32_t max_queue_depth)
+    : impl_(std::make_unique<DecoderImpl>(renderer, width, height, fps,
+                                          max_queue_depth)) {}
+Decoder::~Decoder() = default;
+BridgeStatus Decoder::decode(rust::Slice<const std::uint8_t> annex_b,
+                             std::uint64_t frame_id,
+                             std::uint64_t timestamp_ns) {
+  return impl_->decode(annex_b, frame_id, timestamp_ns);
+}
+std::unique_ptr<Surface> Decoder::poll_output(std::uint64_t& frame_id,
+                                              std::uint64_t& timestamp_ns,
+                                              std::uint32_t& status) {
+  auto surface = impl_->poll_output(frame_id, timestamp_ns);
+  status = status_code(surface ? BridgeStatus::Ok : BridgeStatus::NoFrame);
+  return surface;
+}
+BridgeStatus Decoder::flush() { return impl_->flush(); }
+BridgeStatus Decoder::quiesce() noexcept { return impl_->quiesce(); }
+bool Decoder::hardware_accelerated() const noexcept {
+  return impl_->hardware_accelerated();
+}
 
 
 class CaptureImpl final {
@@ -932,6 +1345,28 @@ std::unique_ptr<Encoder> make_mf_h264_encoder(
   return nullptr;
 }
 
+std::unique_ptr<Encoder> make_mf_h264_encoder_for_surface(
+    const Surface& surface, std::uint32_t width, std::uint32_t height,
+    std::uint32_t target_bitrate_bps, std::uint32_t fps,
+    std::uint32_t max_queue_depth, std::uint32_t& status) noexcept {
+  try {
+    auto encoder = std::make_unique<Encoder>(
+        surface, width, height, target_bitrate_bps, fps, max_queue_depth);
+    status = status_code(BridgeStatus::Ok);
+    return encoder;
+  } catch (const std::invalid_argument&) {
+    status = status_code(BridgeStatus::InvalidArgument);
+  } catch (const std::bad_alloc&) {
+    status = status_code(BridgeStatus::QueueFull);
+  } catch (const std::runtime_error& error) {
+    std::fprintf(stderr, "make_mf_h264_encoder_for_surface: %s\n", error.what());
+    status = status_code(BridgeStatus::Unsupported);
+  } catch (...) {
+    status = status_code(BridgeStatus::InternalFailure);
+  }
+  return nullptr;
+}
+
 std::uint32_t encoder_encode(Encoder& encoder, const Surface& surface,
                              std::uint64_t capture_sequence,
                              std::uint64_t timestamp_ns) noexcept {
@@ -964,6 +1399,63 @@ std::uint32_t encoder_drain(Encoder& encoder) noexcept {
 std::uint32_t encoder_quiesce(Encoder& encoder) noexcept {
   return invoke_status([&] { return encoder.quiesce(); });
 }
+
+std::unique_ptr<Decoder> make_mf_h264_decoder(
+    Renderer& renderer, std::uint32_t width, std::uint32_t height,
+    std::uint32_t fps, std::uint32_t max_queue_depth,
+    std::uint32_t& status) noexcept {
+  try {
+    auto decoder =
+        std::make_unique<Decoder>(renderer, width, height, fps, max_queue_depth);
+    status = status_code(BridgeStatus::Ok);
+    return decoder;
+  } catch (const std::invalid_argument&) {
+    status = status_code(BridgeStatus::InvalidArgument);
+  } catch (const std::bad_alloc&) {
+    status = status_code(BridgeStatus::QueueFull);
+  } catch (const std::runtime_error&) {
+    status = status_code(BridgeStatus::Unsupported);
+  } catch (...) {
+    status = status_code(BridgeStatus::InternalFailure);
+  }
+  return nullptr;
+}
+
+std::uint32_t decoder_decode(Decoder& decoder,
+                             rust::Slice<const std::uint8_t> annex_b,
+                             std::uint64_t frame_id,
+                             std::uint64_t timestamp_ns) noexcept {
+  return invoke_status(
+      [&] { return decoder.decode(annex_b, frame_id, timestamp_ns); });
+}
+
+std::unique_ptr<Surface> decoder_poll_output(
+    Decoder& decoder, std::uint64_t& frame_id, std::uint64_t& timestamp_ns,
+    std::uint32_t& status) noexcept {
+  try {
+    return decoder.poll_output(frame_id, timestamp_ns, status);
+  } catch (const std::bad_alloc&) {
+    status = status_code(BridgeStatus::QueueFull);
+  } catch (const std::runtime_error&) {
+    status = status_code(BridgeStatus::Unsupported);
+  } catch (...) {
+    status = status_code(BridgeStatus::InternalFailure);
+  }
+  return nullptr;
+}
+
+std::uint32_t decoder_flush(Decoder& decoder) noexcept {
+  return invoke_status([&] { return decoder.flush(); });
+}
+
+std::uint32_t decoder_quiesce(Decoder& decoder) noexcept {
+  return invoke_status([&] { return decoder.quiesce(); });
+}
+
+bool decoder_hardware_accelerated(const Decoder& decoder) noexcept {
+  return decoder.hardware_accelerated();
+}
+
 std::unique_ptr<Renderer> make_d3d11_renderer(
     std::uint32_t width, std::uint32_t height, std::uint32_t& status) noexcept {
   try {

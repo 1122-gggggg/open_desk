@@ -8,7 +8,10 @@ use crate::win32_input_consts::{INPUT_KEYBOARD, INPUT_MOUSE};
 use crate::Win32Input;
 use latencydesk_frame::ConvertError;
 #[cfg(windows)]
-use latencydesk_frame::{bgra_to_nv12_bt601_limited, letterbox_scale_bgra};
+use latencydesk_frame::{
+    bgra_to_nv12_bt601_limited_into, letterbox_can_skip_scale, letterbox_identity_geom,
+    letterbox_scale_bgra_into,
+};
 use latencydesk_input::AppliedInput;
 use latencydesk_platform::PlatformError;
 use std::fmt;
@@ -52,6 +55,12 @@ impl From<ConvertError> for WindowsDesktopError {
 pub struct WindowsDesktopSession {
     screen_width: u32,
     screen_height: u32,
+    #[cfg(windows)]
+    bgra_scratch: Vec<u8>,
+    #[cfg(windows)]
+    nv12_scratch: Vec<u8>,
+    #[cfg(windows)]
+    scaled_scratch: Vec<u8>,
 }
 
 impl WindowsDesktopSession {
@@ -69,6 +78,9 @@ impl WindowsDesktopSession {
             Ok(Self {
                 screen_width: width,
                 screen_height: height,
+                bgra_scratch: Vec::new(),
+                nv12_scratch: Vec::new(),
+                scaled_scratch: Vec::new(),
             })
         }
     }
@@ -90,21 +102,40 @@ impl WindowsDesktopSession {
         }
         #[cfg(windows)]
         {
-            let (bgra, src_w, src_h, src_stride) = capture_desktop_bgra()?;
+            let (src_w, src_h, src_stride) = capture_desktop_bgra(&mut self.bgra_scratch)?;
             self.screen_width = src_w;
             self.screen_height = src_h;
-            if src_w == 0 || src_h == 0 {
+            if src_w < 2 || src_h < 2 {
                 return Err(WindowsDesktopError::InvalidDimensions);
             }
-            let (geom, scaled) =
-                letterbox_scale_bgra(&bgra, src_w, src_h, src_stride, max_width, max_height)?;
-            let nv12 = bgra_to_nv12_bt601_limited(
+            if letterbox_can_skip_scale(src_w, src_h, max_width, max_height) {
+                let geom = letterbox_identity_geom(src_w, src_h);
+                bgra_to_nv12_bt601_limited_into(
+                    geom.out_width,
+                    geom.out_height,
+                    &self.bgra_scratch,
+                    src_stride,
+                    &mut self.nv12_scratch,
+                )?;
+                return Ok((geom.out_width, geom.out_height, self.nv12_scratch.clone()));
+            }
+            let geom = letterbox_scale_bgra_into(
+                &self.bgra_scratch,
+                src_w,
+                src_h,
+                src_stride,
+                max_width,
+                max_height,
+                &mut self.scaled_scratch,
+            )?;
+            bgra_to_nv12_bt601_limited_into(
                 geom.out_width,
                 geom.out_height,
-                &scaled,
+                &self.scaled_scratch,
                 geom.out_width as usize * 4,
+                &mut self.nv12_scratch,
             )?;
-            Ok((geom.out_width, geom.out_height, nv12))
+            Ok((geom.out_width, geom.out_height, self.nv12_scratch.clone()))
         }
     }
 
@@ -146,33 +177,29 @@ fn desktop_metrics() -> Result<(u32, u32, i32, i32), WindowsDesktopError> {
 }
 
 #[cfg(windows)]
-fn capture_desktop_bgra() -> Result<(Vec<u8>, u32, u32, usize), WindowsDesktopError> {
+fn capture_desktop_bgra(pixels: &mut Vec<u8>) -> Result<(u32, u32, usize), WindowsDesktopError> {
     let (mut width, mut height, _, _) = desktop_metrics()?;
     if width < 2 || height < 2 {
         return Err(WindowsDesktopError::InvalidDimensions);
     }
-    let mut pixels = vec![
-        0_u8;
-        (width as usize)
-            .saturating_mul(height as usize)
-            .saturating_mul(4)
-    ];
+    let mut needed = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
+    if pixels.len() < needed {
+        pixels.resize(needed, 0);
+    }
     let mut stride = 0_u32;
-    let mut status = crate::native::ffi::gdi_capture_desktop_bgra(
-        &mut pixels,
-        &mut width,
-        &mut height,
-        &mut stride,
-    );
+    let mut status =
+        crate::native::ffi::gdi_capture_desktop_bgra(pixels, &mut width, &mut height, &mut stride);
     if status == crate::native::STATUS_INVALID_ARGUMENT && width >= 2 && height >= 2 {
-        pixels.resize(
-            (width as usize)
-                .saturating_mul(height as usize)
-                .saturating_mul(4),
-            0,
-        );
+        needed = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4);
+        if pixels.len() < needed {
+            pixels.resize(needed, 0);
+        }
         status = crate::native::ffi::gdi_capture_desktop_bgra(
-            &mut pixels,
+            pixels,
             &mut width,
             &mut height,
             &mut stride,
@@ -193,8 +220,7 @@ fn capture_desktop_bgra() -> Result<(Vec<u8>, u32, u32, usize), WindowsDesktopEr
             pixels.len()
         )));
     }
-    pixels.truncate(needed);
-    Ok((pixels, width, height, stride as usize))
+    Ok((width, height, stride as usize))
 }
 
 #[cfg(windows)]

@@ -34,25 +34,6 @@ void wait_for_completion(ID3D11DeviceContext* context, ID3D11Query* query) {
   }
 }
 
-template <typename T, typename Fetch>
-std::vector<T> read_rectangles(Fetch&& fetch, UINT maximum_bytes, const char* operation) {
-  UINT required_bytes = 0;
-  const HRESULT probe = fetch(0, nullptr, &required_bytes);
-  if (probe != DXGI_ERROR_MORE_DATA && FAILED(probe)) check(probe, operation);
-  if (required_bytes == 0) return {};
-  if (required_bytes > maximum_bytes || required_bytes % sizeof(T) != 0) {
-    throw std::runtime_error("DDA metadata exceeds the configured bound");
-  }
-
-  std::vector<T> values(required_bytes / sizeof(T));
-  UINT returned_bytes = 0;
-  check(fetch(required_bytes, values.data(), &returned_bytes), operation);
-  if (returned_bytes > required_bytes || returned_bytes % sizeof(T) != 0) {
-    throw std::runtime_error("DDA metadata size changed while acquiring a frame");
-  }
-  values.resize(returned_bytes / sizeof(T));
-  return values;
-}
 
 }  // namespace
 
@@ -78,7 +59,8 @@ void DdaCaptureSource::start() {
   Microsoft::WRL::ComPtr<IDXGIOutput1> output1;
   check(output.As(&output1), "Query IDXGIOutput1");
 
-  UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+  UINT flags =
+      D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
 #ifndef NDEBUG
   flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
@@ -87,6 +69,9 @@ void DdaCaptureSource::start() {
                           nullptr, 0, D3D11_SDK_VERSION, &device_, &feature_level,
                           &context_),
         "D3D11CreateDevice");
+  Microsoft::WRL::ComPtr<ID3D10Multithread> multithread;
+  check(device_.As(&multithread), "ID3D10Multithread capture");
+  static_cast<void>(multithread->SetMultithreadProtected(TRUE));
   check(output1->DuplicateOutput(device_.Get(), &duplication_), "DuplicateOutput");
 
   D3D11_QUERY_DESC description{};
@@ -187,17 +172,13 @@ D3d11OwnedFrame DdaCaptureSource::detach_owned(UINT destination_format,
     target_format = DXGI_FORMAT_R8G8B8A8_UNORM;
   }
 
-  if (destination_width != pending_description_.Width ||
-      destination_height != pending_description_.Height) {
-    try {
-      release_pending();
-    } catch (...) {
-    }
-    throw std::invalid_argument("dimension mismatch for DDA frame detach");
-  }
 
   try {
     if (target_format == pending_description_.Format) {
+      if (destination_width != pending_description_.Width ||
+          destination_height != pending_description_.Height) {
+        throw std::invalid_argument("copy-only DDA detach requires matching dimensions");
+      }
       D3D11_TEXTURE2D_DESC owned_description = pending_description_;
       owned_description.Usage = D3D11_USAGE_DEFAULT;
       owned_description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -228,6 +209,7 @@ D3d11OwnedFrame DdaCaptureSource::detach_owned(UINT destination_format,
       }
 
       ensure_video_processor(pending_description_.Format, target_format,
+                             pending_description_.Width, pending_description_.Height,
                              destination_width, destination_height);
 
       const D3D11_TEXTURE2D_DESC nv12_desc =
@@ -352,8 +334,10 @@ void DdaCaptureSource::destroy_unusable() noexcept {
   video_device_.Reset();
   video_processor_input_format_ = DXGI_FORMAT_UNKNOWN;
   video_processor_output_format_ = DXGI_FORMAT_UNKNOWN;
-  video_processor_width_ = 0;
-  video_processor_height_ = 0;
+  video_processor_input_width_ = 0;
+  video_processor_input_height_ = 0;
+  video_processor_output_width_ = 0;
+  video_processor_output_height_ = 0;
   copy_started_ = false;
   copy_completed_ = false;
   copy_completion_query_.Reset();
@@ -381,8 +365,10 @@ void DdaCaptureSource::release_pending() {
 
 void DdaCaptureSource::ensure_video_processor(DXGI_FORMAT input_format,
                                               DXGI_FORMAT output_format,
-                                              UINT width,
-                                              UINT height) {
+                                              UINT input_width,
+                                              UINT input_height,
+                                              UINT output_width,
+                                              UINT output_height) {
   if (!video_device_ || !video_context_) {
     check(device_.As(&video_device_), "Query ID3D11VideoDevice");
     check(context_.As(&video_context_), "Query ID3D11VideoContext");
@@ -391,8 +377,10 @@ void DdaCaptureSource::ensure_video_processor(DXGI_FORMAT input_format,
   if (video_processor_ != nullptr &&
       video_processor_input_format_ == input_format &&
       video_processor_output_format_ == output_format &&
-      video_processor_width_ == width &&
-      video_processor_height_ == height) {
+      video_processor_input_width_ == input_width &&
+      video_processor_input_height_ == input_height &&
+      video_processor_output_width_ == output_width &&
+      video_processor_output_height_ == output_height) {
     return;
   }
 
@@ -401,10 +389,10 @@ void DdaCaptureSource::ensure_video_processor(DXGI_FORMAT input_format,
 
   D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
   content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-  content.InputWidth = width;
-  content.InputHeight = height;
-  content.OutputWidth = width;
-  content.OutputHeight = height;
+  content.InputWidth = input_width;
+  content.InputHeight = input_height;
+  content.OutputWidth = output_width;
+  content.OutputHeight = output_height;
   content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
 
   check(video_device_->CreateVideoProcessorEnumerator(&content, &video_enumerator_),
@@ -429,14 +417,21 @@ void DdaCaptureSource::ensure_video_processor(DXGI_FORMAT input_format,
 
   video_context_->VideoProcessorSetStreamFrameFormat(
       video_processor_.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
-  const RECT rect{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
-  video_context_->VideoProcessorSetStreamSourceRect(video_processor_.Get(), 0, TRUE, &rect);
-  video_context_->VideoProcessorSetStreamDestRect(video_processor_.Get(), 0, TRUE, &rect);
+  const RECT source_rect{0, 0, static_cast<LONG>(input_width),
+                         static_cast<LONG>(input_height)};
+  const RECT destination_rect{0, 0, static_cast<LONG>(output_width),
+                              static_cast<LONG>(output_height)};
+  video_context_->VideoProcessorSetStreamSourceRect(video_processor_.Get(), 0, TRUE,
+                                                     &source_rect);
+  video_context_->VideoProcessorSetStreamDestRect(video_processor_.Get(), 0, TRUE,
+                                                   &destination_rect);
 
   video_processor_input_format_ = input_format;
   video_processor_output_format_ = output_format;
-  video_processor_width_ = width;
-  video_processor_height_ = height;
+  video_processor_input_width_ = input_width;
+  video_processor_input_height_ = input_height;
+  video_processor_output_width_ = output_width;
+  video_processor_output_height_ = output_height;
 }
 
 void DdaCaptureSource::ensure_intermediate_input(const D3D11_TEXTURE2D_DESC& description) {
@@ -463,23 +458,86 @@ void DdaCaptureSource::require_started() const {
   }
 }
 
-DdaFrameMetadata DdaCaptureSource::read_metadata(const DXGI_OUTDUPL_FRAME_INFO& info) const {
+DdaFrameMetadata DdaCaptureSource::read_metadata(const DXGI_OUTDUPL_FRAME_INFO& info) {
   DdaFrameMetadata metadata{
       .protected_content_masked = info.ProtectedContentMaskedOut != FALSE,
       .pointer_visible = info.PointerPosition.Visible != FALSE,
       .pointer_x = info.PointerPosition.Position.x,
       .pointer_y = info.PointerPosition.Position.y,
   };
-  metadata.move_rects = read_rectangles<DXGI_OUTDUPL_MOVE_RECT>(
-      [this](UINT bytes, DXGI_OUTDUPL_MOVE_RECT* output, UINT* required) {
-        return duplication_->GetFrameMoveRects(bytes, output, required);
-      },
-      kMaxMetadataBytes, "GetFrameMoveRects");
-  metadata.dirty_rects = read_rectangles<RECT>(
-      [this](UINT bytes, RECT* output, UINT* required) {
-        return duplication_->GetFrameDirtyRects(bytes, output, required);
-      },
-      kMaxMetadataBytes, "GetFrameDirtyRects");
+
+  const UINT total_bytes = info.TotalMetadataBufferSize;
+  if (total_bytes > kMaxMetadataBytes) {
+    throw std::runtime_error("DDA metadata exceeds the configured bound");
+  }
+  if (total_bytes != 0) {
+    metadata_buffer_.resize(total_bytes);
+
+    UINT move_bytes = 0;
+    HRESULT status = duplication_->GetFrameMoveRects(
+        static_cast<UINT>(metadata_buffer_.size()),
+        reinterpret_cast<DXGI_OUTDUPL_MOVE_RECT*>(metadata_buffer_.data()),
+        &move_bytes);
+    if (status == DXGI_ERROR_MORE_DATA) {
+      if (move_bytes > kMaxMetadataBytes) {
+        throw std::runtime_error("DDA move metadata exceeds the configured bound");
+      }
+      metadata_buffer_.resize(move_bytes);
+      status = duplication_->GetFrameMoveRects(
+          static_cast<UINT>(metadata_buffer_.size()),
+          reinterpret_cast<DXGI_OUTDUPL_MOVE_RECT*>(metadata_buffer_.data()),
+          &move_bytes);
+    }
+    check(status, "GetFrameMoveRects");
+    if (move_bytes > metadata_buffer_.size() ||
+        move_bytes % sizeof(DXGI_OUTDUPL_MOVE_RECT) != 0) {
+      throw std::runtime_error("DDA move metadata size is invalid");
+    }
+
+    if (metadata_buffer_.size() - move_bytes < sizeof(RECT)) {
+      const std::size_t minimum_dirty_buffer =
+          static_cast<std::size_t>(move_bytes) + sizeof(RECT);
+      if (minimum_dirty_buffer > kMaxMetadataBytes) {
+        throw std::runtime_error("DDA metadata leaves no bounded dirty-rect buffer");
+      }
+      metadata_buffer_.resize(minimum_dirty_buffer);
+    }
+    UINT dirty_bytes = 0;
+    UINT dirty_capacity =
+        static_cast<UINT>(metadata_buffer_.size() - move_bytes);
+    status = duplication_->GetFrameDirtyRects(
+        dirty_capacity,
+        reinterpret_cast<RECT*>(metadata_buffer_.data() + move_bytes),
+        &dirty_bytes);
+    if (status == DXGI_ERROR_MORE_DATA) {
+      const std::size_t required =
+          static_cast<std::size_t>(move_bytes) + dirty_bytes;
+      if (required > kMaxMetadataBytes) {
+        throw std::runtime_error("DDA dirty metadata exceeds the configured bound");
+      }
+      metadata_buffer_.resize(required);
+      dirty_capacity =
+          static_cast<UINT>(metadata_buffer_.size() - move_bytes);
+      status = duplication_->GetFrameDirtyRects(
+          dirty_capacity,
+          reinterpret_cast<RECT*>(metadata_buffer_.data() + move_bytes),
+          &dirty_bytes);
+    }
+    check(status, "GetFrameDirtyRects");
+    if (dirty_bytes > metadata_buffer_.size() - move_bytes ||
+        dirty_bytes % sizeof(RECT) != 0) {
+      throw std::runtime_error("DDA dirty metadata size is invalid");
+    }
+
+    const auto* moves = reinterpret_cast<const DXGI_OUTDUPL_MOVE_RECT*>(
+        metadata_buffer_.data());
+    metadata.move_rects.assign(
+        moves, moves + move_bytes / sizeof(DXGI_OUTDUPL_MOVE_RECT));
+    const auto* dirty =
+        reinterpret_cast<const RECT*>(metadata_buffer_.data() + move_bytes);
+    metadata.dirty_rects.assign(dirty, dirty + dirty_bytes / sizeof(RECT));
+  }
+
   if (info.PointerShapeBufferSize == 0) return metadata;
   if (info.PointerShapeBufferSize > kMaxMetadataBytes) {
     throw std::runtime_error("DDA pointer shape exceeds the configured bound");

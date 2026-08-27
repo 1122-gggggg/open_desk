@@ -43,6 +43,7 @@ pub struct ProductSession {
     reassembler: Arc<Mutex<Reassembler>>,
     last_delivered_frame_id: Arc<Mutex<Option<u64>>>,
     clock_origin: Instant,
+    inbound_control: Arc<Mutex<Option<QuicInboundStream>>>,
 }
 
 /// Receiver for the dedicated ordered input lane.
@@ -51,6 +52,31 @@ pub struct InputReceiver {
     connection: QuicConnection,
     stream: QuicInboundStream,
     expected_stamp: SessionStamp,
+}
+
+/// Receiver for the peer's persistent ordered control lane.
+#[derive(Debug)]
+pub struct ControlReceiver {
+    connection: QuicConnection,
+    stream: QuicInboundStream,
+    expected_stamp: SessionStamp,
+}
+
+/// Validated product control message with an owned payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductControlMessage {
+    pub kind: ControlKind,
+    pub payload: Bytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductNetworkStats {
+    pub rtt: Duration,
+    pub sent_packets: u64,
+    pub lost_packets: u64,
+    pub congestion_events: u64,
+    pub congestion_window_bytes: u64,
+    pub current_mtu: u16,
 }
 
 /// Successful whole-frame submission details.
@@ -319,6 +345,7 @@ impl ProductSession {
                 reassembler: Arc::new(Mutex::new(reassembler)),
                 last_delivered_frame_id: Arc::new(Mutex::new(None)),
                 clock_origin: Instant::now(),
+                inbound_control: Arc::new(Mutex::new(Some(stream))),
             })
         };
         match tokio::time::timeout(timeout, operation).await {
@@ -337,6 +364,70 @@ impl ProductSession {
     #[must_use]
     pub const fn stamp(&self) -> SessionStamp {
         self.stamp
+    }
+
+    /// Snapshot of Quinn's current path telemetry for adaptation feedback.
+    #[must_use]
+    pub fn network_stats(&self) -> ProductNetworkStats {
+        let stats = self.connection.path_stats();
+        ProductNetworkStats {
+            rtt: stats.rtt,
+            sent_packets: stats.sent_packets,
+            lost_packets: stats.lost_packets,
+            congestion_events: stats.congestion_events,
+            congestion_window_bytes: stats.cwnd_bytes,
+            current_mtu: stats.current_mtu,
+        }
+    }
+
+    /// Writes one typed product message on the persistent reliable control lane.
+    pub async fn send_control(
+        &self,
+        kind: ControlKind,
+        payload: &[u8],
+    ) -> Result<(), ProductSessionError> {
+        let control = ControlPacket::encode(
+            ControlHeader {
+                kind,
+                flags: 0,
+                session_id: self.stamp.session_id,
+                payload_len: u32::try_from(payload.len())
+                    .map_err(|_| ProtocolError::ControlLength(u32::MAX))?,
+            },
+            payload,
+        )?;
+        let record = StreamRecord::encode(StreamKind::Control, self.stamp, &control)?;
+        self.connection.send_control(&record).await?;
+        Ok(())
+    }
+
+    /// Takes the peer's one persistent reliable control lane. On the client,
+    /// this continues the lane whose first record completed the product
+    /// handshake rather than opening or accepting a second lane.
+    pub async fn accept_control_receiver(&self) -> Result<ControlReceiver, ProductSessionError> {
+        let retained = self.inbound_control.lock().await.take();
+        let stream = match retained {
+            Some(stream) => stream,
+            None => self
+                .connection
+                .accept_inbound_stream()
+                .await
+                .map_err(|error| inbound_error(&self.connection, error))?,
+        };
+        if stream.kind() != StreamKind::Control {
+            return fail_peer_protocol(
+                &self.connection,
+                ProductProtocolViolation::UnexpectedLane {
+                    expected: StreamKind::Control,
+                    actual: stream.kind(),
+                },
+            );
+        }
+        Ok(ControlReceiver {
+            connection: self.connection.clone(),
+            stream,
+            expected_stamp: self.stamp,
+        })
     }
 
     /// Encodes and writes one bounded payload on the independent reliable input
@@ -546,6 +637,7 @@ impl ProductSession {
             reassembler: Arc::new(Mutex::new(Reassembler::new(reassembly)?)),
             last_delivered_frame_id: Arc::new(Mutex::new(None)),
             clock_origin: Instant::now(),
+            inbound_control: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -573,6 +665,40 @@ impl InputReceiver {
             );
         }
         Ok(record.payload)
+    }
+}
+
+impl ControlReceiver {
+    /// Reads and validates the next typed control message.
+    pub async fn next_control(&mut self) -> Result<ProductControlMessage, ProductSessionError> {
+        let record = self
+            .stream
+            .next_record()
+            .await
+            .map_err(|error| inbound_error(&self.connection, error))?;
+        if record.stamp != self.expected_stamp {
+            return fail_peer_protocol(
+                &self.connection,
+                ProductProtocolViolation::StampMismatch {
+                    expected: self.expected_stamp,
+                    actual: record.stamp,
+                },
+            );
+        }
+        let packet = ControlPacket::decode(&record.payload)?;
+        if packet.header.session_id != self.expected_stamp.session_id {
+            return fail_peer_protocol(
+                &self.connection,
+                ProductProtocolViolation::ControlSessionMismatch {
+                    expected: self.expected_stamp.session_id,
+                    actual: packet.header.session_id,
+                },
+            );
+        }
+        Ok(ProductControlMessage {
+            kind: packet.header.kind,
+            payload: Bytes::copy_from_slice(packet.payload),
+        })
     }
 }
 
@@ -708,7 +834,10 @@ fn is_skippable_ingest_error(error: &TransportError) -> bool {
 mod tests {
     use super::*;
     use crate::quic::{bind_client, bind_server};
-    use latencydesk_protocol::{media_flags, MediaKind, MediaPacket};
+    use latencydesk_protocol::{
+        media_flags, video_capability_flags, MediaKind, MediaPacket, VideoCodec,
+        VideoCodecCapabilities, VideoProfile, VideoStreamConfig, VIDEO_CODEC_CONTRACT_VERSION,
+    };
     use latencydesk_transport::FrameKey;
     use rcgen::generate_simple_self_signed;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -954,6 +1083,86 @@ mod tests {
             receiver.next_input().await.expect("input record").as_ref(),
             b"pointer delta"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_round_trip_continues_the_handshake_lane() {
+        let (host, client) = product_pair(1_450).await;
+
+        client
+            .send_control(ControlKind::Capabilities, b"h264-high-420")
+            .await
+            .expect("client capabilities");
+        let mut host_control = host
+            .accept_control_receiver()
+            .await
+            .expect("host control receiver");
+        let offered = host_control.next_control().await.expect("capabilities");
+        assert_eq!(offered.kind, ControlKind::Capabilities);
+        assert_eq!(offered.payload.as_ref(), b"h264-high-420");
+
+        host.send_control(ControlKind::ConfigureStream, b"h264-selected")
+            .await
+            .expect("host configuration");
+        let mut client_control = client
+            .accept_control_receiver()
+            .await
+            .expect("client retained control receiver");
+        let selected = client_control.next_control().await.expect("configuration");
+        assert_eq!(selected.kind, ControlKind::ConfigureStream);
+        assert_eq!(selected.payload.as_ref(), b"h264-selected");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_raw_nv12_negotiation_precedes_other_lanes() {
+        let (host, client) = product_pair(1_450).await;
+        let capabilities = VideoCodecCapabilities {
+            contract_version: VIDEO_CODEC_CONTRACT_VERSION,
+            flags: video_capability_flags::RAW_NV12,
+            max_width: 1_280,
+            max_height: 720,
+            max_fps: 60,
+        };
+        client
+            .send_control(
+                ControlKind::Capabilities,
+                &capabilities.encode().expect("capabilities"),
+            )
+            .await
+            .expect("send capabilities first");
+        let mut host_control = host
+            .accept_control_receiver()
+            .await
+            .expect("host control receiver");
+        let offered = host_control.next_control().await.expect("capabilities");
+        let offered = VideoCodecCapabilities::decode(&offered.payload).expect("typed offer");
+        assert_eq!(offered.flags, video_capability_flags::RAW_NV12);
+
+        let config = VideoStreamConfig {
+            contract_version: VIDEO_CODEC_CONTRACT_VERSION,
+            codec: VideoCodec::RawNv12,
+            profile: VideoProfile::RawNv12,
+            pixel_format: u32::from_le_bytes(*b"NV12"),
+            stream_id: 1,
+            codec_epoch: host.stamp().codec_epoch,
+            width: 1_280,
+            height: 720,
+            fps: 60,
+            target_bitrate_bps: 663_552_000,
+            flags: 0,
+        };
+        host.send_control(
+            ControlKind::ConfigureStream,
+            &config.encode().expect("configuration"),
+        )
+        .await
+        .expect("send explicit raw configuration");
+        let mut client_control = client
+            .accept_control_receiver()
+            .await
+            .expect("retained handshake lane");
+        let selected = client_control.next_control().await.expect("configuration");
+        assert_eq!(VideoStreamConfig::decode(&selected.payload), Ok(config));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

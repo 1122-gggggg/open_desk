@@ -1636,7 +1636,7 @@ impl LinuxHardwareDecoder {
         }
         let pool = self.pool.as_ref().ok_or(LinuxBackendError::InvalidState)?;
 
-        let action = self.continuity.inspect(unit.meta);
+        let action = self.continuity.classify(unit.meta);
         if action == ContinuityAction::DropAndRequestRecovery {
             self.dropped_continuity = self.dropped_continuity.saturating_add(1);
             return Ok(None);
@@ -1706,6 +1706,9 @@ impl LinuxHardwareDecoder {
         let surface = publisher
             .bind(owned, authorization)
             .map_err(LinuxBackendError::Platform)?;
+        self.continuity
+            .commit_decoded(unit.meta)
+            .map_err(|_| LinuxBackendError::InvalidState)?;
 
         self.frames_decoded = self.frames_decoded.saturating_add(1);
         if unit.meta.recovery_point {
@@ -1750,7 +1753,7 @@ impl FrameDecoder for LinuxHardwareDecoder {
             return Err(CodecError::EncodedSize(unit.bytes.len()));
         }
 
-        let action = self.continuity.inspect(unit.meta);
+        let action = self.continuity.classify(unit.meta);
         if action == ContinuityAction::DropAndRequestRecovery {
             self.dropped_continuity = self.dropped_continuity.saturating_add(1);
             return Ok(None);
@@ -1797,6 +1800,9 @@ impl FrameDecoder for LinuxHardwareDecoder {
             data,
         )
         .map_err(|_| CodecError::InvalidDimensions)?;
+        self.continuity
+            .commit_decoded(unit.meta)
+            .map_err(|_| CodecError::InvalidBitstream)?;
         Ok(Some(raw))
     }
 
@@ -2220,14 +2226,14 @@ pub fn hid_to_evdev(code: u16) -> u16 {
     }
 }
 
-/// Translate pointer button number (1..=5) to Linux evdev button code.
+/// Translate producer pointer button IDs (0=left, 1=right, 2=middle) to Linux evdev codes.
 pub fn pointer_button_to_evdev(button: u8) -> Result<u16, PlatformError> {
     match button {
-        1 => Ok(evdev_codes::BTN_LEFT),
-        2 => Ok(evdev_codes::BTN_RIGHT),
-        3 => Ok(evdev_codes::BTN_MIDDLE),
-        4 => Ok(evdev_codes::BTN_SIDE),
-        5 => Ok(evdev_codes::BTN_EXTRA),
+        0 => Ok(evdev_codes::BTN_LEFT),
+        1 => Ok(evdev_codes::BTN_RIGHT),
+        2 => Ok(evdev_codes::BTN_MIDDLE),
+        3 => Ok(evdev_codes::BTN_SIDE),
+        4 => Ok(evdev_codes::BTN_EXTRA),
         _ => Err(PlatformError::InvalidState),
     }
 }
@@ -2307,10 +2313,10 @@ impl LinuxInputBackend {
 
     #[must_use]
     pub fn is_button_held(&self, button: u8) -> bool {
-        if !(1..=5).contains(&button) {
+        if button > 4 {
             return false;
         }
-        (self.held_buttons & (1 << (button - 1))) != 0
+        (self.held_buttons & (1 << button)) != 0
     }
 
     fn record_event(&mut self, type_: u16, code: u16, value: i32) {
@@ -2350,7 +2356,7 @@ impl InputBackend for LinuxInputBackend {
             }
             AppliedInput::PointerButton { button, pressed } => {
                 let evdev_button = pointer_button_to_evdev(button)?;
-                let mask = 1 << (button - 1);
+                let mask = 1 << button;
                 if pressed {
                     self.held_buttons |= mask;
                 } else {
@@ -2433,10 +2439,10 @@ impl InputBackend for LinuxInputBackend {
             self.held_keys[word_idx] = 0;
         }
 
-        for btn in 1..=5 {
-            if (self.held_buttons & (1 << (btn - 1))) != 0 {
-                let evdev_btn = pointer_button_to_evdev(btn)?;
-                self.record_event(evdev_codes::EV_KEY, evdev_btn, 0);
+        for button in 0..=4 {
+            if (self.held_buttons & (1 << button)) != 0 {
+                let evdev_button = pointer_button_to_evdev(button)?;
+                self.record_event(evdev_codes::EV_KEY, evdev_button, 0);
             }
         }
         self.held_buttons = 0;
@@ -3597,17 +3603,24 @@ mod tests {
     }
 
     #[test]
+    fn producer_pointer_buttons_map_to_evdev_buttons() {
+        assert_eq!(pointer_button_to_evdev(0), Ok(evdev_codes::BTN_LEFT));
+        assert_eq!(pointer_button_to_evdev(1), Ok(evdev_codes::BTN_RIGHT));
+        assert_eq!(pointer_button_to_evdev(2), Ok(evdev_codes::BTN_MIDDLE));
+    }
+
+    #[test]
     fn test_input_backend_pointer_and_wheel() {
         let mut input = LinuxInputBackend::new(LinuxInputMode::Uinput, 1_920, 1_080);
 
         assert_eq!(
             input.inject(AppliedInput::PointerButton {
-                button: 1,
+                button: 0,
                 pressed: true
             }),
             Ok(())
         );
-        assert!(input.is_button_held(1));
+        assert!(input.is_button_held(0));
 
         assert_eq!(
             input.inject(AppliedInput::PointerMotionRelative { dx: 10, dy: -5 }),
@@ -3651,19 +3664,19 @@ mod tests {
             .unwrap();
         input
             .inject(AppliedInput::PointerButton {
-                button: 1,
+                button: 0,
                 pressed: true,
             })
             .unwrap();
 
         assert!(input.is_key_held(0x04));
         assert!(input.is_key_held(0xE0));
-        assert!(input.is_button_held(1));
+        assert!(input.is_button_held(0));
 
         assert_eq!(input.release_all(&[]), Ok(()));
         assert!(!input.is_key_held(0x04));
         assert!(!input.is_key_held(0xE0));
-        assert!(!input.is_button_held(1));
+        assert!(!input.is_button_held(0));
     }
 
     #[test]
@@ -4157,19 +4170,19 @@ mod tests {
             sequence: 2,
             session_epoch: 1,
             event: InputEvent::PointerButton {
-                button: 1,
+                button: 0,
                 pressed: true,
             },
         };
         let _ = input.handle_input_message(msg1).unwrap();
         let _ = input.handle_input_message(msg2).unwrap();
         assert!(input.state().key_pressed(0x04));
-        assert!(input.state().button_pressed(1));
+        assert!(input.state().button_pressed(0));
 
         let release_actions = input.set_focused(false);
         assert_eq!(release_actions.len(), 2);
         assert!(!input.state().key_pressed(0x04));
-        assert!(!input.state().button_pressed(1));
+        assert!(!input.state().button_pressed(0));
         assert!(!input.is_focused());
 
         let msg3 = InputMessage {

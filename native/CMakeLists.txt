@@ -58,13 +58,27 @@ if(WIN32)
     windows_mf_h264_probe_help
     PROPERTIES PASS_REGULAR_EXPRESSION "Usage: latencydesk_win_mf_h264_probe")
 
+  add_executable(latencydesk_win_mf_h264_encoder_async_probe
+    windows/mf_h264_encoder_async_probe.cpp
+    windows/mf_h264_encoder.cpp)
+  target_include_directories(latencydesk_win_mf_h264_encoder_async_probe
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/windows)
+  target_link_libraries(latencydesk_win_mf_h264_encoder_async_probe
+    PRIVATE d3d11 dxgi mfplat mf mfuuid wmcodecdspuuid ole32 oleaut32 propsys)
+
   add_library(latencydesk_win_wgc_capture_source STATIC windows/wgc_capture_source.cpp)
   target_include_directories(latencydesk_win_wgc_capture_source PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/common)
   target_link_libraries(latencydesk_win_wgc_capture_source
     PUBLIC latencydesk_win_dda_capture_source d3d11 dxgi windowsapp)
 
-  add_executable(latencydesk_win_mf_h264_decode_probe windows/mf_h264_decode_probe.cpp)
-  target_link_libraries(latencydesk_win_mf_h264_decode_probe PRIVATE mfplat mf mfuuid wmcodecdspuuid ole32 propsys)
+  add_executable(latencydesk_win_mf_h264_decode_probe
+    windows/mf_h264_decode_probe.cpp
+    windows/mf_h264_decoder.cpp
+    windows/mf_h264_encoder.cpp)
+  target_include_directories(latencydesk_win_mf_h264_decode_probe
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/windows)
+  target_link_libraries(latencydesk_win_mf_h264_decode_probe
+    PRIVATE d3d11 d3d10 dxgi mfplat mf mfuuid wmcodecdspuuid ole32 oleaut32 propsys)
 
   add_executable(latencydesk_win_wgc_probe windows/wgc_probe.cpp)
   target_link_libraries(latencydesk_win_wgc_probe PRIVATE windowsapp)
@@ -86,9 +100,9 @@ if(WIN32)
     NAME windows_capture_color_contract
     COMMAND latencydesk_win_capture_color_contract)
 
-  add_executable(latencydesk_win_bridge_contract tests/windows_bridge_contract.cpp windows/latencydesk_windows_bridge.cpp windows/mf_h264_encoder.cpp)
+  add_executable(latencydesk_win_bridge_contract tests/windows_bridge_contract.cpp windows/latencydesk_windows_bridge.cpp windows/mf_h264_encoder.cpp windows/mf_h264_decoder.cpp)
   target_include_directories(latencydesk_win_bridge_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common ${CMAKE_CURRENT_SOURCE_DIR}/windows/include ${CMAKE_CURRENT_SOURCE_DIR}/windows)
-  target_link_libraries(latencydesk_win_bridge_contract PRIVATE latencydesk_win_dda_capture_source d3d11 dxgi dxguid user32 ole32 oleaut32 propsys mfplat mf mfuuid wer)
+  target_link_libraries(latencydesk_win_bridge_contract PRIVATE latencydesk_win_dda_capture_source d3d11 d3d10 dxgi dxguid user32 ole32 oleaut32 propsys mfplat mf mfuuid wmcodecdspuuid wer)
   add_test(
     NAME windows_bridge_contract
     COMMAND latencydesk_win_bridge_contract)

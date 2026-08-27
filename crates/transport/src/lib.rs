@@ -157,11 +157,11 @@ pub struct ReassemblyConfig {
 impl Default for ReassemblyConfig {
     fn default() -> Self {
         Self {
-            max_inflight_frames: 32,
+            max_inflight_frames: 2,
             max_buffered_bytes: 64 * 1024 * 1024,
             max_fragments_per_frame: 16_384,
             max_fragment_entries: 65_536,
-            max_frame_age_ns: 250_000_000,
+            max_frame_age_ns: 17_000_000,
             min_datagram_bytes: MIN_DATAGRAM_MTU,
             max_datagram_bytes: MAX_DATAGRAM_MTU,
         }
@@ -922,7 +922,7 @@ pub struct AdaptiveCongestionConfig {
 impl Default for AdaptiveCongestionConfig {
     fn default() -> Self {
         Self {
-            min_bitrate_bps: MIN_TARGET_BITRATE_BPS,
+            min_bitrate_bps: 15_000_000,
             max_bitrate_bps: MAX_TARGET_BITRATE_BPS,
             initial_bitrate_bps: 20_000_000,
             min_fps: MIN_TARGET_FRAMERATE_FPS,
@@ -1541,22 +1541,22 @@ mod tests {
     #[test]
     fn adaptive_congestion_controller_adaptation() {
         let config = AdaptiveCongestionConfig {
-            initial_bitrate_bps: 10_000_000,
+            initial_bitrate_bps: 20_000_000,
             initial_fps: 60,
-            min_bitrate_bps: 500_000,
+            min_bitrate_bps: 15_000_000,
             max_bitrate_bps: 100_000_000,
             min_fps: 15,
             max_fps: 120,
             ..Default::default()
         };
         let mut controller = AdaptiveCongestionController::new(config).expect("controller");
-        assert_eq!(controller.target_bitrate_bps(), 10_000_000);
+        assert_eq!(controller.target_bitrate_bps(), 20_000_000);
         assert_eq!(controller.target_fps(), 60);
 
         // High loss / congestion sample: 15% loss
         let dec = controller.on_sample(80_000_000, 150_000, 20_000_000, 1_000);
-        assert!(dec.target_bitrate_bps < 10_000_000);
-        assert!(dec.target_bitrate_bps >= 500_000);
+        assert!(dec.target_bitrate_bps < 20_000_000);
+        assert!(dec.target_bitrate_bps >= 15_000_000);
 
         // Multiple severe loss signals should throttle FPS and trigger keyframe
         for i in 2..10 {
@@ -1564,7 +1564,7 @@ mod tests {
         }
         assert!(controller.target_fps() < 60);
         assert!(controller.target_fps() >= 15);
-        assert!(controller.target_bitrate_bps() >= 500_000);
+        assert!(controller.target_bitrate_bps() >= 15_000_000);
 
         // Clean, low-loss channel -> additive increase
         let before = controller.target_bitrate_bps();
@@ -1603,6 +1603,24 @@ mod tests {
         assert_eq!(msg.codec_epoch, 2);
         assert!(msg.flags & rate_flags::FORCE_KEYFRAME != 0);
         assert!(msg.flags & rate_flags::EPOCH_BUMP != 0);
+    }
+
+    #[test]
+    fn default_reassembly_age_covers_a_complete_60hz_interval() {
+        const FRAME_60HZ_CEILING_NS: u64 = 16_666_667;
+
+        let config = ReassemblyConfig::default();
+        assert_eq!(config.max_frame_age_ns, 17_000_000);
+        let packets = fragment_frame(spec(3), &[9_u8; 2_000], 1_200).expect("fragment");
+        let mut reassembler = Reassembler::new(config).expect("config");
+        assert!(matches!(
+            reassembler.ingest(&packets[0], 0).expect("partial ingest"),
+            IngestOutcome::Pending { .. }
+        ));
+
+        assert_eq!(reassembler.expire_due(FRAME_60HZ_CEILING_NS), 0);
+        assert_eq!(reassembler.inflight_frames(), 1);
+        assert_eq!(reassembler.expire_due(config.max_frame_age_ns), 1);
     }
 
     #[test]

@@ -24,7 +24,7 @@ class Slice final {
 
 namespace latencydesk::windows_bridge {
 
-inline constexpr std::uint32_t kBridgeAbiVersion = 2U;
+inline constexpr std::uint32_t kBridgeAbiVersion = 3U;
 inline constexpr std::uint32_t kDesktopDuplicationPendingFrameCapacity = 1U;
 
 enum class BridgeStatus : std::uint32_t {
@@ -57,6 +57,7 @@ enum class BridgeStatus : std::uint32_t {
 class CaptureImpl;
 class SurfaceImpl;
 class Surface;
+class Renderer;
 
 // CXX requires a complete C++ class definition for UniquePtr deletion. These
 // handles use Pimpl, so their COM/D3D/DXGI/WinRT state remains private to the
@@ -104,6 +105,7 @@ class Surface final {
   friend class CaptureImpl;
   friend class EncoderImpl;
   friend class RendererImpl;
+  friend class DecoderImpl;
 
   explicit Surface(std::unique_ptr<SurfaceImpl> impl);
 
@@ -115,7 +117,11 @@ class EncoderImpl;
 class Encoder final {
  public:
   Encoder(std::uint32_t adapter_index, std::uint32_t width, std::uint32_t height,
-          std::uint32_t target_bitrate_bps, std::uint32_t fps, std::uint32_t max_queue_depth);
+          std::uint32_t target_bitrate_bps, std::uint32_t fps,
+          std::uint32_t max_queue_depth);
+  Encoder(const Surface& surface, std::uint32_t width, std::uint32_t height,
+          std::uint32_t target_bitrate_bps, std::uint32_t fps,
+          std::uint32_t max_queue_depth);
   ~Encoder();
   Encoder(const Encoder&) = delete;
   Encoder& operator=(const Encoder&) = delete;
@@ -133,6 +139,32 @@ class Encoder final {
 
  private:
   std::unique_ptr<EncoderImpl> impl_;
+};
+
+class DecoderImpl;
+
+class Decoder final {
+ public:
+  Decoder(Renderer& renderer, std::uint32_t width, std::uint32_t height,
+          std::uint32_t fps, std::uint32_t max_queue_depth);
+  ~Decoder();
+  Decoder(const Decoder&) = delete;
+  Decoder& operator=(const Decoder&) = delete;
+  Decoder(Decoder&&) = delete;
+  Decoder& operator=(Decoder&&) = delete;
+
+  [[nodiscard]] BridgeStatus decode(rust::Slice<const std::uint8_t> annex_b,
+                                    std::uint64_t frame_id,
+                                    std::uint64_t timestamp_ns);
+  [[nodiscard]] std::unique_ptr<Surface> poll_output(std::uint64_t& frame_id,
+                                                     std::uint64_t& timestamp_ns,
+                                                     std::uint32_t& status);
+  [[nodiscard]] BridgeStatus flush();
+  [[nodiscard]] BridgeStatus quiesce() noexcept;
+  [[nodiscard]] bool hardware_accelerated() const noexcept;
+
+ private:
+  std::unique_ptr<DecoderImpl> impl_;
 };
 
 class RendererImpl;
@@ -154,6 +186,7 @@ class Renderer final {
   void close() noexcept;
 
 
+  friend class DecoderImpl;
  private:
   std::unique_ptr<RendererImpl> impl_;
 };
@@ -199,6 +232,10 @@ class Input;
     std::uint32_t adapter_index, std::uint32_t width, std::uint32_t height,
     std::uint32_t target_bitrate_bps, std::uint32_t fps,
     std::uint32_t max_queue_depth, std::uint32_t& status) noexcept;
+[[nodiscard]] std::unique_ptr<Encoder> make_mf_h264_encoder_for_surface(
+    const Surface& surface, std::uint32_t width, std::uint32_t height,
+    std::uint32_t target_bitrate_bps, std::uint32_t fps,
+    std::uint32_t max_queue_depth, std::uint32_t& status) noexcept;
 
 [[nodiscard]] std::uint32_t encoder_encode(Encoder& encoder, const Surface& surface,
                                            std::uint64_t capture_sequence,
@@ -213,6 +250,20 @@ class Input;
 [[nodiscard]] std::uint32_t encoder_request_idr(Encoder& encoder) noexcept;
 [[nodiscard]] std::uint32_t encoder_update_bitrate(Encoder& encoder, std::uint32_t target_bitrate_bps) noexcept;
 [[nodiscard]] std::uint32_t encoder_drain(Encoder& encoder) noexcept;
+
+[[nodiscard]] std::unique_ptr<Decoder> make_mf_h264_decoder(
+    Renderer& renderer, std::uint32_t width, std::uint32_t height,
+    std::uint32_t fps, std::uint32_t max_queue_depth,
+    std::uint32_t& status) noexcept;
+[[nodiscard]] std::uint32_t decoder_decode(
+    Decoder& decoder, rust::Slice<const std::uint8_t> annex_b,
+    std::uint64_t frame_id, std::uint64_t timestamp_ns) noexcept;
+[[nodiscard]] std::unique_ptr<Surface> decoder_poll_output(
+    Decoder& decoder, std::uint64_t& frame_id, std::uint64_t& timestamp_ns,
+    std::uint32_t& status) noexcept;
+[[nodiscard]] std::uint32_t decoder_flush(Decoder& decoder) noexcept;
+[[nodiscard]] std::uint32_t decoder_quiesce(Decoder& decoder) noexcept;
+[[nodiscard]] bool decoder_hardware_accelerated(const Decoder& decoder) noexcept;
 [[nodiscard]] std::unique_ptr<Renderer> make_d3d11_renderer(
     std::uint32_t width, std::uint32_t height, std::uint32_t& status) noexcept;
 

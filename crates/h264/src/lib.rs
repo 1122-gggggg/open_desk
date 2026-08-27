@@ -207,7 +207,14 @@ fn find_start_codes(bytes: &[u8]) -> Result<Vec<(usize, usize)>, H264Error> {
 }
 
 fn parse_slice_class(ebsp: &[u8]) -> Result<SliceClass, H264Error> {
-    let rbsp = unescape_rbsp(ebsp)?;
+    let payload_len = ebsp
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |index| index + 1);
+    if payload_len == 0 {
+        return Err(H264Error::TruncatedSlice);
+    }
+    let rbsp = unescape_rbsp_prefix(&ebsp[..payload_len], 64)?;
     let mut bits = BitReader::new(&rbsp);
     let _first_macroblock = bits.read_ue()?;
     let slice_type = bits.read_ue()?;
@@ -221,29 +228,32 @@ fn parse_slice_class(ebsp: &[u8]) -> Result<SliceClass, H264Error> {
     }
 }
 
-fn unescape_rbsp(ebsp: &[u8]) -> Result<Vec<u8>, H264Error> {
-    if ebsp.len() > MAX_RBSP_BYTES.saturating_add(MAX_RBSP_BYTES / 2) {
+fn unescape_rbsp_prefix(ebsp: &[u8], output_limit: usize) -> Result<Vec<u8>, H264Error> {
+    if output_limit == 0
+        || output_limit > MAX_RBSP_BYTES
+        || ebsp.len() > MAX_RBSP_BYTES.saturating_add(MAX_RBSP_BYTES / 2)
+    {
         return Err(H264Error::RbspLimit(ebsp.len()));
     }
-    let mut rbsp = Vec::with_capacity(ebsp.len().min(MAX_RBSP_BYTES));
+    let mut rbsp = Vec::with_capacity(ebsp.len().min(output_limit));
     let mut zero_count = 0u8;
     let mut cursor = 0usize;
-    while cursor < ebsp.len() {
+    while cursor < ebsp.len() && rbsp.len() < output_limit {
         let byte = ebsp[cursor];
-        if zero_count >= 2 && byte == 3 {
+        if zero_count >= 2 && byte <= 3 {
+            if byte != 3 {
+                return Err(H264Error::MalformedEscape(cursor, byte));
+            }
             let next = ebsp
                 .get(cursor + 1)
                 .copied()
-                .ok_or(H264Error::MalformedEscape)?;
+                .ok_or(H264Error::MalformedEscape(cursor, 0xff))?;
             if next > 3 {
-                return Err(H264Error::MalformedEscape);
+                return Err(H264Error::MalformedEscape(cursor, next));
             }
+            zero_count = 0;
             cursor += 1;
-            zero_count = 2;
             continue;
-        }
-        if rbsp.len() == MAX_RBSP_BYTES {
-            return Err(H264Error::RbspLimit(ebsp.len()));
         }
         rbsp.push(byte);
         zero_count = if byte == 0 {
@@ -254,6 +264,11 @@ fn unescape_rbsp(ebsp: &[u8]) -> Result<Vec<u8>, H264Error> {
         cursor += 1;
     }
     Ok(rbsp)
+}
+
+#[cfg(test)]
+fn unescape_rbsp(ebsp: &[u8]) -> Result<Vec<u8>, H264Error> {
+    unescape_rbsp_prefix(ebsp, MAX_RBSP_BYTES)
 }
 
 struct BitReader<'a> {
@@ -412,7 +427,7 @@ pub enum H264Error {
     ProviderQueue,
     IntraPeriod,
     RbspLimit(usize),
-    MalformedEscape,
+    MalformedEscape(usize, u8),
     TruncatedSlice,
     ExpGolombOverflow,
     RecoveryPointRequired,
@@ -506,6 +521,24 @@ mod tests {
         assert_eq!(
             wrap_access_unit(&mut planner, B, 11, 5_000),
             Err(H264Error::BFrameDetected)
+        );
+    }
+
+    #[test]
+    fn emulation_prevention_allows_literal_three_after_escape() {
+        assert_eq!(unescape_rbsp(&[0, 0, 3, 3, 0x80]), Ok(vec![0, 0, 3, 0x80]));
+    }
+
+    #[test]
+    fn slice_parser_ignores_annex_b_trailing_zero_bytes() {
+        assert_eq!(parse_slice_class(&[0xe0, 0, 0, 0]), Ok(SliceClass::P));
+    }
+
+    #[test]
+    fn repeated_emulation_prevention_groups_decode_consecutive_zeros() {
+        assert_eq!(
+            unescape_rbsp(&[0, 0, 3, 0, 0, 3, 0]),
+            Ok(vec![0, 0, 0, 0, 0])
         );
     }
 }

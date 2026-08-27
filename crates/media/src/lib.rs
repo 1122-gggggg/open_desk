@@ -24,6 +24,11 @@ pub enum ContinuityAction {
     DropAndRequestRecovery,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuityCommitError {
+    InvalidDecodedDependency,
+}
+
 /// Client-side conservative continuity tracker.
 #[derive(Debug, Default, Clone)]
 pub struct DecoderContinuity {
@@ -33,29 +38,49 @@ pub struct DecoderContinuity {
 }
 
 impl DecoderContinuity {
-    /// Classifies an encoded frame and updates continuity only when decodable.
-    pub fn inspect(&mut self, frame: EncodedFrameMeta) -> ContinuityAction {
+    /// Classifies an encoded frame without claiming that native decode succeeded.
+    #[must_use]
+    pub fn classify(&self, frame: EncodedFrameMeta) -> ContinuityAction {
+        if frame.recovery_point {
+            return ContinuityAction::ResetAndDecode;
+        }
+        let same_epoch = self.epoch == Some(frame.codec_epoch);
+        let dependency_present = frame.dependency_frame_id == self.last_decoded_frame;
+        if same_epoch && dependency_present && !self.recovery_outstanding {
+            ContinuityAction::Decode
+        } else {
+            ContinuityAction::DropAndRequestRecovery
+        }
+    }
+
+    /// Commits continuity only after the matching native decoder output exists.
+    pub fn commit_decoded(&mut self, frame: EncodedFrameMeta) -> Result<(), ContinuityCommitError> {
         if frame.recovery_point {
             self.epoch = Some(frame.codec_epoch);
             self.last_decoded_frame = Some(frame.frame_id);
             self.recovery_outstanding = false;
-            return ContinuityAction::ResetAndDecode;
+            return Ok(());
         }
-
-        let same_epoch = self.epoch == Some(frame.codec_epoch);
-        let dependency_present = frame.dependency_frame_id == self.last_decoded_frame;
-        if same_epoch && dependency_present && !self.recovery_outstanding {
-            self.last_decoded_frame = Some(frame.frame_id);
-            ContinuityAction::Decode
-        } else {
-            self.recovery_outstanding = true;
-            ContinuityAction::DropAndRequestRecovery
+        let valid = self.epoch == Some(frame.codec_epoch)
+            && frame.dependency_frame_id == self.last_decoded_frame
+            && self
+                .last_decoded_frame
+                .is_none_or(|decoded| frame.frame_id > decoded);
+        if !valid {
+            return Err(ContinuityCommitError::InvalidDecodedDependency);
         }
+        self.last_decoded_frame = Some(frame.frame_id);
+        Ok(())
     }
 
     /// Marks a frame as lost before decode. Later dependent frames must not decode.
     pub fn note_loss(&mut self) {
         self.recovery_outstanding = true;
+    }
+
+    #[must_use]
+    pub const fn last_decoded_frame_id(&self) -> Option<u64> {
+        self.last_decoded_frame
     }
 
     /// Whether a recovery request should remain outstanding.
@@ -391,43 +416,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_reference_requests_recovery() {
+    fn classification_does_not_advance_before_decode_commit() {
         let mut continuity = DecoderContinuity::default();
+        let idr = EncodedFrameMeta {
+            codec_epoch: 1,
+            frame_id: 10,
+            dependency_frame_id: None,
+            recovery_point: true,
+        };
+        let p = EncodedFrameMeta {
+            codec_epoch: 1,
+            frame_id: 11,
+            dependency_frame_id: Some(10),
+            recovery_point: false,
+        };
+        assert_eq!(continuity.classify(idr), ContinuityAction::ResetAndDecode);
+        assert_eq!(continuity.last_decoded_frame_id(), None);
         assert_eq!(
-            continuity.inspect(EncodedFrameMeta {
+            continuity.classify(p),
+            ContinuityAction::DropAndRequestRecovery
+        );
+        continuity.commit_decoded(idr).expect("decoded IDR");
+        assert_eq!(continuity.classify(p), ContinuityAction::Decode);
+        assert_eq!(continuity.last_decoded_frame_id(), Some(10));
+        continuity.commit_decoded(p).expect("decoded P");
+        assert_eq!(continuity.last_decoded_frame_id(), Some(11));
+    }
+
+    #[test]
+    fn decode_failure_blocks_dependents_until_recovery_commit() {
+        let mut continuity = DecoderContinuity::default();
+        continuity
+            .commit_decoded(EncodedFrameMeta {
                 codec_epoch: 1,
                 frame_id: 10,
                 dependency_frame_id: None,
                 recovery_point: true,
-            }),
-            ContinuityAction::ResetAndDecode
-        );
+            })
+            .expect("decoded IDR");
         continuity.note_loss();
         assert_eq!(
-            continuity.inspect(EncodedFrameMeta {
+            continuity.classify(EncodedFrameMeta {
                 codec_epoch: 1,
                 frame_id: 12,
-                dependency_frame_id: Some(11),
+                dependency_frame_id: Some(10),
                 recovery_point: false,
             }),
             ContinuityAction::DropAndRequestRecovery
         );
-    }
-
-    #[test]
-    fn new_recovery_point_clears_loss() {
-        let mut continuity = DecoderContinuity::default();
-        continuity.note_loss();
+        let recovery = EncodedFrameMeta {
+            codec_epoch: 2,
+            frame_id: 20,
+            dependency_frame_id: None,
+            recovery_point: true,
+        };
         assert_eq!(
-            continuity.inspect(EncodedFrameMeta {
-                codec_epoch: 2,
-                frame_id: 20,
-                dependency_frame_id: None,
-                recovery_point: true,
-            }),
+            continuity.classify(recovery),
             ContinuityAction::ResetAndDecode
         );
+        assert!(continuity.recovery_outstanding());
+        continuity
+            .commit_decoded(recovery)
+            .expect("decoded recovery");
         assert!(!continuity.recovery_outstanding());
+        assert_eq!(continuity.last_decoded_frame_id(), Some(20));
     }
 
     #[test]
