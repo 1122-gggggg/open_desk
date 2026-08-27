@@ -67,7 +67,7 @@ impl WindowsDesktopSession {
     pub fn open() -> Result<Self, WindowsDesktopError> {
         #[cfg(not(windows))]
         {
-            return Err(WindowsDesktopError::Unsupported);
+            Err(WindowsDesktopError::Unsupported)
         }
         #[cfg(windows)]
         {
@@ -98,7 +98,7 @@ impl WindowsDesktopSession {
         #[cfg(not(windows))]
         {
             let _ = (max_width, max_height);
-            return Err(WindowsDesktopError::Unsupported);
+            Err(WindowsDesktopError::Unsupported)
         }
         #[cfg(windows)]
         {
@@ -143,7 +143,7 @@ impl WindowsDesktopSession {
         #[cfg(not(windows))]
         {
             let _ = action;
-            return Err(WindowsDesktopError::Unsupported);
+            Err(WindowsDesktopError::Unsupported)
         }
         #[cfg(windows)]
         {
@@ -275,7 +275,9 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn open_fails_closed_off_windows() {
-        let error = WindowsDesktopSession::open().expect_err("non-Windows must fail closed");
-        assert!(matches!(error, WindowsDesktopError::Unsupported));
+        assert!(matches!(
+            WindowsDesktopSession::open(),
+            Err(WindowsDesktopError::Unsupported)
+        ));
     }
 }

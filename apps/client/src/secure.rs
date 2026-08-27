@@ -27,6 +27,7 @@ const VIEWER_IDLE_PARK: Duration = Duration::ZERO;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VideoCodecPreference {
+    #[cfg_attr(not(windows), allow(dead_code))]
     H264High420,
     #[cfg_attr(windows, allow(dead_code))]
     RawNv12,

@@ -21,6 +21,7 @@ pub use latencydesk_platform::{CursorMode, CursorUpdate};
 use latencydesk_surface::{
     CaptureLease, DestinationSurfaceSpec, OwnedSurface, SurfaceError, SurfacePayload, SurfacePool,
 };
+#[cfg(windows)]
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -3946,7 +3947,7 @@ impl EncodeBackend for WindowsEncodeBackend {
 
         #[cfg(not(windows))]
         {
-            return Err(sub.reject(PlatformError::InvalidSurface));
+            Err(sub.reject(PlatformError::InvalidSurface))
         }
 
         #[cfg(windows)]
