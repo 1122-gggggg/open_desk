@@ -1,5 +1,7 @@
 #include "mf_h264_decoder.hpp"
 
+#include "../common/gpu_completion.hpp"
+
 #include <mferror.h>
 #include <wmcodecdsp.h>
 
@@ -8,7 +10,6 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
-
 namespace latencydesk {
 namespace {
 
@@ -36,16 +37,7 @@ MfDecoderStatus status_from_hresult(HRESULT hr) noexcept {
 }
 
 HRESULT wait_for_copy(ID3D11DeviceContext* context, ID3D11Query* query) noexcept {
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (std::chrono::steady_clock::now() < deadline) {
-    const HRESULT result =
-        context->GetData(query, nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
-    if (result == S_OK) return S_OK;
-    if (result != S_FALSE) return result;
-    Sleep(1);
-  }
-  return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+  return wait_for_gpu_query(context, query, std::chrono::seconds(5));
 }
 
 }  // namespace
@@ -390,18 +382,25 @@ MfDecoderStatus MfH264Decoder::copy_output_sample(IMFSample* sample,
   owned.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
   owned.CPUAccessFlags = 0;
   owned.MiscFlags = 0;
-  Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
-  hr = device_->CreateTexture2D(&owned, nullptr, &texture);
-  if (FAILED(hr)) return status_from_hresult(hr);
-  context_->CopySubresourceRegion(texture.Get(), 0, 0, 0, 0, decoded.Get(),
+  auto& pooled = copy_pool_[copy_pool_index_];
+  if (pooled == nullptr || copy_pool_description_.Width != owned.Width ||
+      copy_pool_description_.Height != owned.Height ||
+      copy_pool_description_.Format != owned.Format) {
+    pooled.Reset();
+    hr = device_->CreateTexture2D(&owned, nullptr, &pooled);
+    if (FAILED(hr)) return status_from_hresult(hr);
+    copy_pool_description_ = owned;
+  }
+  context_->CopySubresourceRegion(pooled.Get(), 0, 0, 0, 0, decoded.Get(),
                                   subresource, nullptr);
   context_->End(copy_completion_query_.Get());
   context_->Flush();
   hr = wait_for_copy(context_.Get(), copy_completion_query_.Get());
   if (FAILED(hr)) return status_from_hresult(hr);
   hardware_accelerated_ = true;
-  frame.texture = std::move(texture);
+  frame.texture = pooled;
   frame.description = owned;
+  copy_pool_index_ = 1U - copy_pool_index_;
   return MfDecoderStatus::Ok;
 }
 

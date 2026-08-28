@@ -84,11 +84,12 @@ pub async fn run(_args: &HostArgs) -> Result<(), Box<dyn Error>> {
 mod linux {
     use super::HostArgs;
     use bytes::Bytes;
+    use latencydesk_h264::{H264Error, LowDelayPolicy, SoftwareH264Encoder};
     use latencydesk_input::{InputMessage, InputReconciler, ReconcileOutcome};
     use latencydesk_platform_linux::{letterbox_geom, pack_nv12_access_unit, X11DesktopSession};
     use latencydesk_protocol::{
-        media_flags, video_capability_flags, ControlKind, MediaKind, VideoCodec,
-        VideoCodecCapabilities, VideoProfile, VideoStreamConfig, VIDEO_CODEC_CONTRACT_VERSION,
+        media_flags, select_host_codec, ControlKind, MediaKind, VideoCodec, VideoCodecCapabilities,
+        VideoProfile, VideoStreamConfig, VIDEO_CODEC_CONTRACT_VERSION,
     };
     use latencydesk_socket_transport::identity::{
         accept_exact_peer_with_timeout, certificate_fingerprint, load_certificate_der,
@@ -303,9 +304,7 @@ mod linux {
                 .into());
             }
             let capabilities = VideoCodecCapabilities::decode(&capabilities_message.payload)?;
-            if capabilities.flags & video_capability_flags::RAW_NV12 == 0 {
-                return Err("client did not explicitly offer raw NV12 compatibility".into());
-            }
+            let (codec, profile) = select_host_codec(capabilities, true, true)?;
             let max_width = args.max_width.min(capabilities.max_width) & !1;
             let max_height = args.max_height.min(capabilities.max_height) & !1;
             let fps = args.fps.min(capabilities.max_fps);
@@ -320,30 +319,58 @@ mod linux {
             )
             .unwrap_or(u32::MAX)
             .max(1);
+            let mut selected_codec = codec;
+            let mut selected_profile = profile;
+            let mut encoder = None;
+            if selected_codec == VideoCodec::H264 {
+                match SoftwareH264Encoder::new(
+                    geometry.out_width,
+                    geometry.out_height,
+                    fps,
+                    8_000_000,
+                    session.stamp().codec_epoch,
+                    LowDelayPolicy::baseline(fps.saturating_mul(2)).validate()?,
+                ) {
+                    Ok(software) => encoder = Some(software),
+                    Err(error) if capabilities.offers_nv12() => {
+                        eprintln!(
+                            "software H.264 encoder unavailable ({error}); falling back to raw NV12"
+                        );
+                        selected_codec = VideoCodec::RawNv12;
+                        selected_profile = VideoProfile::RawNv12;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let target_bitrate_bps = if selected_codec == VideoCodec::H264 {
+                8_000_000
+            } else {
+                raw_bitrate_bps
+            };
             let config = VideoStreamConfig {
                 contract_version: VIDEO_CODEC_CONTRACT_VERSION,
-                codec: VideoCodec::RawNv12,
-                profile: VideoProfile::RawNv12,
+                codec: selected_codec,
+                profile: selected_profile,
                 pixel_format: u32::from_le_bytes(*b"NV12"),
                 stream_id: 1,
                 codec_epoch: session.stamp().codec_epoch,
                 width: geometry.out_width,
                 height: geometry.out_height,
                 fps,
-                target_bitrate_bps: raw_bitrate_bps,
+                target_bitrate_bps,
                 flags: 0,
             };
             session
                 .send_control(ControlKind::ConfigureStream, &config.encode()?)
                 .await?;
             println!(
-                "codec: negotiated contract v{VIDEO_CODEC_CONTRACT_VERSION} explicit Raw NV12 {}x{}@{}",
-                config.width, config.height, config.fps
+                "codec: negotiated contract v{VIDEO_CODEC_CONTRACT_VERSION} {:?}/{:?} {}x{}@{} target={target_bitrate_bps}bps",
+                config.codec, config.profile, config.width, config.height, config.fps
             );
-            Ok::<_, Box<dyn Error>>((control_receiver, config))
+            Ok::<_, Box<dyn Error>>((control_receiver, config, encoder))
         }
         .await;
-        let (_control_receiver, stream_config) = match negotiation_result {
+        let (_control_receiver, stream_config, mut encoder) = match negotiation_result {
             Ok(negotiated) => negotiated,
             Err(error) => {
                 close_endpoint!(endpoint, false, b"codec negotiation failed");
@@ -403,6 +430,7 @@ mod linux {
             &mut reconciler,
             &mut desktop,
             stream_config,
+            encoder.as_mut(),
         )
         .await;
 
@@ -442,6 +470,7 @@ mod linux {
         reconciler: &mut InputReconciler,
         desktop: &mut X11DesktopSession,
         stream_config: VideoStreamConfig,
+        mut encoder: Option<&mut SoftwareH264Encoder>,
     ) -> Result<(), Box<dyn Error>> {
         let frame_period =
             frame_period(stream_config.fps).ok_or("fps must be positive and nonzero")?;
@@ -505,19 +534,48 @@ mod linux {
                     return Err("reliable input lane task terminated unexpectedly".into());
                 }
                 ScheduledWork::Media => {
-                    frame_id = frame_id.checked_add(1).ok_or("frame id exhausted")?;
-                    let keyframe_interval = u64::from(stream_config.fps).saturating_mul(2).max(1);
-                    let is_keyframe = frame_id == 1 || frame_id % keyframe_interval == 0;
                     let (width, height, nv12) =
                         desktop.capture_nv12(stream_config.width, stream_config.height)?;
                     if (width, height) != (stream_config.width, stream_config.height) {
                         return Err(format!(
-                            "raw NV12 capture geometry changed from negotiated {}x{} to {width}x{height}",
+                            "capture geometry changed from negotiated {}x{} to {width}x{height}",
                             stream_config.width, stream_config.height
                         )
                         .into());
                     }
-                    let frame = pack_nv12_access_unit(width, height, &nv12);
+                    let capture_timestamp_ns = frame_period
+                        .as_nanos()
+                        .saturating_mul(u128::from(frame_id.saturating_add(1)))
+                        as u64;
+                    let (frame, is_keyframe, dependency, encoded_frame_id) =
+                        if let Some(encoder) = encoder.as_mut() {
+                            match encoder.encode_nv12(&nv12, capture_timestamp_ns) {
+                                Ok(unit) => (
+                                    unit.bytes,
+                                    unit.meta.recovery_point,
+                                    unit.meta.dependency_frame_id,
+                                    unit.meta.frame_id,
+                                ),
+                                Err(H264Error::RecoveryPointRequired) => {
+                                    encoder.request_idr();
+                                    priority = WorkPriority::after_media();
+                                    continue;
+                                }
+                                Err(error) => return Err(error.into()),
+                            }
+                        } else {
+                            frame_id = frame_id.checked_add(1).ok_or("frame id exhausted")?;
+                            let keyframe_interval =
+                                u64::from(stream_config.fps).saturating_mul(2).max(1);
+                            let is_keyframe = frame_id == 1 || frame_id % keyframe_interval == 0;
+                            (
+                                pack_nv12_access_unit(width, height, &nv12),
+                                is_keyframe,
+                                (!is_keyframe).then_some(frame_id - 1),
+                                frame_id,
+                            )
+                        };
+                    frame_id = encoded_frame_id;
                     let report = match session.send_media_frame(
                         FragmentSpec {
                             kind: MediaKind::Video,
@@ -529,7 +587,7 @@ mod linux {
                             stream_id: stream_config.stream_id,
                             codec_epoch: stream_config.codec_epoch,
                             frame_id,
-                            dependency_frame_id: (!is_keyframe).then_some(frame_id - 1),
+                            dependency_frame_id: dependency,
                         },
                         &frame,
                         frame_period,
@@ -540,6 +598,9 @@ mod linux {
                             return Ok(());
                         }
                         Err(error) if is_transient_media_send(&error) => {
+                            if let Some(encoder) = encoder.as_mut() {
+                                encoder.request_idr();
+                            }
                             if let Some(dropped) = media_drop_log.record(frame_id) {
                                 eprintln!(
                                     "media: dropped {dropped} frame(s) through frame {frame_id}: {error}"
@@ -555,7 +616,12 @@ mod linux {
                     };
 
                     if !announced_stream {
-                        println!("stream: explicit Raw NV12 {width}x{height} over QUIC DATAGRAM");
+                        let label = if stream_config.codec == VideoCodec::H264 {
+                            "H.264 4:2:0"
+                        } else {
+                            "explicit Raw NV12"
+                        };
+                        println!("stream: {label} {width}x{height} over QUIC DATAGRAM");
                         announced_stream = true;
                     }
                     if let Some(dropped) = media_drop_log.take_if_due(frame_id) {
@@ -923,7 +989,7 @@ mod linux {
         }
 
         #[test]
-        fn first_inject_failure_still_attempts_remaining_actions() {
+        fn attempt_all_injections_reports_failures_after_trying_every_action() {
             let mut attempted = Vec::new();
             let result = attempt_all_injections([10, 20, 30], |action| {
                 attempted.push(action);
@@ -991,6 +1057,7 @@ mod windows {
     const LAN_QUALITY_FLOOR_BPS: u32 = 15_000_000;
     const MAX_VIDEO_BITRATE_BPS: u32 = 60_000_000;
     const STREAM_ID: u32 = 1;
+    const ENCODER_OUTPUT_POLL: Duration = Duration::from_micros(250);
     fn frame_period(fps: u32) -> Option<Duration> {
         let fps = NonZeroU64::new(u64::from(fps))?;
         Some(Duration::from_nanos(1_000_000_000_u64.div_ceil(fps.get())))
@@ -1461,14 +1528,14 @@ mod windows {
                     biased;
                     signal_result = &mut shutdown => ScheduledWork::Shutdown(signal_result),
                     _ = ticker.tick() => ScheduledWork::Media,
-                    _ = std::future::ready(()), if video.has_pending_output() => ScheduledWork::EncoderOutput,
+                    _ = tokio::time::sleep(ENCODER_OUTPUT_POLL), if video.has_pending_output() => ScheduledWork::EncoderOutput,
                     input = input_rx.recv() => ScheduledWork::Input(input),
                 },
                 WorkPriority::Input => tokio::select! {
                     biased;
                     signal_result = &mut shutdown => ScheduledWork::Shutdown(signal_result),
                     input = input_rx.recv() => ScheduledWork::Input(input),
-                    _ = std::future::ready(()), if video.has_pending_output() => ScheduledWork::EncoderOutput,
+                    _ = tokio::time::sleep(ENCODER_OUTPUT_POLL), if video.has_pending_output() => ScheduledWork::EncoderOutput,
                     _ = ticker.tick() => ScheduledWork::Media,
                 },
             };

@@ -494,6 +494,33 @@ impl VideoCodecCapabilities {
         }
         Ok(())
     }
+
+    #[must_use]
+    pub const fn offers_h264(self) -> bool {
+        self.flags & video_capability_flags::H264_HIGH_420 != 0
+    }
+
+    #[must_use]
+    pub const fn offers_nv12(self) -> bool {
+        self.flags & video_capability_flags::RAW_NV12 != 0
+    }
+}
+
+/// Picks the lowest-latency codec both peers can actually implement.
+/// H.264 4:2:0 wins over raw NV12 because uncompressed frames saturate a LAN
+/// and add milliseconds of queueing.
+pub fn select_host_codec(
+    client: VideoCodecCapabilities,
+    host_can_h264: bool,
+    host_can_nv12: bool,
+) -> Result<(VideoCodec, VideoProfile), ProtocolError> {
+    if host_can_h264 && client.offers_h264() {
+        Ok((VideoCodec::H264, VideoProfile::H264High420))
+    } else if host_can_nv12 && client.offers_nv12() {
+        Ok((VideoCodec::RawNv12, VideoProfile::RawNv12))
+    } else {
+        Err(ProtocolError::InvalidCodecCapabilities(client.flags))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1870,6 +1897,26 @@ mod tests {
             flags: 0,
         };
         assert_eq!(mismatched.encode(), Err(ProtocolError::InvalidVideoProfile));
+    }
+
+    #[test]
+    fn host_prefers_h264_when_both_peers_offer_it() {
+        let client = VideoCodecCapabilities {
+            contract_version: VIDEO_CODEC_CONTRACT_VERSION,
+            flags: video_capability_flags::H264_HIGH_420 | video_capability_flags::RAW_NV12,
+            max_width: 1_280,
+            max_height: 720,
+            max_fps: 60,
+        };
+        assert_eq!(
+            select_host_codec(client, true, true),
+            Ok((VideoCodec::H264, VideoProfile::H264High420))
+        );
+        assert_eq!(
+            select_host_codec(client, false, true),
+            Ok((VideoCodec::RawNv12, VideoProfile::RawNv12))
+        );
+        assert!(select_host_codec(client, false, false).is_err());
     }
 
     #[test]

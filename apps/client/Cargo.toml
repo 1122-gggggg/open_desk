@@ -24,8 +24,9 @@ tokio = { version = "1", features = ["full"] }
 [target.'cfg(windows)'.dependencies]
 latencydesk-platform-windows = { path = "../../crates/platform-windows" }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(not(windows))'.dependencies]
 latencydesk-platform-linux = { path = "../../crates/platform-linux" }
+minifb = "0.27.0"
 
 [lints]
 workspace = true

@@ -87,6 +87,9 @@ class MfH264Decoder final {
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
   Microsoft::WRL::ComPtr<IMFDXGIDeviceManager> device_manager_;
   Microsoft::WRL::ComPtr<ID3D11Query> copy_completion_query_;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> copy_pool_[2];
+  D3D11_TEXTURE2D_DESC copy_pool_description_{};
+  UINT copy_pool_index_{};
   Microsoft::WRL::ComPtr<IMFTransform> transform_;
   Microsoft::WRL::ComPtr<IMFMediaEventGenerator> event_source_;
   std::deque<PendingMeta> pending_;

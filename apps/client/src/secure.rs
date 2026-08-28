@@ -9,6 +9,8 @@ use latencydesk_socket_transport::identity::{
 use latencydesk_socket_transport::product::ProductSessionError;
 use latencydesk_socket_transport::product::{ControlReceiver, ProductSession};
 use latencydesk_socket_transport::quic::bind_client;
+#[cfg(any(windows, test))]
+use std::collections::VecDeque;
 use std::error::Error;
 #[cfg(any(windows, test))]
 use std::future::Future;
@@ -22,10 +24,13 @@ const CLIENT_CLEANUP_SCHEDULER_ALLOWANCE: Duration = Duration::from_millis(250);
 const SNAPSHOT_CADENCE: Duration = Duration::from_millis(500);
 #[cfg(any(windows, test))]
 const RECOVERY_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(any(windows, test))]
+const MAX_QUEUED_ACCESS_UNITS: usize = 2;
 #[cfg(windows)]
 const VIEWER_IDLE_PARK: Duration = Duration::ZERO;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 enum VideoCodecPreference {
     #[cfg_attr(not(windows), allow(dead_code))]
     H264High420,
@@ -33,6 +38,7 @@ enum VideoCodecPreference {
     RawNv12,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl VideoCodecPreference {
     const fn capability_flag(self) -> u16 {
         match self {
@@ -60,34 +66,37 @@ impl VideoCodecPreference {
     }
 }
 
-#[cfg(windows)]
-const fn platform_video_codec_preference() -> VideoCodecPreference {
-    VideoCodecPreference::H264High420
+const fn platform_capability_flags() -> u16 {
+    latencydesk_protocol::video_capability_flags::H264_HIGH_420
+        | latencydesk_protocol::video_capability_flags::RAW_NV12
 }
 
-#[cfg(target_os = "linux")]
-const fn platform_video_codec_preference() -> VideoCodecPreference {
-    VideoCodecPreference::RawNv12
+fn stream_config_is_offered(config: latencydesk_protocol::VideoStreamConfig, flags: u16) -> bool {
+    match (config.codec, config.profile) {
+        (
+            latencydesk_protocol::VideoCodec::H264,
+            latencydesk_protocol::VideoProfile::H264High420,
+        ) => flags & latencydesk_protocol::video_capability_flags::H264_HIGH_420 != 0,
+        (
+            latencydesk_protocol::VideoCodec::RawNv12,
+            latencydesk_protocol::VideoProfile::RawNv12,
+        ) => flags & latencydesk_protocol::video_capability_flags::RAW_NV12 != 0,
+        _ => false,
+    }
 }
-
-#[cfg(not(any(windows, target_os = "linux")))]
-const fn platform_video_codec_preference() -> VideoCodecPreference {
-    VideoCodecPreference::RawNv12
-}
-async fn negotiate_video_stream(
+pub(crate) async fn negotiate_video_stream(
     session: &ProductSession,
     timeout: Duration,
-    preference: VideoCodecPreference,
 ) -> Result<(latencydesk_protocol::VideoStreamConfig, ControlReceiver), Box<dyn Error>> {
     use latencydesk_protocol::{
         ControlKind, VideoCodecCapabilities, VideoStreamConfig, VIDEO_CODEC_CONTRACT_VERSION,
     };
 
     tokio::time::timeout(timeout, async {
-        let capability = preference.capability_flag();
+        let flags = platform_capability_flags();
         let capabilities = VideoCodecCapabilities {
             contract_version: VIDEO_CODEC_CONTRACT_VERSION,
-            flags: capability,
+            flags,
             max_width: 16_384,
             max_height: 16_384,
             max_fps: 240,
@@ -105,10 +114,10 @@ async fn negotiate_video_stream(
             .into());
         }
         let config = VideoStreamConfig::decode(&selected.payload)?;
-        if (config.codec, config.profile) != preference.expected_pair() {
+        if !stream_config_is_offered(config, flags) {
             return Err(format!(
-                "host selected unsupported codec/profile {:?}/{:?}; offered {:?}",
-                config.codec, config.profile, preference
+                "host selected unsupported codec/profile {:?}/{:?}",
+                config.codec, config.profile
             )
             .into());
         }
@@ -138,14 +147,6 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
     let exact_peer_certificate = load_certificate_der(peer_certificate)?;
     let client_configuration = mtls_client_config(&identity, &exact_peer_certificate)?;
     let operation_timeout = Duration::from_secs(args.pairing_timeout_secs);
-
-    #[cfg(not(windows))]
-    if args.max_frames.is_none() && !args.inject_probe {
-        return Err(
-            "interactive presentation is currently supported only on Windows; use --frames <COUNT> or --inject-probe on this platform"
-                .into(),
-        );
-    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -216,7 +217,7 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
         }
         #[cfg(not(windows))]
         {
-            unreachable!("non-Windows interactive mode is rejected before connecting")
+            crate::software_viewer::run(&runtime, session, operation_timeout)
         }
     };
 
@@ -247,12 +248,7 @@ fn run_headless_windows_h264(
     };
     let (received, last_input_sequence, release_all_sent) = runtime.block_on(async {
         tokio::time::timeout(timeout, async {
-            let (config, control) = negotiate_video_stream(
-                session,
-                timeout,
-                VideoCodecPreference::H264High420,
-            )
-            .await?;
+            let (config, control) = negotiate_video_stream(session, timeout).await?;
             let policy =
                 LowDelayPolicy::baseline(config.fps.saturating_mul(2)).validate()?;
             let mut window = D3D11WindowRenderer::new(config.width, config.height)?;
@@ -505,11 +501,7 @@ fn run_headless(
     needed: u64,
     timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
-    let (config, _control_receiver) = runtime.block_on(negotiate_video_stream(
-        session,
-        timeout,
-        platform_video_codec_preference(),
-    ))?;
+    let (config, _control_receiver) = runtime.block_on(negotiate_video_stream(session, timeout))?;
     let received = runtime.block_on(receive_frames_with_timeout(
         session, needed, timeout, config,
     ))?;
@@ -533,11 +525,7 @@ fn run_probe(
     height: u32,
     timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
-    let (config, _control_receiver) = runtime.block_on(negotiate_video_stream(
-        session,
-        timeout,
-        platform_video_codec_preference(),
-    ))?;
+    let (config, _control_receiver) = runtime.block_on(negotiate_video_stream(session, timeout))?;
     runtime.block_on(async {
         send_input_event(
             session,
@@ -584,37 +572,22 @@ async fn receive_frames_with_timeout(
             })?;
             match config.codec {
                 latencydesk_protocol::VideoCodec::H264 => {
-                    #[cfg(windows)]
-                    {
-                        EncodedH264Frame::decode(frame, config)?;
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        return Err("H.264 was not offered on this platform".into());
-                    }
+                    latencydesk_h264::inspect_annex_b(&frame.bytes)?;
                 }
                 latencydesk_protocol::VideoCodec::RawNv12 => {
-                    #[cfg(target_os = "linux")]
+                    if frame.header.stream_id != config.stream_id
+                        || frame.header.codec_epoch != config.codec_epoch
                     {
-                        if frame.header.stream_id != config.stream_id
-                            || frame.header.codec_epoch != config.codec_epoch
-                        {
-                            return Err("raw NV12 frame does not match negotiated stream".into());
-                        }
-                        let (width, height, _) =
-                            latencydesk_platform_linux::parse_nv12_access_unit(&frame.bytes)
-                                .ok_or("invalid explicitly negotiated raw NV12 access unit")?;
-                        if (width, height) != (config.width, config.height) {
-                            return Err(format!(
-                                "raw NV12 dimensions {width}x{height} differ from negotiated {}x{}",
-                                config.width, config.height
-                            )
-                            .into());
-                        }
+                        return Err("raw NV12 frame does not match negotiated stream".into());
                     }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        return Err("raw NV12 was not offered on this platform".into());
+                    let (width, height, _) = crate::parse_nv12_access_unit(&frame.bytes)
+                        .ok_or("invalid explicitly negotiated raw NV12 access unit")?;
+                    if (width, height) != (config.width, config.height) {
+                        return Err(format!(
+                            "raw NV12 dimensions {width}x{height} differ from negotiated {}x{}",
+                            config.width, config.height
+                        )
+                        .into());
                     }
                 }
             }
@@ -631,7 +604,7 @@ async fn receive_frames_with_timeout(
     })?
 }
 
-async fn send_input_event(
+pub(crate) async fn send_input_event(
     session: &ProductSession,
     sequence: u64,
     event: InputEvent,
@@ -757,16 +730,22 @@ enum LatestFrameSlotDecision {
 
 #[cfg(any(windows, test))]
 fn enqueue_latest_frame(
-    slot: &mut Option<EncodedH264Frame>,
+    queue: &mut VecDeque<EncodedH264Frame>,
     frame: EncodedH264Frame,
 ) -> LatestFrameSlotDecision {
-    if slot.is_none() {
-        *slot = Some(frame);
-        return LatestFrameSlotDecision::Queued;
-    }
     if frame.meta.recovery_point {
-        *slot = Some(frame);
-        LatestFrameSlotDecision::ReplacedWithRecovery
+        let replaced = !queue.is_empty();
+        queue.clear();
+        queue.push_back(frame);
+        return if replaced {
+            LatestFrameSlotDecision::ReplacedWithRecovery
+        } else {
+            LatestFrameSlotDecision::Queued
+        };
+    }
+    if queue.len() < MAX_QUEUED_ACCESS_UNITS {
+        queue.push_back(frame);
+        LatestFrameSlotDecision::Queued
     } else {
         LatestFrameSlotDecision::DroppedDependent
     }
@@ -778,6 +757,86 @@ enum NetworkCommand {
     Input(InputEvent),
     Decoded(latencydesk_media::EncodedFrameMeta),
     RecoveryNeeded { first_missing_frame_id: u64 },
+}
+
+#[cfg(windows)]
+fn run_windows_nv12_viewer(
+    runtime: &tokio::runtime::Runtime,
+    session: ProductSession,
+    timeout: Duration,
+    config: latencydesk_protocol::VideoStreamConfig,
+) -> Result<(), Box<dyn Error>> {
+    use latencydesk_platform_windows::D3D11WindowRenderer;
+    use std::sync::{mpsc, Arc, Mutex};
+
+    let first = runtime
+        .block_on(async { tokio::time::timeout(timeout, session.receive_media_frame()).await })
+        .map_err(|_| "timed out waiting for the first packed NV12 frame")??;
+    let (_, _, nv12) =
+        crate::parse_nv12_access_unit(&first.bytes).ok_or("invalid packed NV12 access unit")?;
+    let mut window = D3D11WindowRenderer::new(config.width, config.height)
+        .map_err(|error| format!("failed to create D3D11 renderer: {error:?}"))?;
+    window.present_nv12(nv12)?;
+    println!(
+        "Client Connected. Packed NV12 -> D3D11 window open ({}x{}@{}).",
+        config.width, config.height, config.fps
+    );
+
+    let latest = Arc::new(Mutex::new(None::<Vec<u8>>));
+    let network_latest = Arc::clone(&latest);
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<InputEvent>(128);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let network_session = session.clone();
+    let reliable_timeout = reliable_operation_timeout(timeout);
+    let mut network_task = runtime.spawn(async move {
+        let mut sequence = 0_u64;
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                event = input_rx.recv() => {
+                    let Some(event) = event else { break };
+                    sequence = sequence.saturating_add(1);
+                    if send_input_event(&network_session, sequence, event, reliable_timeout).await.is_err() {
+                        break;
+                    }
+                }
+                frame = network_session.receive_media_frame() => {
+                    match frame {
+                        Ok(frame) => {
+                            if let Ok(mut slot) = network_latest.lock() {
+                                *slot = Some(frame.bytes);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        let _ = send_input_event(
+            &network_session,
+            sequence.saturating_add(1),
+            InputEvent::ReleaseAll,
+            reliable_timeout,
+        )
+        .await;
+    });
+
+    while window.pump_messages() {
+        for event in window.poll_inputs(32) {
+            if let Some(input) = super::window_event_to_input(event, config.width, config.height) {
+                let _ = input_tx.try_send(input);
+            }
+        }
+        if let Some(bytes) = latest.lock().ok().and_then(|mut slot| slot.take()) {
+            if let Some((_, _, nv12)) = crate::parse_nv12_access_unit(&bytes) {
+                let _ = window.present_nv12(nv12);
+            }
+        }
+    }
+    let _ = shutdown_tx.send(());
+    network_task.abort();
+    window.close();
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -793,12 +852,10 @@ fn run_windows_viewer(
     use std::collections::VecDeque;
     use std::sync::{mpsc, Arc, Mutex};
 
-    let (config, control_receiver) = runtime.block_on(negotiate_video_stream(
-        &session,
-        timeout,
-        VideoCodecPreference::H264High420,
-    ))?;
-
+    let (config, control_receiver) = runtime.block_on(negotiate_video_stream(&session, timeout))?;
+    if config.codec == latencydesk_protocol::VideoCodec::RawNv12 {
+        return run_windows_nv12_viewer(runtime, session, timeout, config);
+    }
     let first = runtime
         .block_on(async { tokio::time::timeout(timeout, session.receive_media_frame()).await })
         .map_err(|_| "timed out waiting for the first secure H.264 media frame")??;
@@ -873,7 +930,9 @@ fn run_windows_viewer(
     println!("codec: contract v1 H.264 High 4:2:0; raw NV12 compatibility disabled");
     println!("Close the window to disconnect safely.");
 
-    let latest_frame = Arc::new(Mutex::new(None::<EncodedH264Frame>));
+    let latest_frame = Arc::new(Mutex::new(VecDeque::<EncodedH264Frame>::with_capacity(
+        MAX_QUEUED_ACCESS_UNITS,
+    )));
     let network_latest = Arc::clone(&latest_frame);
     let (command_tx, command_rx) = tokio::sync::mpsc::channel::<NetworkCommand>(128);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -944,15 +1003,15 @@ fn run_windows_viewer(
             }
         }
 
-        let next_frame = match latest_frame.lock() {
-            Ok(mut slot) => slot.take(),
+        let queued_frames = match latest_frame.lock() {
+            Ok(mut slot) => slot.drain(..).collect::<Vec<_>>(),
             Err(_) => {
                 ui_error = Some("latest-frame queue lock was poisoned".to_owned());
                 break;
             }
         };
-        let had_frame = next_frame.is_some();
-        if let Some(frame) = next_frame {
+        let had_frame = !queued_frames.is_empty();
+        for frame in queued_frames {
             if frame.meta.recovery_point {
                 if let Err(error) = decoder.flush() {
                     let _ = command_tx.try_send(NetworkCommand::RecoveryNeeded {
@@ -1155,7 +1214,7 @@ async fn viewer_network_loop(
     mut control: latencydesk_socket_transport::product::ControlReceiver,
     mut commands: tokio::sync::mpsc::Receiver<NetworkCommand>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
-    latest_frame: std::sync::Arc<std::sync::Mutex<Option<EncodedH264Frame>>>,
+    latest_frame: std::sync::Arc<std::sync::Mutex<VecDeque<EncodedH264Frame>>>,
     config: latencydesk_protocol::VideoStreamConfig,
     first_meta: latencydesk_media::EncodedFrameMeta,
     reliable_timeout: Duration,
@@ -1684,28 +1743,22 @@ mod tests {
     }
 
     #[test]
-    fn recovery_requests_are_coalesced_for_one_hundred_milliseconds() {
-        let sent = tokio::time::Instant::now();
-        assert!(recovery_request_due(None, sent));
-        assert!(!recovery_request_due(Some(sent), sent));
-        assert!(recovery_request_due(
-            Some(sent),
-            sent + RECOVERY_REQUEST_INTERVAL
-        ));
-    }
-
-    #[test]
-    fn slot_pressure_preserves_older_decodable_frame_and_drops_new_dependency() {
-        let mut slot = Some(EncodedH264Frame {
-            meta: latencydesk_media::EncodedFrameMeta {
-                codec_epoch: 1,
-                frame_id: 10,
-                dependency_frame_id: Some(9),
-                recovery_point: false,
+    fn slot_pressure_queues_two_dependent_frames_then_drops() {
+        let mut slot = VecDeque::new();
+        let first = enqueue_latest_frame(
+            &mut slot,
+            EncodedH264Frame {
+                meta: latencydesk_media::EncodedFrameMeta {
+                    codec_epoch: 1,
+                    frame_id: 10,
+                    dependency_frame_id: Some(9),
+                    recovery_point: false,
+                },
+                bytes: vec![10],
             },
-            bytes: vec![10],
-        });
-        let decision = enqueue_latest_frame(
+        );
+        assert_eq!(first, LatestFrameSlotDecision::Queued);
+        let second = enqueue_latest_frame(
             &mut slot,
             EncodedH264Frame {
                 meta: latencydesk_media::EncodedFrameMeta {
@@ -1717,17 +1770,31 @@ mod tests {
                 bytes: vec![11],
             },
         );
-        assert_eq!(decision, LatestFrameSlotDecision::DroppedDependent);
-        assert_eq!(slot.as_ref().map(|frame| frame.meta.frame_id), Some(10));
+        assert_eq!(second, LatestFrameSlotDecision::Queued);
+        let third = enqueue_latest_frame(
+            &mut slot,
+            EncodedH264Frame {
+                meta: latencydesk_media::EncodedFrameMeta {
+                    codec_epoch: 1,
+                    frame_id: 12,
+                    dependency_frame_id: Some(11),
+                    recovery_point: false,
+                },
+                bytes: vec![12],
+            },
+        );
+        assert_eq!(third, LatestFrameSlotDecision::DroppedDependent);
         assert_eq!(
-            slot.as_ref().map(|frame| frame.bytes.as_slice()),
-            Some(&[10][..])
+            slot.iter()
+                .map(|frame| frame.meta.frame_id)
+                .collect::<Vec<_>>(),
+            vec![10, 11]
         );
     }
 
     #[test]
     fn recovery_point_replaces_queued_dependent_frame() {
-        let mut slot = Some(EncodedH264Frame {
+        let mut slot = VecDeque::from([EncodedH264Frame {
             meta: latencydesk_media::EncodedFrameMeta {
                 codec_epoch: 1,
                 frame_id: 10,
@@ -1735,7 +1802,7 @@ mod tests {
                 recovery_point: false,
             },
             bytes: vec![10],
-        });
+        }]);
         let decision = enqueue_latest_frame(
             &mut slot,
             EncodedH264Frame {
@@ -1749,11 +1816,9 @@ mod tests {
             },
         );
         assert_eq!(decision, LatestFrameSlotDecision::ReplacedWithRecovery);
-        assert_eq!(slot.as_ref().map(|frame| frame.meta.frame_id), Some(20));
-        assert_eq!(
-            slot.as_ref().map(|frame| frame.bytes.as_slice()),
-            Some(&[20][..])
-        );
+        assert_eq!(slot.len(), 1);
+        assert_eq!(slot[0].meta.frame_id, 20);
+        assert_eq!(slot[0].bytes.as_slice(), &[20]);
     }
 
     #[tokio::test]

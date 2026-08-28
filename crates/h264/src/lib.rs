@@ -8,6 +8,9 @@ use latencydesk_codec::{CodecError, CodecId, EncodedAccessUnit};
 use latencydesk_media::EncodedFrameMeta;
 use std::fmt;
 
+mod software;
+pub use software::{DecodedNv12, SoftwareH264Decoder, SoftwareH264Encoder};
+
 pub const MAX_ACCESS_UNIT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_NAL_UNITS: usize = 2_048;
 pub const MAX_RBSP_BYTES: usize = 4 * 1024 * 1024;
@@ -437,6 +440,9 @@ pub enum H264Error {
     InvalidDependency,
     FrameIdExhausted,
     NonMonotonicEpoch,
+    SoftwareEncode,
+    SoftwareDecode,
+    InvalidNv12,
 }
 
 impl fmt::Display for H264Error {

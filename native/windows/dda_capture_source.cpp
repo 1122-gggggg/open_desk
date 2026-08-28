@@ -1,7 +1,7 @@
 #include "dda_capture_source.hpp"
 
 #include "capture_detach.hpp"
-
+#include "../common/gpu_completion.hpp"
 #include <chrono>
 #include <exception>
 #include <stdexcept>
@@ -21,17 +21,15 @@ void check(HRESULT status, const char* operation) {
 }
 
 void wait_for_completion(ID3D11DeviceContext* context, ID3D11Query* query) {
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-  while (true) {
-    const HRESULT status =
-        context->GetData(query, nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
-    if (status == S_OK) return;
-    if (status != S_FALSE) check(status, "GetData copy completion query");
-    if (std::chrono::steady_clock::now() >= deadline) {
-      throw std::runtime_error("owned DDA copy completion timeout");
-    }
-    Sleep(1);
+  const HRESULT status =
+      wait_for_gpu_query(context, query, std::chrono::seconds(30));
+  if (status == S_OK) {
+    return;
   }
+  if (status == HRESULT_FROM_WIN32(WAIT_TIMEOUT)) {
+    throw std::runtime_error("owned DDA copy completion timeout");
+  }
+  check(status, "GetData copy completion query");
 }
 
 
@@ -215,9 +213,9 @@ D3d11OwnedFrame DdaCaptureSource::detach_owned(UINT destination_format,
       const D3D11_TEXTURE2D_DESC nv12_desc =
           make_nv12_description(destination_width, destination_height);
 
+      ensure_nv12_pool(destination_width, destination_height);
       D3d11OwnedFrame owned;
-      check(device_->CreateTexture2D(&nv12_desc, nullptr, &owned.texture_),
-            "Create owned NV12 texture");
+      owned.texture_ = nv12_pool_texture_;
 
       D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_view_desc{};
       output_view_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
@@ -446,6 +444,20 @@ void DdaCaptureSource::ensure_intermediate_input(const D3D11_TEXTURE2D_DESC& des
 
   check(device_->CreateTexture2D(&intermediate_description_, nullptr, &intermediate_input_texture_),
         "Create intermediate input texture");
+}
+
+void DdaCaptureSource::ensure_nv12_pool(UINT width, UINT height) {
+  const D3D11_TEXTURE2D_DESC nv12_desc = make_nv12_description(width, height);
+  if (nv12_pool_texture_ != nullptr &&
+      nv12_pool_description_.Width == nv12_desc.Width &&
+      nv12_pool_description_.Height == nv12_desc.Height &&
+      nv12_pool_description_.Format == nv12_desc.Format) {
+    return;
+  }
+  nv12_pool_texture_.Reset();
+  nv12_pool_description_ = nv12_desc;
+  check(device_->CreateTexture2D(&nv12_pool_description_, nullptr, &nv12_pool_texture_),
+        "Create pooled NV12 texture");
 }
 
 void DdaCaptureSource::require_started() const {

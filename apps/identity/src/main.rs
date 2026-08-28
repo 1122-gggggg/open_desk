@@ -15,6 +15,7 @@ const PRIVATE_KEY_FILE_NAME: &str = "identity.key.der";
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Generate { name: String, out_dir: PathBuf },
+    Pair { out_dir: PathBuf },
     Fingerprint { certificate: PathBuf },
     Help,
     Version,
@@ -98,6 +99,32 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
                 "IMPORTANT: Exchange only {CERTIFICATE_FILE_NAME}. Never share {PRIVATE_KEY_FILE_NAME}."
             );
         }
+        Command::Pair { out_dir } => {
+            let host_dir = out_dir.join("host");
+            let client_dir = out_dir.join("client");
+            let host = generate_identity("LatencyDesk host", &host_dir)?;
+            let client = generate_identity("LatencyDesk client", &client_dir)?;
+            println!("Paired identities created.");
+            println!("Host certificate: {}", host.certificate_path.display());
+            println!("Host fingerprint: {}", host.fingerprint);
+            println!("Client certificate: {}", client.certificate_path.display());
+            println!("Client fingerprint: {}", client.fingerprint);
+            println!();
+            println!("Start the host:");
+            println!(
+                "  latencydesk-host --listen 127.0.0.1:9000 --identity-cert {} --identity-key {} --peer-cert {}",
+                host.certificate_path.display(),
+                host.private_key_path.display(),
+                client.certificate_path.display()
+            );
+            println!("Start the client:");
+            println!(
+                "  latencydesk-client --connect 127.0.0.1:9000 --identity-cert {} --identity-key {} --peer-cert {}",
+                client.certificate_path.display(),
+                client.private_key_path.display(),
+                host.certificate_path.display()
+            );
+        }
         Command::Fingerprint { certificate } => {
             let certificate_der = load_certificate_der(&certificate)?;
             println!(
@@ -114,11 +141,12 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
 fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
     let mut arguments = arguments.into_iter();
     let command = arguments.next().ok_or_else(|| {
-        CliError::Usage("missing command; expected `generate` or `fingerprint`".to_owned())
+        CliError::Usage("missing command; expected `generate`, `pair`, or `fingerprint`".to_owned())
     })?;
     let command = command.to_str().ok_or_else(|| {
         CliError::Usage(
-            "command name is not valid Unicode; use `generate` or `fingerprint`".to_owned(),
+            "command name is not valid Unicode; use `generate`, `pair`, or `fingerprint`"
+                .to_owned(),
         )
     })?;
 
@@ -126,9 +154,10 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
         "--help" | "-h" => require_no_extra_arguments(arguments, Command::Help),
         "--version" | "-V" => require_no_extra_arguments(arguments, Command::Version),
         "generate" => parse_generate(arguments),
+        "pair" => parse_pair(arguments),
         "fingerprint" => parse_fingerprint(arguments),
         other => Err(CliError::Usage(format!(
-            "unknown command `{other}`; expected `generate` or `fingerprint`"
+            "unknown command `{other}`; expected `generate`, `pair`, or `fingerprint`"
         ))),
     }
 }
@@ -180,6 +209,30 @@ fn parse_generate(mut arguments: impl Iterator<Item = OsString>) -> Result<Comma
     let out_dir =
         out_dir.ok_or_else(|| CliError::Usage("generate requires --out-dir <DIR>".to_owned()))?;
     Ok(Command::Generate { name, out_dir })
+}
+
+fn parse_pair(mut arguments: impl Iterator<Item = OsString>) -> Result<Command, CliError> {
+    let mut out_dir = None;
+    while let Some(option) = arguments.next() {
+        let option_text = option
+            .to_str()
+            .ok_or_else(|| CliError::Usage("pair option name is not valid Unicode".to_owned()))?;
+        match option_text {
+            "--out-dir" => {
+                reject_duplicate(&out_dir, "--out-dir")?;
+                out_dir = Some(PathBuf::from(take_value(&mut arguments, "--out-dir")?));
+            }
+            "--help" | "-h" => return Ok(Command::Help),
+            other => {
+                return Err(CliError::Usage(format!(
+                    "unknown pair option `{other}`; expected --out-dir"
+                )));
+            }
+        }
+    }
+    let out_dir =
+        out_dir.ok_or_else(|| CliError::Usage("pair requires --out-dir <DIR>".to_owned()))?;
+    Ok(Command::Pair { out_dir })
 }
 
 fn parse_fingerprint(mut arguments: impl Iterator<Item = OsString>) -> Result<Command, CliError> {
@@ -401,6 +454,7 @@ fn print_help() {
          \n\
          USAGE:\n\
            latencydesk-identity generate --name <DEVICE_NAME> --out-dir <DIR>\n\
+           latencydesk-identity pair --out-dir <DIR>\n\
            latencydesk-identity fingerprint --cert <PATH>\n\
            latencydesk-identity --help\n\
            latencydesk-identity --version\n\

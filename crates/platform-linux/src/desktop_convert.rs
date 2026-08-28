@@ -82,6 +82,57 @@ pub fn rgb_to_yuv_bt601_limited(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
     )
 }
 
+#[must_use]
+pub fn yuv_to_rgb_bt601_limited(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
+    let y = i32::from(y) - 16;
+    let u = i32::from(u) - 128;
+    let v = i32::from(v) - 128;
+    let r = (298 * y + 409 * v + 128) >> 8;
+    let g = (298 * y - 100 * u - 208 * v + 128) >> 8;
+    let b = (298 * y + 516 * u + 128) >> 8;
+    (
+        r.clamp(0, 255) as u8,
+        g.clamp(0, 255) as u8,
+        b.clamp(0, 255) as u8,
+    )
+}
+
+pub fn nv12_to_argb_u32(
+    width: u32,
+    height: u32,
+    nv12: &[u8],
+    out: &mut Vec<u32>,
+) -> Result<(), ConvertError> {
+    if width < 2 || height < 2 || width % 2 != 0 || height % 2 != 0 {
+        return Err(ConvertError::InvalidDimensions);
+    }
+    let required = nv12_len(width, height);
+    if nv12.len() < required {
+        return Err(ConvertError::BufferTooSmall {
+            required,
+            actual: nv12.len(),
+        });
+    }
+    let width = width as usize;
+    let height = height as usize;
+    let y_plane = &nv12[..width * height];
+    let uv = &nv12[width * height..required];
+    out.clear();
+    out.resize(width * height, 0);
+    for row in 0..height {
+        let uv_row = (row / 2) * width;
+        for col in 0..width {
+            let y = y_plane[row * width + col];
+            let uv_index = uv_row + (col & !1);
+            let u = uv[uv_index];
+            let v = uv[uv_index + 1];
+            let (r, g, b) = yuv_to_rgb_bt601_limited(y, u, v);
+            out[row * width + col] = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+        }
+    }
+    Ok(())
+}
+
 pub fn bgra_to_nv12_bt601_limited(
     width: u32,
     height: u32,
@@ -386,6 +437,23 @@ mod tests {
         assert_eq!((y, u, v), (82, 90, 240));
     }
 
+    #[test]
+    fn nv12_argb_round_trip_keeps_red_channel_dominant() {
+        let mut nv12 = vec![0_u8; nv12_len(2, 2)];
+        nv12[0] = 82;
+        nv12[1] = 82;
+        nv12[2] = 82;
+        nv12[3] = 82;
+        nv12[4] = 90;
+        nv12[5] = 240;
+        let mut argb = Vec::new();
+        nv12_to_argb_u32(2, 2, &nv12, &mut argb).expect("convert");
+        assert_eq!(argb.len(), 4);
+        let r = (argb[0] >> 16) & 0xff;
+        let g = (argb[0] >> 8) & 0xff;
+        let b = argb[0] & 0xff;
+        assert!(r > g && r > b, "red={r} green={g} blue={b}");
+    }
     #[test]
     fn bgra_two_by_two_encodes_nv12_size() {
         let mut bgra = vec![0u8; 2 * 2 * 4];

@@ -25,6 +25,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod secure;
+#[cfg(not(windows))]
+mod software_viewer;
 
 const MAX_PAIRING_TIMEOUT_SECS: u64 = 3_600;
 #[derive(Debug, Clone)]
@@ -343,7 +345,6 @@ fn take_latest_frame<T>(receiver: &mpsc::Receiver<T>) -> Option<T> {
     latest
 }
 
-#[cfg(any(windows, test))]
 fn parse_nv12_access_unit(bytes: &[u8]) -> Option<(u32, u32, &[u8])> {
     if bytes.len() < 8 {
         return None;

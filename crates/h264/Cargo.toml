@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 latencydesk-media = { path = "../media" }
 latencydesk-codec = { path = "../codec" }
-
+openh264 = { version = "0.6.6", default-features = false, features = ["source"] }
 
 [lints]
 workspace = true

@@ -106,6 +106,7 @@ class DdaCaptureSource final {
                               UINT input_width, UINT input_height,
                               UINT output_width, UINT output_height);
   void ensure_intermediate_input(const D3D11_TEXTURE2D_DESC& description);
+  void ensure_nv12_pool(UINT width, UINT height);
   void destroy_unusable() noexcept;
 
 
@@ -126,7 +127,9 @@ class DdaCaptureSource final {
   Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> video_enumerator_;
   Microsoft::WRL::ComPtr<ID3D11VideoProcessor> video_processor_;
   Microsoft::WRL::ComPtr<ID3D11Texture2D> intermediate_input_texture_;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> nv12_pool_texture_;
   D3D11_TEXTURE2D_DESC intermediate_description_{};
+  D3D11_TEXTURE2D_DESC nv12_pool_description_{};
   DXGI_FORMAT video_processor_input_format_{};
   DXGI_FORMAT video_processor_output_format_{};
   UINT video_processor_input_width_{};
