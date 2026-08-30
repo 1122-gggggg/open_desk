@@ -3,15 +3,18 @@
 use core::fmt;
 pub use latencydesk_protocol::WireIpAddr;
 use latencydesk_protocol::{
-    compute_candidate_priority, compute_pair_priority, CandidateType, IceCandidate, RelayProvider,
-    TransportProtocol,
+    compute_candidate_priority, compute_pair_priority, CandidateExchange, CandidateType,
+    IceCandidate, RelayProvider, TransportProtocol,
 };
+use sha2::{Digest, Sha256};
+use std::net::{IpAddr, SocketAddr};
 
 /// Errors encountered during NAT traversal or routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NatError {
     CandidateLimitReached,
     InvalidCandidate,
+    AddressFamilyMismatch,
     NoCandidatesAvailable,
     NoValidPath,
     PathTimeout,
@@ -163,6 +166,57 @@ impl CandidateGatherer {
         self.candidates
             .sort_by_key(|b| std::cmp::Reverse(b.priority));
         self.candidates.clone()
+    }
+}
+
+/// Builds the bounded v1 candidate advertisement for an already-authenticated
+/// product session. This only describes the current same-socket host mapping;
+/// it does not perform connectivity checks, nominate a route, or complete ICE.
+pub fn gather_candidate_exchange_v1(
+    local: SocketAddr,
+    server_reflexive: Option<SocketAddr>,
+    exchange_id: u64,
+    generation: u32,
+) -> Result<CandidateExchange, NatError> {
+    if server_reflexive.is_some_and(|mapped| mapped.is_ipv4() != local.is_ipv4()) {
+        return Err(NatError::AddressFamilyMismatch);
+    }
+
+    let local_ip = wire_ip(local.ip());
+    let mut gatherer = CandidateGatherer::new();
+    gatherer.add_host_candidate(local_ip, local.port(), 1, u16::MAX)?;
+    if let Some(mapped) = server_reflexive.filter(|mapped| *mapped != local) {
+        gatherer.add_srflx_candidate(
+            wire_ip(mapped.ip()),
+            mapped.port(),
+            local_ip,
+            local.port(),
+            1,
+            u16::MAX,
+        )?;
+    }
+
+    let exchange = CandidateExchange {
+        version: CandidateExchange::VERSION,
+        exchange_id,
+        generation,
+        candidates: gatherer.finish_gathering(),
+    };
+    exchange.encode().map_err(|_| NatError::InvalidCandidate)?;
+    Ok(exchange)
+}
+
+/// Canonical SHA-256 evidence digest of the validated candidate wire payload.
+/// The digest is diagnostic only and supplies neither identity nor integrity.
+pub fn candidate_exchange_sha256(exchange: &CandidateExchange) -> Result<[u8; 32], NatError> {
+    let encoded = exchange.encode().map_err(|_| NatError::InvalidCandidate)?;
+    Ok(Sha256::digest(encoded).into())
+}
+
+const fn wire_ip(address: IpAddr) -> WireIpAddr {
+    match address {
+        IpAddr::V4(address) => WireIpAddr::V4(address.octets()),
+        IpAddr::V6(address) => WireIpAddr::V6(address.octets()),
     }
 }
 
@@ -519,6 +573,7 @@ fn direct_path(pair: CandidatePair) -> ConnectionPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
 
     fn candidates(
         host_octets: &[[u8; 4]],
@@ -548,6 +603,79 @@ mod tests {
                 .expect("relay candidate");
         }
         gatherer.finish_gathering()
+    }
+
+    #[test]
+    fn authenticated_advertisement_keeps_host_and_distinct_srflx_candidates() {
+        let local: SocketAddr = "192.0.2.10:4000".parse().expect("local address");
+        let reflexive: SocketAddr = "198.51.100.20:5000".parse().expect("reflexive address");
+
+        let exchange = gather_candidate_exchange_v1(local, Some(reflexive), 41, 1)
+            .expect("bounded candidate exchange");
+
+        assert_eq!(exchange.exchange_id, 41);
+        assert_eq!(exchange.generation, 1);
+        assert_eq!(exchange.candidates.len(), 2);
+        assert_eq!(exchange.candidates[0].candidate_type, CandidateType::Host);
+        assert_eq!(
+            exchange.candidates[1].candidate_type,
+            CandidateType::ServerReflexive
+        );
+        assert_eq!(
+            exchange.candidates[1].related_address,
+            Some((WireIpAddr::V4([192, 0, 2, 10]), 4000))
+        );
+    }
+
+    #[test]
+    fn authenticated_advertisement_eliminates_redundant_same_socket_mapping() {
+        let local: SocketAddr = "127.0.0.1:4000".parse().expect("local address");
+
+        let exchange =
+            gather_candidate_exchange_v1(local, Some(local), 41, 1).expect("candidate exchange");
+
+        assert_eq!(exchange.candidates.len(), 1);
+        assert_eq!(exchange.candidates[0].candidate_type, CandidateType::Host);
+    }
+
+    #[test]
+    fn authenticated_advertisement_rejects_invalid_identity_family_and_addresses() {
+        let v4: SocketAddr = "192.0.2.10:4000".parse().expect("v4");
+        let v6: SocketAddr = "[2001:db8::1]:5000".parse().expect("v6");
+        let unspecified: SocketAddr = "0.0.0.0:4000".parse().expect("unspecified");
+
+        assert_eq!(
+            gather_candidate_exchange_v1(v4, None, 0, 1),
+            Err(NatError::InvalidCandidate)
+        );
+        assert_eq!(
+            gather_candidate_exchange_v1(v4, None, 41, 0),
+            Err(NatError::InvalidCandidate)
+        );
+        assert_eq!(
+            gather_candidate_exchange_v1(v4, Some(v6), 41, 1),
+            Err(NatError::AddressFamilyMismatch)
+        );
+        assert_eq!(
+            gather_candidate_exchange_v1(unspecified, None, 41, 1),
+            Err(NatError::InvalidCandidate)
+        );
+    }
+
+    #[test]
+    fn authenticated_advertisement_digest_covers_the_canonical_payload() {
+        let local: SocketAddr = "192.0.2.10:4000".parse().expect("local address");
+        let first = gather_candidate_exchange_v1(local, None, 41, 1).expect("exchange");
+        let second = gather_candidate_exchange_v1(local, None, 41, 2).expect("exchange");
+
+        assert_eq!(
+            candidate_exchange_sha256(&first),
+            candidate_exchange_sha256(&first.clone())
+        );
+        assert_ne!(
+            candidate_exchange_sha256(&first),
+            candidate_exchange_sha256(&second)
+        );
     }
 
     #[test]
