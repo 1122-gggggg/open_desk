@@ -36,15 +36,22 @@ compete with Quinn for the same socket would also lose or misclassify packets.
    duplicate/unbounded candidates, role conflict, establishment expiry, and
    liveness loss. The real loopback gate checks nominated addresses, retained
    socket ports, Quinn peer addresses, and both certificate chains.
+7. Keep application signaling separate from the adapter: after exact-mTLS
+   capability negotiation, typed APIs exchange bounded, redacted credentials
+   followed immediately by candidates; wrapper-owned credential objects and
+   encoded temporaries are zeroized. The offer and selected
+   configuration must both carry the capability; Client/Host roles are fixed
+   as controlling/controlled. Active session IDs and consecutive generations fence the exchange; raw ICE sends
+   and per-session mixing with advertisement-only mode are rejected.
 
 ## Consequences
 
 - LatencyDesk now has a standards-based connectivity-check and same-socket
   ICE→QUIC handoff seam without inventing an ICE state machine or concurrent
   socket demultiplexer.
-- The current application does not exchange ICE credentials, run rendezvous,
-  promote nominated routes, enumerate interfaces, emulate NAT, or allocate
-  TURN relays. The result is in-process loopback evidence, not automatic
+- The current application does not run checks from the signaled data, promote
+  nominated routes, run rendezvous, enumerate interfaces, emulate NAT, or
+  allocate TURN relays. The result is in-process loopback evidence, not automatic
   Internet traversal or AnyDesk/RustDesk parity.
 - A later product integration must bind credentials/candidates to the existing
   exact-mTLS session, test real NAT/CGNAT/IPv6 matrices, define consent and

@@ -72,6 +72,20 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
 - ICE raw reads and Quinn never race on one socket: ICE ownership ends and the
   receive queue is drained before the nominated socket enters Quinn. A nominated
   pair still has no desktop authority until exact-mTLS and the product handshake;
+- ICE credential signaling is available only through typed APIs after exact-mTLS
+  capability negotiation. Both the offer and selected configuration must carry
+  the capability; Client/Host roles are fixed as controlling/controlled,
+  active-session binding and consecutive generations are required; credentials
+  precede candidates and cannot mix with advertisement-only mode per session.
+  typed send/receive cancellation closes fail-closed so a partial generation
+  cannot be retried or reinterpreted. Generic ICE control access is rejected;
+  control-message Debug output never renders payload bytes. Values are bounded
+  and debug-redacted; signaling-wrapper objects and encoded temporaries are
+  zeroized, while borrowed transport buffers and the upstream ICE core's
+  internal copy are not guaranteed to be zeroized and must never be logged.
+  This boundary does not prove
+  connectivity, consent, route choice, NAT/TURN/Internet reachability, or
+  AnyDesk superiority;
 - rate limits before expensive parsing/decompression;
 - connection and incomplete-frame quotas.
 

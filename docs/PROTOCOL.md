@@ -94,6 +94,24 @@ transaction ID is only a correlation value; authentication depends on the
 CSPRNG password and HMAC. This adapter is currently an in-process loopback gate,
 not an application signaling, route-selection, NAT traversal, or relay path.
 
+After exact-mTLS and capability negotiation, the typed ICE signaling API may
+exchange bounded short-term credentials followed immediately by candidates.
+Both the validated offer and selected stream configuration must carry the
+authenticated-credential capability before use. Roles are then fixed per
+session: Client is controlling and Host is controlled.
+Each exchange is bound to the active session and a strictly consecutive
+generation. Generic ICE control sends and receives are rejected, and a session
+cannot mix credential generations with advertisement-only signaling. Cancelling
+a typed send poisons the signaling mode and closes the connection; cancelling a
+receive closes it while retaining the pending generation so it cannot be
+reinterpreted as a legacy advertisement. Credential values are debug-redacted;
+credential objects and encoded temporaries owned by the
+signaling wrapper are zeroized. Borrowed transport buffers and the upstream ICE
+core's internal credential copy are not guaranteed to be zeroized and must
+never be logged or retained. This slice does not prove connectivity checks,
+nomination, consent freshness, path selection/promotion, rollback, rendezvous,
+NAT/CGNAT, TURN/relay, Internet reachability, or AnyDesk superiority.
+
 ## 3. Capability negotiation
 
 Each peer advertises:
