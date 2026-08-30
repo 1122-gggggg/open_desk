@@ -15,8 +15,8 @@ Client。
 | --- | --- | --- |
 | 安全傳輸 | Quinn QUIC 上僅允許 TLS 1.3 的 mTLS；雙方 pin 並逐 byte 檢查預期 leaf certificate；不會自動降級 UDP | 預設產品路徑；in-process 測試通過 |
 | 裝置身分 | `latencydesk-identity` 產生持久的 self-signed certificate DER 與 PKCS#8 private-key DER，且不覆寫現有身分 | 已實作；certificate 仍須手動交換 |
-| 控制與輸入 | 已驗證的產品握手、帶 session stamp 的可靠 QUIC lane；input 優先權高於 control；Linux opt-in probe 只在 XTEST 加後續 X11 sync reply 完成後取得完整 stamp ACK | 已實作 128-sample application-ACK 程序證據；實體 input-to-photon 仍待完成 |
-| 同時連線多台 Host | 可重複使用 `--target <ADDR>,<PEER_CERT>`，以 2–16 個隔離的安全 Client 子程序同時開啟多台 exact-pinned Host | 兩台 distinct-cert Host 已通過同時連線程序驗證，且壞 target 不會中止健康 target；跨機器 2／4／8／16 Host soak 仍待完成 |
+| 控制與輸入 | 已驗證的產品握手、帶 session stamp 的可靠 QUIC lane；input 優先權高於 control；Client／Host 會明確協商 capability，Linux opt-in probe 只在 XTEST 加後續 X11 sync reply 完成後取得完整 stamp ACK | 已有單 target 與同時多 target 的 application-ACK 程序證據；實體 input-to-photon 仍待完成 |
+| 同時連線多台 Host | 可重複使用 `--target <ADDR>,<PEER_CERT>`，以 2–16 個隔離的安全 Client 子程序同時開啟多台 exact-pinned Host | 兩台 distinct-cert Host 已通過同時連線，包含每台 256 筆互相重疊的 raw input-ACK 樣本；壞 target 不會中止健康 target；跨機器 2／4／8／16 Host soak 仍待完成 |
 | Linux Host | 真實 X11 root 擷取、CPU BGRA-to-NV12 轉換，以及在獨立連線／task 中執行、不受擷取與軟體編碼阻塞的 XTEST 輸入 | 安全 Alpha 路徑；X11 到 headless 的 process loopback 已驗證，可見輸入延遲與跨機器呈現仍待完成 |
 | Successor session | Linux X11 Host 可保留同一個 endpoint，依序接受 1–16 個 exact-pinned session；headless Client 支援 clean sequence，亦可對已驗證 QUIC reset／idle timeout 做有界恢復；每個 successor 都在 ReleaseAll 後取得新 identity 與嚴格遞增 epoch | Clean 與 loopback blackhole recovery 已實作；互動式 reconnect、Windows Host persistence、實體 handoff 與跨機器 soak 仍待完成 |
 | Windows Client | 嚴格 raw-NV12 驗證、Direct3D 11 Viewer、有界 latest-frame 呈現及原生輸入轉送；`--frames` 可 headless 執行 | 安全 Alpha 路徑；Windows Viewer 跨機器 E2E 證據仍待完成 |
@@ -80,6 +80,21 @@ xvfb-run -a python3 scripts/secure_connect_test.py \
 **不能**證明 Linux 到 Windows 的畫面呈現、可見 XTEST 輸入效果、封包擷取的
 機密性、跨機器操作或長時間網路可靠度。這些項目在
 [產品就緒度](docs/PRODUCT_READINESS.md)仍為 Pending。
+
+同時多目標輸入 gate 會由一個 supervisor 啟動兩個 exact-pinned child，要求兩個
+已 flush 的 start marker 都先於任一 stop marker，再分別保留每台 Host 的 256 筆
+raw application-ACK RTT：
+
+```bash
+xvfb-run -a python3 scripts/multi_target_input_latency_test.py \
+  --host-bin target/debug/latencydesk-host \
+  --client-bin target/debug/latencydesk-client \
+  --identity-bin target/debug/latencydesk-identity \
+  --samples 256 --timeout 45 \
+  --output artifacts/multi-target-input-latency.json
+```
+
+這仍是單機控制面的 ACK 往返時間，不是實體 input-to-photon、WAN 或競品成績。
 
 ## 安全 LAN Preview 快速開始
 

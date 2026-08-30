@@ -16,8 +16,8 @@ Windows client on a trusted, low-latency LAN.
 | --- | --- | --- |
 | Secure transport | TLS 1.3-only mTLS over Quinn QUIC; both sides pin and byte-check the expected leaf certificate; no automatic UDP downgrade | Default product path; in-process tests pass |
 | Device identity | `latencydesk-identity` creates persistent self-signed certificate DER and PKCS#8 private-key DER files without overwriting an existing identity | Implemented; certificate exchange is manual |
-| Control and input | Authenticated product handshake; session-stamped reliable QUIC lanes; input has higher Quinn send priority; opt-in Linux probes receive a full-stamp ACK only after XTEST plus an X11 sync reply | Implemented; 128-sample application-ACK process evidence, while physical input-to-photon remains pending |
-| Concurrent targets | Repeatable `--target <ADDR>,<PEER_CERT>` launches 2–16 isolated secure client processes so one controller can open several exact-pinned Hosts at once | Two distinct-cert Hosts are process-verified concurrently and a failed target is isolated; cross-machine 2/4/8/16-Host soak remains pending |
+| Control and input | Authenticated product handshake; session-stamped reliable QUIC lanes; input has higher Quinn send priority; Client/Host negotiate an explicit capability and opt-in Linux probes receive a full-stamp ACK only after XTEST plus an X11 sync reply | Implemented; single- and concurrent-target application-ACK process evidence, while physical input-to-photon remains pending |
+| Concurrent targets | Repeatable `--target <ADDR>,<PEER_CERT>` launches 2–16 isolated secure client processes so one controller can open several exact-pinned Hosts at once | Two distinct-cert Hosts are process-verified concurrently, including 256 overlapping raw input-ACK samples per Host; a failed target is isolated; cross-machine 2/4/8/16-Host soak remains pending |
 | Linux host | Real X11 root capture, CPU BGRA-to-NV12 conversion, and reconciled XTEST input on a connection/task isolated from blocking capture and software encode | Secure alpha path; X11-to-headless process loopback is verified, while visible input latency and cross-machine rendering remain pending |
 | Successor sessions | Linux X11 Host retains one endpoint for 1–16 sequential exact-pinned sessions; a headless Client supports clean sequences plus bounded recovery from authenticated QUIC reset/idle timeout; every successor follows ReleaseAll and receives a fresh identity with strictly increasing epochs | Clean and loopback-blackhole recovery paths implemented; interactive reconnect, Windows Host persistence, physical handoff, and cross-machine soak remain pending |
 | Windows client | Strict raw-NV12 validation, Direct3D 11 viewer, bounded latest-frame presentation, and native input forwarding; `--frames` provides headless mode | Secure alpha path; Windows viewer cross-machine E2E evidence is still pending |
@@ -118,6 +118,24 @@ xvfb-run -a python3 scripts/secure_input_latency_test.py \
 
 The artifact retains every sequence/latency sample and recomputes its summary;
 the 100 ms loopback p95 ceiling is a stall detector, not a competitor claim.
+
+The concurrent input gate uses one supervisor and two exact-pinned Host
+children. Both flushed probe-start markers must arrive before either flushed
+probe-stop marker; every target then retains its own 256 raw samples and full
+lifecycle stamp:
+
+```bash
+xvfb-run -a python3 scripts/multi_target_input_latency_test.py \
+  --host-bin target/debug/latencydesk-host \
+  --client-bin target/debug/latencydesk-client \
+  --identity-bin target/debug/latencydesk-identity \
+  --samples 256 --timeout 45 \
+  --output artifacts/multi-target-input-latency.json
+```
+
+This adds concurrent single-machine control-plane evidence. It still does not
+measure a visible application response, a physical display, a WAN path, or any
+competitor.
 
 ## Secure LAN preview quick start
 

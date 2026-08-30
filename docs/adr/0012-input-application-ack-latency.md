@@ -29,14 +29,25 @@ cannot be compared safely without a separate synchronization experiment.
 4. The Client accepts an ACK only when the outer control lane and payload match
    the current full stamp, input sequence, ACK sequence, successful status, and
    expected action count. ACKs never grant permission or trigger input replay.
-5. `--input-latency-probes N` is a bounded single-target diagnostic. It sends
-   alternating relative pointer events one at a time and measures each local
-   `Instant` from immediately before reliable send through receipt of the
-   post-X11-sync ACK. It first receives one media frame so the complete product
-   session is active.
+5. `--input-latency-probes N` is a bounded secure-target diagnostic. A single
+   `--connect` runs one probe; repeated `--target` entries project the same
+   bound into each isolated Client child. Each sends alternating relative
+   pointer events one at a time and measures its local `Instant` from
+   immediately before reliable send through receipt of the post-X11-sync ACK.
+   Each first receives one media frame so its complete product session is
+   active.
 6. Linux CI retains exactly 128 raw `{sequence, latency_us}` samples, recomputes
    nearest-rank p50/p95/p99 and mean, and uses a permissive 100 ms loopback p95
    sanity ceiling to detect stalls rather than market a competitive result.
+7. A second Linux gate runs two distinct-certificate Hosts through one
+   supervisor with 256 samples each. Every child flushes full-stamp/target
+   `start`, `stop`, and result records. Both starts must be observed before
+   either stop, proving the measured intervals overlap; malformed or
+   interleaved records fail closed.
+8. The Client offers `INPUT_APPLIED_ACK` in its capabilities and
+   `VideoStreamConfig` carries the Host's intersection. Probe mode refuses a
+   Host that omits it before sending input. Unknown capability/stream flags fail
+   closed; Linux X11 intersects the capability and Windows Host does not.
 
 ## Consequences
 
@@ -45,7 +56,8 @@ cannot be compared safely without a separate synchronization experiment.
 - Sequential probes measure responsiveness without queue buildup; separate
   concurrent-load and physical keyboard-to-photon experiments remain required.
 - Windows Host ACK production, interactive continuous telemetry, network
-  shaping, and competitor baselines remain Pending.
+  shaping, cross-machine multi-target scale, and competitor baselines remain
+  Pending.
 
 ## Sources
 

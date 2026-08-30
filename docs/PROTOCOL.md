@@ -51,6 +51,13 @@ stamps, and unexpected sequences fail closed. A platform injection or X11
 synchronization failure is reported as `ApplyFailed` before the Host terminates
 that input lane; only `Applied` ACKs may contribute latency samples.
 
+The Client offers `INPUT_APPLIED_ACK` with its receiver capabilities. The Host
+advertises it in the selected stream configuration only when both the offer and
+its platform path implement that ordering. Probe Clients reject a missing bit
+immediately after stream negotiation, before sending input; unknown capability
+or stream flags are protocol errors. Linux X11 currently intersects the bit and
+Windows Host does not.
+
 ## 3. Capability negotiation
 
 Each peer advertises:
