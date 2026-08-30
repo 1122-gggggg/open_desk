@@ -3,6 +3,7 @@
 //! Native QUIC/UDP client role coordinator using platform providers.
 
 use latencydesk_input::{InputEvent, InputMessage};
+use latencydesk_session::lifecycle::MAX_RECONNECT_ATTEMPTS;
 use latencydesk_socket_transport::identity::MAX_PARALLEL_CONNECT_CANDIDATES;
 use latencydesk_socket_transport::{
     AuthenticatedDatagramEndpoint, AuthenticatedSessionConfig, HandshakeState, SessionRole,
@@ -59,6 +60,7 @@ pub struct ClientArgs {
     pub profile_1080p120: bool,
     pub max_frames: Option<u64>,
     pub session_count: u32,
+    pub reconnect_attempts: u32,
     pub width: u32,
     pub height: u32,
     pub auto_approve: bool,
@@ -83,6 +85,7 @@ impl Default for ClientArgs {
             profile_1080p120: false,
             max_frames: None,
             session_count: 1,
+            reconnect_attempts: 0,
             width: 1280,
             height: 720,
             auto_approve: false,
@@ -179,6 +182,13 @@ where
                 config.session_count = args[i + 1].parse()?;
                 i += 2;
             }
+            "--reconnect-attempts" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --reconnect-attempts".into());
+                }
+                config.reconnect_attempts = args[i + 1].parse()?;
+                i += 2;
+            }
             "--width" => {
                 if i + 1 >= args.len() {
                     return Err("missing value for --width".into());
@@ -268,6 +278,7 @@ where
                        --height <PIXELS>         Probe coordinate height (--inject-probe only; default 720)\n  \
                        --frames <COUNT>          Receive N completed frames then exit (headless)\n  \
                        --session-count <COUNT>   Run 1..=16 clean sequential headless sessions (default 1)\n  \
+                       --reconnect-attempts <N>  Retry 0..=8 recoverable headless path losses (default 0)\n  \
                        --inject-probe            Send one pointer move and ReleaseAll, wait 3 frames, exit\n  \
                        --role client             Explicit role assertion\n  \
                        --version, -V             Show version information\n  \
@@ -299,6 +310,11 @@ where
     }
     if !(1..=MAX_CLIENT_SESSIONS).contains(&config.session_count) {
         return Err(format!("--session-count must be between 1 and {MAX_CLIENT_SESSIONS}").into());
+    }
+    if config.reconnect_attempts > MAX_RECONNECT_ATTEMPTS {
+        return Err(
+            format!("--reconnect-attempts must be between 0 and {MAX_RECONNECT_ATTEMPTS}").into(),
+        );
     }
     if config.pairing_timeout_secs == 0 || config.pairing_timeout_secs > MAX_PAIRING_TIMEOUT_SECS {
         return Err(format!(
@@ -369,7 +385,19 @@ where
         }
         if config.unsafe_udp_lab || config.inject_probe || !config.targets.is_empty() {
             return Err(
-                "--session-count greater than 1 requires one secure headless Host target".into(),
+                "--session-count greater than 1 requires secure headless --frames mode and is incompatible with --target, --inject-probe, and --unsafe-udp-lab"
+                    .into(),
+            );
+        }
+    }
+    if config.reconnect_attempts > 0 {
+        if config.max_frames.is_none() {
+            return Err("--reconnect-attempts currently requires --frames".into());
+        }
+        if config.unsafe_udp_lab || config.inject_probe || !config.targets.is_empty() {
+            return Err(
+                "--reconnect-attempts requires secure headless --frames mode and is incompatible with --target, --inject-probe, and --unsafe-udp-lab"
+                    .into(),
             );
         }
     }
@@ -1435,6 +1463,48 @@ mod tests {
                 "1",
                 "--session-count",
                 "2",
+            ],
+        ] {
+            assert!(parse_client_args_from(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn client_parser_bounds_recoverable_headless_reconnect_attempts() {
+        let args = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client.der",
+            "--identity-key",
+            "key.der",
+            "--peer-cert",
+            "host.der",
+            "--frames",
+            "3",
+            "--reconnect-attempts",
+            "3",
+        ])
+        .expect("bounded recoverable reconnect policy");
+        assert_eq!(args.reconnect_attempts, 3);
+        assert_eq!(ClientArgs::default().reconnect_attempts, 0);
+
+        for arguments in [
+            vec![
+                "latencydesk-client",
+                "--frames",
+                "1",
+                "--reconnect-attempts",
+                "9",
+            ],
+            vec!["latencydesk-client", "--reconnect-attempts", "1"],
+            vec![
+                "latencydesk-client",
+                "--unsafe-udp-lab",
+                "--approve",
+                "--frames",
+                "1",
+                "--reconnect-attempts",
+                "1",
             ],
         ] {
             assert!(parse_client_args_from(arguments).is_err());

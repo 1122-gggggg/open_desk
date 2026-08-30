@@ -27,16 +27,37 @@ struct InputLaneFailure(std::sync::Arc<InputLaneFailureState>);
 #[derive(Debug)]
 struct InputLaneFailureState {
     message: String,
+    disposition: InputLaneFailureDisposition,
     observed_by_stream: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputLaneFailureDisposition {
+    Fatal,
+    RetryablePeerLoss,
 }
 
 #[cfg(any(target_os = "linux", windows))]
 impl InputLaneFailure {
     fn new(message: String) -> Self {
+        Self::with_disposition(message, InputLaneFailureDisposition::Fatal)
+    }
+
+    fn peer_connection_lost(message: String) -> Self {
+        Self::with_disposition(message, InputLaneFailureDisposition::RetryablePeerLoss)
+    }
+
+    fn with_disposition(message: String, disposition: InputLaneFailureDisposition) -> Self {
         Self(std::sync::Arc::new(InputLaneFailureState {
             message,
+            disposition,
             observed_by_stream: std::sync::atomic::AtomicBool::new(false),
         }))
+    }
+
+    fn is_retryable_connection_loss(&self) -> bool {
+        self.0.disposition == InputLaneFailureDisposition::RetryablePeerLoss
     }
 
     fn mark_observed(&self) {
@@ -70,6 +91,15 @@ mod close_code_tests {
     fn application_close_code_is_zero_only_for_host_success() {
         assert_eq!(host_application_close_code(true), 0);
         assert_eq!(host_application_close_code(false), 1);
+    }
+
+    #[test]
+    fn input_lane_failure_preserves_retryable_peer_loss_disposition() {
+        let fatal = InputLaneFailure::new("provider failed".into());
+        let peer_loss = InputLaneFailure::peer_connection_lost("path timed out".into());
+
+        assert!(!fatal.is_retryable_connection_loss());
+        assert!(peer_loss.is_retryable_connection_loss());
     }
 }
 
@@ -175,8 +205,36 @@ mod linux {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum SessionEnd {
         PeerCompleted,
+        PeerLost,
         FrameLimit,
         HostShutdown,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ListenerDecision {
+        AcceptSuccessor,
+        Complete,
+        ReconnectCapacityExhausted,
+    }
+
+    const fn listener_decision(
+        session_end: SessionEnd,
+        ended_sessions: u32,
+        maximum_sessions: u32,
+    ) -> ListenerDecision {
+        match session_end {
+            SessionEnd::HostShutdown => ListenerDecision::Complete,
+            SessionEnd::PeerLost if ended_sessions >= maximum_sessions => {
+                ListenerDecision::ReconnectCapacityExhausted
+            }
+            SessionEnd::PeerCompleted | SessionEnd::PeerLost | SessionEnd::FrameLimit
+                if ended_sessions < maximum_sessions =>
+            {
+                ListenerDecision::AcceptSuccessor
+            }
+            SessionEnd::PeerCompleted | SessionEnd::FrameLimit => ListenerDecision::Complete,
+            SessionEnd::PeerLost => ListenerDecision::ReconnectCapacityExhausted,
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,7 +267,7 @@ mod linux {
             args.max_sessions
         );
 
-        let mut completed_sessions = 0_u32;
+        let mut ended_sessions = 0_u32;
         loop {
             let pairing_deadline =
                 tokio::time::Instant::now() + Duration::from_secs(args.pairing_timeout_secs);
@@ -420,6 +478,11 @@ mod linux {
                     let mut receiver = match accepted {
                         Ok(receiver) => receiver,
                         Err(error) if is_clean_session_close(&error) => return Ok(()),
+                        Err(error) if error.is_retryable_connection_loss() => {
+                            return Err(super::InputLaneFailure::peer_connection_lost(format!(
+                                "reliable input lane lost before establishment: {error}"
+                            )))
+                        }
                         Err(error) => {
                             return Err(super::InputLaneFailure::new(format!(
                                 "failed to establish the reliable input lane: {error}"
@@ -442,6 +505,11 @@ mod linux {
                             )
                             .map_err(|error| super::InputLaneFailure::new(error.to_string()))?,
                             Err(error) if is_clean_session_close(&error) => return Ok(()),
+                            Err(error) if error.is_retryable_connection_loss() => {
+                                return Err(super::InputLaneFailure::peer_connection_lost(format!(
+                                    "reliable input lane lost its authenticated peer: {error}"
+                                )))
+                            }
                             Err(error) => {
                                 return Err(super::InputLaneFailure::new(format!(
                                     "reliable input lane disconnected: {error}"
@@ -476,9 +544,14 @@ mod linux {
             .await;
 
             let _ = stop_tx.send(());
+            let stream_end = stream_result.as_ref().ok().copied();
             let input_task_result = match input_task.await {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) if error.was_observed() => Ok(()),
+                Ok(Err(error))
+                    if error.was_observed() || input_failure_is_redundant(stream_end, &error) =>
+                {
+                    Ok(())
+                }
                 Ok(Err(error)) => Err(error.into()),
                 Err(error) if error.is_cancelled() => {
                     Err("input worker cancelled before cleanup".into())
@@ -498,17 +571,31 @@ mod linux {
                     return Err(error);
                 }
             };
-            session.close(0, b"host product session complete");
-            completed_sessions = completed_sessions.saturating_add(1);
+            if session_end != SessionEnd::PeerLost {
+                session.close(0, b"host product session complete");
+            }
+            ended_sessions = ended_sessions.saturating_add(1);
             println!(
-                "listener: completed secure session {completed_sessions}/{} ({session_end:?})",
+                "listener: ended secure session {ended_sessions}/{} ({session_end:?})",
                 args.max_sessions
             );
-            if session_end == SessionEnd::HostShutdown || completed_sessions >= args.max_sessions {
-                close_endpoint!(endpoint, true, b"host session sequence ended");
-                return Ok(());
+            match listener_decision(session_end, ended_sessions, args.max_sessions) {
+                ListenerDecision::AcceptSuccessor => {
+                    println!("listener: waiting for authenticated successor session");
+                }
+                ListenerDecision::Complete => {
+                    close_endpoint!(endpoint, true, b"host session sequence ended");
+                    return Ok(());
+                }
+                ListenerDecision::ReconnectCapacityExhausted => {
+                    close_endpoint!(endpoint, false, b"reconnect capacity exhausted");
+                    return Err(format!(
+                        "authenticated peer transport was lost after consuming all {} allowed session(s)",
+                        args.max_sessions
+                    )
+                    .into());
+                }
             }
-            println!("listener: waiting for authenticated successor session");
         }
     }
 
@@ -558,6 +645,10 @@ mod linux {
                 }
                 ScheduledWork::Input(Some(InputWorkerStatus::Failed(error))) => {
                     error.mark_observed();
+                    if error.is_retryable_connection_loss() {
+                        println!("session: authenticated peer transport lost after ReleaseAll");
+                        return Ok(SessionEnd::PeerLost);
+                    }
                     return Err(error.into());
                 }
                 ScheduledWork::Input(None) => {
@@ -629,6 +720,10 @@ mod linux {
                         Err(error) if is_clean_session_close(&error) => {
                             println!("session: peer completed normally");
                             return Ok(SessionEnd::PeerCompleted);
+                        }
+                        Err(error) if error.is_retryable_connection_loss() => {
+                            println!("session: authenticated peer transport lost");
+                            return Ok(SessionEnd::PeerLost);
                         }
                         Err(error) if is_transient_media_send(&error) => {
                             if let Some(encoder) = encoder.as_mut() {
@@ -735,6 +830,13 @@ mod linux {
                 "{work_error}; input cleanup also failed: {cleanup_error}"
             ))),
         }
+    }
+
+    fn input_failure_is_redundant(
+        stream_end: Option<SessionEnd>,
+        input_error: &super::InputLaneFailure,
+    ) -> bool {
+        stream_end == Some(SessionEnd::PeerLost) && input_error.is_retryable_connection_loss()
     }
 
     fn attempt_all_injections<A, E: ToString>(
@@ -945,6 +1047,51 @@ mod linux {
             let error = merge_input_worker_results(work, cleanup).expect_err("both fail");
             assert!(error.to_string().contains("input failed"));
             assert!(error.to_string().contains("release failed"));
+        }
+
+        #[test]
+        fn listener_only_retries_peer_loss_while_capacity_remains() {
+            assert_eq!(
+                listener_decision(SessionEnd::PeerLost, 1, 2),
+                ListenerDecision::AcceptSuccessor
+            );
+            assert_eq!(
+                listener_decision(SessionEnd::PeerLost, 2, 2),
+                ListenerDecision::ReconnectCapacityExhausted
+            );
+            assert_eq!(
+                listener_decision(SessionEnd::PeerCompleted, 1, 2),
+                ListenerDecision::AcceptSuccessor
+            );
+            assert_eq!(
+                listener_decision(SessionEnd::FrameLimit, 2, 2),
+                ListenerDecision::Complete
+            );
+            assert_eq!(
+                listener_decision(SessionEnd::HostShutdown, 1, 2),
+                ListenerDecision::Complete
+            );
+        }
+
+        #[test]
+        fn concurrent_media_and_input_peer_loss_is_one_recoverable_terminal_event() {
+            let peer_loss = super::super::InputLaneFailure::peer_connection_lost(
+                "same timed-out connection".into(),
+            );
+            let fatal = super::super::InputLaneFailure::new("provider failed".into());
+
+            assert!(input_failure_is_redundant(
+                Some(SessionEnd::PeerLost),
+                &peer_loss
+            ));
+            assert!(!input_failure_is_redundant(
+                Some(SessionEnd::PeerCompleted),
+                &peer_loss
+            ));
+            assert!(!input_failure_is_redundant(
+                Some(SessionEnd::PeerLost),
+                &fatal
+            ));
         }
 
         #[test]

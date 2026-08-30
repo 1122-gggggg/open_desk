@@ -3,10 +3,12 @@
 use super::ClientArgs;
 use latencydesk_input::{InputEvent, InputMessage};
 use latencydesk_protocol::quic::SessionStamp;
+use latencydesk_session::lifecycle::ReconnectPolicy;
 #[cfg(test)]
 use latencydesk_socket_transport::identity::connect_exact_peer;
 use latencydesk_socket_transport::identity::{
-    connect_exact_peer_candidates, load_certificate_der, mtls_client_config, TlsIdentity,
+    connect_exact_peer_candidates, load_certificate_der, mtls_client_config, IdentityError,
+    TlsIdentity,
 };
 use latencydesk_socket_transport::product::ProductSessionError;
 use latencydesk_socket_transport::product::{ControlReceiver, ProductSession};
@@ -17,11 +19,12 @@ use std::error::Error;
 #[cfg(any(windows, test))]
 use std::future::Future;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CLIENT_RELIABLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_CANDIDATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIENT_RECONNECT_TOTAL_BUDGET: Duration = Duration::from_secs(15);
 #[cfg(any(windows, test))]
 const CLIENT_CLEANUP_SCHEDULER_ALLOWANCE: Duration = Duration::from_millis(250);
 #[cfg(any(windows, test))]
@@ -33,13 +36,54 @@ const MAX_QUEUED_ACCESS_UNITS: usize = 2;
 #[cfg(windows)]
 const VIEWER_IDLE_PARK: Duration = Duration::ZERO;
 
+#[derive(Debug)]
+enum SessionEstablishError {
+    Candidate(IdentityError),
+    Handshake(ProductSessionError),
+    Deadline(Duration),
+}
+
+impl SessionEstablishError {
+    fn is_retryable_connection_attempt(&self) -> bool {
+        match self {
+            Self::Candidate(error) => error.is_retryable_connection_attempt(),
+            Self::Handshake(error) => error.is_retryable_connection_loss(),
+            Self::Deadline(_) => true,
+        }
+    }
+}
+
+impl std::fmt::Display for SessionEstablishError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Candidate(error) => write!(formatter, "exact-peer mTLS connection failed: {error}"),
+            Self::Handshake(error) => write!(formatter, "secure product handshake failed: {error}"),
+            Self::Deadline(timeout) => write!(
+                formatter,
+                "secure connection timed out after {} seconds; verify address, firewall, and exchanged certificates",
+                timeout.as_secs()
+            ),
+        }
+    }
+}
+
+impl Error for SessionEstablishError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Candidate(error) => Some(error),
+            Self::Handshake(error) => Some(error),
+            Self::Deadline(_) => None,
+        }
+    }
+}
+
 async fn establish_product_session(
     endpoint: &quinn::Endpoint,
     candidates: &[SocketAddr],
     exact_peer_certificate: &[u8],
     operation_timeout: Duration,
     previous: Option<SessionStamp>,
-) -> Result<(ProductSession, SocketAddr, usize), String> {
+) -> Result<(ProductSession, SocketAddr, usize), SessionEstablishError> {
     let candidate_timeout = operation_timeout.min(CLIENT_CANDIDATE_ATTEMPT_TIMEOUT);
     tokio::time::timeout(operation_timeout, async {
         let connected = connect_exact_peer_candidates(
@@ -49,23 +93,49 @@ async fn establish_product_session(
             candidate_timeout,
         )
         .await
-        .map_err(|error| format!("exact-peer mTLS connection failed: {error}"))?;
+        .map_err(SessionEstablishError::Candidate)?;
         let selected_remote = connected.remote;
         let attempts_started = connected.attempts_started;
         let session = match previous {
-            Some(previous) => ProductSession::client_successor(connected.connection, previous).await,
+            Some(previous) => {
+                ProductSession::client_successor(connected.connection, previous).await
+            }
             None => ProductSession::client(connected.connection).await,
         }
-        .map_err(|error| format!("secure product handshake failed: {error}"))?;
-        Ok::<_, String>((session, selected_remote, attempts_started))
+        .map_err(SessionEstablishError::Handshake)?;
+        Ok::<_, SessionEstablishError>((session, selected_remote, attempts_started))
     })
     .await
-    .map_err(|_| {
-        format!(
-            "secure connection timed out after {} seconds; verify address, firewall, and exchanged certificates",
-            operation_timeout.as_secs()
-        )
-    })?
+    .map_err(|_| SessionEstablishError::Deadline(operation_timeout))?
+}
+
+fn is_retryable_session_run_error(error: &(dyn Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(candidate) = current {
+        if candidate
+            .downcast_ref::<ProductSessionError>()
+            .is_some_and(ProductSessionError::is_retryable_connection_loss)
+        {
+            return true;
+        }
+        current = candidate.source();
+    }
+    false
+}
+
+fn claim_reconnect_delay(
+    policy: ReconnectPolicy,
+    attempts_used: &mut u32,
+    prior_session_id: u64,
+) -> Option<Duration> {
+    let attempt = attempts_used.checked_add(1)?;
+    let delay = policy.delay_for(attempt, prior_session_id)?;
+    *attempts_used = attempt;
+    Some(delay)
+}
+
+fn wait_for_reconnect_delay(runtime: &tokio::runtime::Runtime, delay: Duration) {
+    runtime.block_on(async { tokio::time::sleep(delay).await });
 }
 
 fn log_active_session(session: &ProductSession, remote: SocketAddr, attempts_started: usize) {
@@ -230,7 +300,8 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
 
     log_active_session(&session, selected_remote, attempts_started);
 
-    let result = if args.session_count > 1 {
+    let reconnect_policy = ReconnectPolicy::new(args.reconnect_attempts)?;
+    let result = if args.session_count > 1 || args.reconnect_attempts > 0 {
         run_headless_successor_sequence(
             SuccessorSequenceContext {
                 runtime: &runtime,
@@ -242,6 +313,7 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
             session,
             args.max_frames.expect("parser requires frames"),
             args.session_count,
+            reconnect_policy,
         )
     } else if args.inject_probe {
         run_probe(
@@ -295,9 +367,13 @@ fn run_headless_successor_sequence(
     first_session: ProductSession,
     needed_frames: u64,
     session_count: u32,
+    reconnect_policy: ReconnectPolicy,
 ) -> Result<(), Box<dyn Error>> {
     let mut session = first_session;
-    for session_index in 1..=session_count {
+    let mut completed_sessions = 0_u32;
+    let mut reconnect_attempts_used = 0_u32;
+    let mut reconnect_deadline = None;
+    loop {
         let run_result = {
             #[cfg(windows)]
             {
@@ -319,36 +395,96 @@ fn run_headless_successor_sequence(
             }
         };
         let previous = session.stamp();
-        session.close(
-            u32::from(run_result.is_err()),
-            if run_result.is_ok() {
-                b"client headless session complete"
-            } else {
-                b"client headless session failed"
-            },
-        );
-        run_result?;
-        if session_index >= session_count {
-            return Ok(());
-        }
+        match run_result {
+            Ok(()) => {
+                session.close(0, b"client headless session complete");
+                completed_sessions = completed_sessions.saturating_add(1);
+                if completed_sessions >= session_count {
+                    return Ok(());
+                }
 
-        println!(
-            "reconnect: starting authenticated successor {}/{}",
-            session_index + 1,
-            session_count
-        );
-        let (successor, remote, attempts_started) =
-            context.runtime.block_on(establish_product_session(
-                context.endpoint,
-                context.candidates,
-                context.exact_peer_certificate,
-                context.operation_timeout,
-                Some(previous),
-            ))?;
-        log_active_session(&successor, remote, attempts_started);
-        session = successor;
+                println!(
+                    "reconnect: starting authenticated successor {}/{}",
+                    completed_sessions + 1,
+                    session_count
+                );
+                let (successor, remote, attempts_started) =
+                    context.runtime.block_on(establish_product_session(
+                        context.endpoint,
+                        context.candidates,
+                        context.exact_peer_certificate,
+                        context.operation_timeout,
+                        Some(previous),
+                    ))?;
+                log_active_session(&successor, remote, attempts_started);
+                session = successor;
+            }
+            Err(error) if is_retryable_session_run_error(error.as_ref()) => {
+                session.close(1, b"client transport recovery required");
+                let deadline = *reconnect_deadline.get_or_insert_with(|| {
+                    Instant::now() + context.operation_timeout.min(CLIENT_RECONNECT_TOTAL_BUDGET)
+                });
+                let mut last_failure = error.to_string();
+                loop {
+                    let Some(delay) = claim_reconnect_delay(
+                        reconnect_policy,
+                        &mut reconnect_attempts_used,
+                        previous.session_id,
+                    ) else {
+                        return Err(format!(
+                            "recoverable transport loss exhausted {} reconnect attempt(s): {last_failure}",
+                            reconnect_policy.maximum_attempts()
+                        )
+                        .into());
+                    };
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining <= delay {
+                        return Err(format!(
+                            "recoverable transport loss exhausted the {:?} reconnect deadline after {} attempt(s): {last_failure}",
+                            context
+                                .operation_timeout
+                                .min(CLIENT_RECONNECT_TOTAL_BUDGET),
+                            reconnect_attempts_used.saturating_sub(1)
+                        )
+                        .into());
+                    }
+                    println!(
+                        "reconnect: recoverable transport loss, attempt {}/{} after {delay:?}",
+                        reconnect_attempts_used,
+                        reconnect_policy.maximum_attempts()
+                    );
+                    wait_for_reconnect_delay(context.runtime, delay);
+                    let attempt_timeout = context
+                        .operation_timeout
+                        .min(deadline.saturating_duration_since(Instant::now()));
+                    match context.runtime.block_on(establish_product_session(
+                        context.endpoint,
+                        context.candidates,
+                        context.exact_peer_certificate,
+                        attempt_timeout,
+                        Some(previous),
+                    )) {
+                        Ok((successor, remote, attempts_started)) => {
+                            println!(
+                                "reconnect: recovered authenticated session after {reconnect_attempts_used} attempt(s)"
+                            );
+                            log_active_session(&successor, remote, attempts_started);
+                            session = successor;
+                            break;
+                        }
+                        Err(connect_error) if connect_error.is_retryable_connection_attempt() => {
+                            last_failure = connect_error.to_string();
+                        }
+                        Err(connect_error) => return Err(connect_error.into()),
+                    }
+                }
+            }
+            Err(error) => {
+                session.close(1, b"client headless session failed");
+                return Err(error);
+            }
+        }
     }
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -684,11 +820,7 @@ async fn receive_frames_with_timeout(
     tokio::time::timeout(timeout, async {
         let mut received = 0_u64;
         while received < needed {
-            let frame = session.receive_media_frame().await.map_err(|error| {
-                format!(
-                    "secure media transport ended after {received}/{needed} completed frames: {error}"
-                )
-            })?;
+            let frame = session.receive_media_frame().await?;
             match config.codec {
                 latencydesk_protocol::VideoCodec::H264 => {
                     latencydesk_h264::inspect_annex_b(&frame.bytes)?;
@@ -1669,6 +1801,66 @@ mod tests {
                 latencydesk_protocol::VideoProfile::RawNv12
             )
         );
+    }
+
+    #[test]
+    fn reconnect_classification_never_retries_identity_or_protocol_failures() {
+        let candidate_timeout = SessionEstablishError::Candidate(
+            latencydesk_socket_transport::identity::IdentityError::QuicTransport(
+                latencydesk_socket_transport::quic::QuicTransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "candidate timeout",
+                )),
+            ),
+        );
+        let certificate_mismatch = SessionEstablishError::Candidate(
+            latencydesk_socket_transport::identity::IdentityError::PeerCertificateMismatch,
+        );
+        let handshake_protocol = SessionEstablishError::Handshake(ProductSessionError::Protocol(
+            latencydesk_protocol::ProtocolError::InvalidSessionStamp,
+        ));
+
+        assert!(candidate_timeout.is_retryable_connection_attempt());
+        assert!(SessionEstablishError::Deadline(Duration::from_secs(1))
+            .is_retryable_connection_attempt());
+        assert!(!certificate_mismatch.is_retryable_connection_attempt());
+        assert!(!handshake_protocol.is_retryable_connection_attempt());
+    }
+
+    #[test]
+    fn session_run_retryability_survives_error_erasure() {
+        let timeout = ProductSessionError::Quic(
+            latencydesk_socket_transport::quic::QuicTransportError::Connection(
+                quinn::ConnectionError::TimedOut,
+            ),
+        );
+        let protocol =
+            ProductSessionError::Protocol(latencydesk_protocol::ProtocolError::InvalidSessionStamp);
+
+        assert!(is_retryable_session_run_error(&timeout));
+        assert!(!is_retryable_session_run_error(&protocol));
+    }
+
+    #[test]
+    fn reconnect_attempt_claims_are_global_and_never_exceed_policy() {
+        let policy = latencydesk_session::lifecycle::ReconnectPolicy::new(3)
+            .expect("bounded reconnect policy");
+        let mut used = 0;
+        for expected in 1..=3 {
+            assert!(claim_reconnect_delay(policy, &mut used, 41).is_some());
+            assert_eq!(used, expected);
+        }
+        assert_eq!(claim_reconnect_delay(policy, &mut used, 41), None);
+        assert_eq!(used, 3);
+    }
+
+    #[test]
+    fn reconnect_delay_timer_is_constructed_inside_the_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        wait_for_reconnect_delay(&runtime, Duration::ZERO);
     }
 
     #[test]
