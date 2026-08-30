@@ -23,6 +23,8 @@ const PROTOCOL_VIOLATION_REASON: &[u8] = b"invalid application record";
 const RELIABLE_OPERATION_TIMEOUT_CODE: quinn::VarInt = quinn::VarInt::from_u32(0x101);
 const RELIABLE_OPERATION_TIMEOUT_REASON: &[u8] = b"reliable lane operation timed out";
 const DEFAULT_RELIABLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_STREAM_PRIORITY: i32 = 0;
+const INPUT_STREAM_PRIORITY: i32 = 1;
 
 /// Outcome of an unreliable media submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -503,12 +505,26 @@ impl QuicConnection {
             };
             let mut stream = lane.lock().await;
             if stream.is_none() {
-                *stream = Some(
-                    self.connection
-                        .open_uni()
-                        .await
-                        .map_err(QuicTransportError::Connection)?,
-                );
+                let opened = self
+                    .connection
+                    .open_uni()
+                    .await
+                    .map_err(QuicTransportError::Connection)?;
+                // Quinn transmits locally buffered data from higher-priority
+                // streams first. Keep the reliable input lane ahead of control
+                // chatter without introducing additional priority levels.
+                // Source: https://docs.rs/quinn/0.11.8/quinn/struct.SendStream.html#method.set_priority
+                opened
+                    .set_priority(reliable_stream_priority(kind))
+                    .map_err(|error| {
+                        QuicTransportError::Io(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            format!(
+                                "new reliable {kind:?} lane closed before priority setup: {error}"
+                            ),
+                        ))
+                    })?;
+                *stream = Some(opened);
             }
             stream
                 .as_mut()
@@ -545,6 +561,13 @@ impl QuicConnection {
     pub(crate) fn close_for_protocol_violation(&self) {
         self.connection
             .close(PROTOCOL_VIOLATION_CODE, PROTOCOL_VIOLATION_REASON);
+    }
+}
+
+const fn reliable_stream_priority(kind: StreamKind) -> i32 {
+    match kind {
+        StreamKind::Control => CONTROL_STREAM_PRIORITY,
+        StreamKind::Input => INPUT_STREAM_PRIORITY,
     }
 }
 
@@ -972,6 +995,50 @@ mod tests {
                 .payload
                 .as_ref(),
             b"input-2"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn input_lane_has_higher_quinn_send_priority_than_control_lane() {
+        let pair = connected_pair().await;
+        let control = StreamRecord::encode(StreamKind::Control, active_stamp(), b"control")
+            .expect("control record");
+        let input = StreamRecord::encode(StreamKind::Input, active_stamp(), b"key-down")
+            .expect("input record");
+
+        pair.client
+            .send_control(&control)
+            .await
+            .expect("open control lane");
+        pair.client
+            .send_input(&input)
+            .await
+            .expect("open input lane");
+
+        let control_priority = pair
+            .client
+            .outbound
+            .control
+            .lock()
+            .await
+            .as_ref()
+            .expect("control stream")
+            .priority()
+            .expect("control priority");
+        let input_priority = pair
+            .client
+            .outbound
+            .input
+            .lock()
+            .await
+            .as_ref()
+            .expect("input stream")
+            .priority()
+            .expect("input priority");
+
+        assert!(
+            input_priority > control_priority,
+            "input={input_priority}, control={control_priority}"
         );
     }
 

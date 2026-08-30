@@ -83,7 +83,6 @@ pub async fn run(_args: &HostArgs) -> Result<(), Box<dyn Error>> {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::HostArgs;
-    use bytes::Bytes;
     use latencydesk_h264::{H264Error, LowDelayPolicy, SoftwareH264Encoder};
     use latencydesk_input::{InputMessage, InputReconciler, ReconcileOutcome};
     use latencydesk_platform_linux::{
@@ -108,8 +107,6 @@ mod linux {
     use tokio::sync::mpsc;
     use tokio::time::MissedTickBehavior;
 
-    const INPUT_CHANNEL_CAPACITY: usize = 64;
-    const INPUT_BUDGET_PER_TURN: usize = 8;
     const LOG_FRAME_INTERVAL: u64 = 60;
     const AUTHENTICATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -158,38 +155,20 @@ mod linux {
         }};
     }
 
-    enum InputLaneEvent {
-        Payload(Bytes),
+    /// The media lane only receives bounded lifecycle notifications. Input
+    /// payloads never cross this channel, so a slow encoder cannot delay XTEST.
+    #[derive(Debug, Clone)]
+    enum InputWorkerStatus {
         Completed,
         Failed(super::InputLaneFailure),
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum WorkPriority {
-        Media,
-        Input,
-    }
-
-    impl WorkPriority {
-        const fn after_media() -> Self {
-            Self::Input
-        }
-
-        const fn after_input() -> Self {
-            Self::Media
-        }
-    }
+    const INPUT_STATUS_CAPACITY: usize = 1;
 
     enum ScheduledWork {
         Shutdown(std::io::Result<()>),
         Media,
-        Input(Option<InputLaneEvent>),
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum InputBatchOutcome {
-        Continue,
-        PeerCompleted,
+        Input(Option<InputWorkerStatus>),
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,76 +372,95 @@ mod linux {
             }
         };
 
-        let (input_tx, mut input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
+        let (status_tx, mut status_rx) = mpsc::channel(INPUT_STATUS_CAPACITY);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         let input_session = session.clone();
+        let input_epoch = session.stamp().authorization_epoch;
         let input_task = tokio::spawn(async move {
-            let mut receiver = match input_session.accept_input_receiver().await {
-                Ok(receiver) => receiver,
-                Err(error) if is_clean_session_close(&error) => {
-                    let _ = input_tx.send(InputLaneEvent::Completed).await;
-                    return Ok(());
-                }
+            tokio::pin!(stop_rx);
+            let mut input_desktop = match X11DesktopSession::open() {
+                Ok(desktop) => desktop,
                 Err(error) => {
                     let failure = super::InputLaneFailure::new(format!(
-                        "failed to establish the reliable input lane: {error}"
+                        "input provider initialization failed: {error}"
                     ));
-                    let _ = input_tx.try_send(InputLaneEvent::Failed(failure.clone()));
+                    let _ = status_tx.try_send(InputWorkerStatus::Failed(failure.clone()));
                     return Err(failure);
                 }
             };
-
-            loop {
-                match receiver.next_input().await {
-                    Ok(payload) => {
-                        if input_tx
-                            .send(InputLaneEvent::Payload(payload))
-                            .await
-                            .is_err()
-                        {
-                            return Ok(());
-                        }
-                    }
-                    Err(error) if is_clean_session_close(&error) => {
-                        let _ = input_tx.send(InputLaneEvent::Completed).await;
-                        return Ok(());
-                    }
+            let mut reconciler = InputReconciler::default();
+            let work_result = async {
+                let accepted = tokio::select! {
+                    biased;
+                    _ = &mut stop_rx => return Ok(()),
+                    result = input_session.accept_input_receiver() => result,
+                };
+                let mut receiver = match accepted {
+                    Ok(receiver) => receiver,
+                    Err(error) if is_clean_session_close(&error) => return Ok(()),
                     Err(error) => {
-                        let failure = super::InputLaneFailure::new(format!(
-                            "reliable input lane disconnected: {error}"
-                        ));
-                        let _ = input_tx.try_send(InputLaneEvent::Failed(failure.clone()));
-                        return Err(failure);
+                        return Err(super::InputLaneFailure::new(format!(
+                            "failed to establish the reliable input lane: {error}"
+                        )))
+                    }
+                };
+
+                loop {
+                    let next = tokio::select! {
+                        biased;
+                        _ = &mut stop_rx => return Ok(()),
+                        result = receiver.next_input() => result,
+                    };
+                    match next {
+                        Ok(payload) => {
+                            apply_input(&payload, input_epoch, &mut reconciler, &mut input_desktop)
+                                .map_err(|error| super::InputLaneFailure::new(error.to_string()))?
+                        }
+                        Err(error) if is_clean_session_close(&error) => return Ok(()),
+                        Err(error) => {
+                            return Err(super::InputLaneFailure::new(format!(
+                                "reliable input lane disconnected: {error}"
+                            )))
+                        }
                     }
                 }
             }
-        });
+            .await;
 
-        let mut reconciler = InputReconciler::default();
+            // Cleanup is deliberately outside every receive/error branch. Once
+            // the provider has admitted any state, every terminal path reaches
+            // ReleaseAll before a lifecycle status is published.
+            let cleanup_result = release_all(&mut reconciler, &mut input_desktop)
+                .map_err(|error| super::InputLaneFailure::new(error.to_string()));
+            let final_result = merge_input_worker_results(work_result, cleanup_result);
+            let status = match &final_result {
+                Ok(()) => InputWorkerStatus::Completed,
+                Err(error) => InputWorkerStatus::Failed(error.clone()),
+            };
+            let _ = status_tx.try_send(status);
+            final_result
+        });
         let stream_result = stream_desktop(
             args,
             &session,
-            &mut input_rx,
-            &mut reconciler,
+            &mut status_rx,
             &mut desktop,
             capture_plan,
             encoder.as_mut(),
         )
         .await;
 
-        input_task.abort();
+        let _ = stop_tx.send(());
         let input_task_result = match input_task.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) if error.was_observed() => Ok(()),
             Ok(Err(error)) => Err(error.into()),
-            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) if error.is_cancelled() => {
+                Err("input worker cancelled before cleanup".into())
+            }
             Err(error) => Err(format!("reliable input task failed: {error}").into()),
         };
-        let release_result = release_all(&mut reconciler, &mut desktop);
-        let shutdown_result = merge_results(
-            input_task_result,
-            release_result,
-            "input cleanup also failed",
-        );
+        let shutdown_result = input_task_result;
         let final_result = merge_results(
             stream_result,
             shutdown_result,
@@ -481,8 +479,7 @@ mod linux {
     async fn stream_desktop(
         args: &HostArgs,
         session: &ProductSession,
-        input_rx: &mut mpsc::Receiver<InputLaneEvent>,
-        reconciler: &mut InputReconciler,
+        status_rx: &mut mpsc::Receiver<InputWorkerStatus>,
         desktop: &mut X11DesktopSession,
         capture_plan: CapturePlan,
         mut encoder: Option<&mut SoftwareH264Encoder>,
@@ -495,33 +492,22 @@ mod linux {
         let shutdown = tokio::signal::ctrl_c();
         tokio::pin!(shutdown);
 
-        let expected_input_epoch = session.stamp().authorization_epoch;
         let mut frame_id = 0_u64;
         let mut announced_stream = false;
-        let mut priority = WorkPriority::Input;
         let mut media_drop_log = MediaDropLog::default();
         let mut raw_access_unit = Vec::with_capacity(
             8_usize.saturating_add(nv12_len(stream_config.width, stream_config.height)),
         );
 
         loop {
-            // Shutdown is first in both biased selections. When media and
-            // input are simultaneously ready, alternate their priority so a
-            // permanently full input channel cannot starve video and an
-            // overloaded capture path cannot starve input completion.
-            let work = match priority {
-                WorkPriority::Media => tokio::select! {
-                    biased;
-                    signal_result = &mut shutdown => ScheduledWork::Shutdown(signal_result),
-                    _ = ticker.tick() => ScheduledWork::Media,
-                    input = input_rx.recv() => ScheduledWork::Input(input),
-                },
-                WorkPriority::Input => tokio::select! {
-                    biased;
-                    signal_result = &mut shutdown => ScheduledWork::Shutdown(signal_result),
-                    input = input_rx.recv() => ScheduledWork::Input(input),
-                    _ = ticker.tick() => ScheduledWork::Media,
-                },
+            // Input payloads are serviced by an independent worker. This loop
+            // prioritizes its terminal lifecycle signal over the next media
+            // tick so peer completion and failures remain prompt as well.
+            let work = tokio::select! {
+                biased;
+                signal_result = &mut shutdown => ScheduledWork::Shutdown(signal_result),
+                status = status_rx.recv() => ScheduledWork::Input(status),
+                _ = ticker.tick() => ScheduledWork::Media,
             };
 
             match work {
@@ -530,27 +516,16 @@ mod linux {
                     println!("shutdown: Ctrl-C requested");
                     return Ok(());
                 }
-                ScheduledWork::Input(Some(first)) => {
-                    match service_input_batch(
-                        first,
-                        input_rx,
-                        expected_input_epoch,
-                        reconciler,
-                        desktop,
-                    )
-                    .await?
-                    {
-                        InputBatchOutcome::Continue => {
-                            priority = WorkPriority::after_input();
-                        }
-                        InputBatchOutcome::PeerCompleted => {
-                            println!("session: peer completed normally");
-                            return Ok(());
-                        }
-                    }
+                ScheduledWork::Input(Some(InputWorkerStatus::Completed)) => {
+                    println!("session: peer completed normally");
+                    return Ok(());
+                }
+                ScheduledWork::Input(Some(InputWorkerStatus::Failed(error))) => {
+                    error.mark_observed();
+                    return Err(error.into());
                 }
                 ScheduledWork::Input(None) => {
-                    return Err("reliable input lane task terminated unexpectedly".into());
+                    return Err("input worker terminated without lifecycle status".into());
                 }
                 ScheduledWork::Media => {
                     // Preserve the constraints used during negotiation. Feeding
@@ -580,7 +555,6 @@ mod linux {
                                 ),
                                 Err(H264Error::RecoveryPointRequired) => {
                                     encoder.request_idr();
-                                    priority = WorkPriority::after_media();
                                     continue;
                                 }
                                 Err(error) => return Err(error.into()),
@@ -632,7 +606,6 @@ mod linux {
                             if args.max_frames.is_some_and(|maximum| frame_id >= maximum) {
                                 return Ok(());
                             }
-                            priority = WorkPriority::after_media();
                             continue;
                         }
                         Err(error) => return Err(error.into()),
@@ -662,60 +635,9 @@ mod linux {
                     if args.max_frames.is_some_and(|maximum| frame_id >= maximum) {
                         return Ok(());
                     }
-                    priority = WorkPriority::after_media();
                 }
             }
         }
-    }
-
-    async fn service_input_batch(
-        first: InputLaneEvent,
-        input_rx: &mut mpsc::Receiver<InputLaneEvent>,
-        expected_input_epoch: u32,
-        reconciler: &mut InputReconciler,
-        desktop: &mut X11DesktopSession,
-    ) -> Result<InputBatchOutcome, Box<dyn Error>> {
-        let (events, disconnected) = take_ready_input_batch(first, input_rx);
-        for event in events {
-            match event {
-                InputLaneEvent::Payload(payload) => {
-                    apply_input(&payload, expected_input_epoch, reconciler, desktop)?;
-                }
-                InputLaneEvent::Completed => return Ok(InputBatchOutcome::PeerCompleted),
-                InputLaneEvent::Failed(error) => {
-                    error.mark_observed();
-                    return Err(error.into());
-                }
-            }
-        }
-        if disconnected {
-            return Err("reliable input lane task terminated unexpectedly".into());
-        }
-
-        // Give the signal driver, QUIC driver, and timer wheel an explicit
-        // scheduling point after every bounded input batch.
-        tokio::task::yield_now().await;
-        Ok(InputBatchOutcome::Continue)
-    }
-
-    fn take_ready_input_batch(
-        first: InputLaneEvent,
-        input_rx: &mut mpsc::Receiver<InputLaneEvent>,
-    ) -> (Vec<InputLaneEvent>, bool) {
-        let mut events = Vec::with_capacity(INPUT_BUDGET_PER_TURN);
-        events.push(first);
-        let mut disconnected = false;
-        while events.len() < INPUT_BUDGET_PER_TURN {
-            match input_rx.try_recv() {
-                Ok(event) => events.push(event),
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-        (events, disconnected)
     }
 
     fn apply_input(
@@ -764,6 +686,19 @@ mod linux {
         }
         println!("input: ReleaseAll applied");
         Ok(())
+    }
+
+    fn merge_input_worker_results(
+        work: Result<(), super::InputLaneFailure>,
+        cleanup: Result<(), super::InputLaneFailure>,
+    ) -> Result<(), super::InputLaneFailure> {
+        match (work, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(work_error), Err(cleanup_error)) => Err(super::InputLaneFailure::new(format!(
+                "{work_error}; input cleanup also failed: {cleanup_error}"
+            ))),
+        }
     }
 
     fn attempt_all_injections<A, E: ToString>(
@@ -951,27 +886,23 @@ mod linux {
             assert!(AUTHENTICATION_ATTEMPT_TIMEOUT < Duration::from_secs(3_600));
         }
 
-        #[tokio::test]
-        async fn ready_input_batch_never_exceeds_budget() {
-            let (sender, mut receiver) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
-            for sequence in 0..(INPUT_BUDGET_PER_TURN + 3) {
-                sender
-                    .send(InputLaneEvent::Payload(Bytes::from(vec![sequence as u8])))
-                    .await
-                    .expect("queue input");
-            }
-
-            let first = receiver.recv().await.expect("first input");
-            let (batch, disconnected) = take_ready_input_batch(first, &mut receiver);
-            assert_eq!(batch.len(), INPUT_BUDGET_PER_TURN);
-            assert!(!disconnected);
-            assert_eq!(receiver.len(), 3);
+        #[test]
+        fn input_worker_status_channel_is_bounded() {
+            let (sender, _receiver) = mpsc::channel(INPUT_STATUS_CAPACITY);
+            assert_eq!(sender.capacity(), INPUT_STATUS_CAPACITY);
+            sender
+                .try_send(InputWorkerStatus::Completed)
+                .expect("one terminal status fits");
+            assert!(sender.try_send(InputWorkerStatus::Completed).is_err());
         }
 
         #[test]
-        fn ready_work_priority_alternates_deterministically() {
-            assert_eq!(WorkPriority::after_input(), WorkPriority::Media);
-            assert_eq!(WorkPriority::after_media(), WorkPriority::Input);
+        fn input_worker_cleanup_failure_is_never_hidden() {
+            let work = Err(super::super::InputLaneFailure::new("input failed".into()));
+            let cleanup = Err(super::super::InputLaneFailure::new("release failed".into()));
+            let error = merge_input_worker_results(work, cleanup).expect_err("both fail");
+            assert!(error.to_string().contains("input failed"));
+            assert!(error.to_string().contains("release failed"));
         }
 
         #[test]
