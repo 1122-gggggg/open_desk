@@ -32,6 +32,10 @@ def valid_result(**overrides: object) -> dict[str, object]:
         "host_exact_mtls_log": True,
         "client_exact_mtls_log": True,
         "client_fallback_selected": True,
+        "first_session_completed": True,
+        "host_survived_first_session": True,
+        "successor_session_distinct": True,
+        "release_all_between_sessions": True,
         "host_session_id": 73,
         "client_session_id": 73,
         "received_session_id": 73,
@@ -52,6 +56,29 @@ class OutputParsingTests(unittest.TestCase):
 
         self.assertEqual(secure_connect_test.parse_host_session_id(host), 9123)
         self.assertEqual(secure_connect_test.parse_client_session_id(client), 9123)
+
+    def test_parses_successor_session_ids_and_monotonic_lifecycle(self) -> None:
+        output = """session: active session_id=41
+session-lifecycle: generation=1 authorization_epoch=1 display_epoch=1 codec_epoch=1
+session: active session_id=42
+session-lifecycle: generation=2 authorization_epoch=2 display_epoch=2 codec_epoch=2
+"""
+        self.assertEqual(secure_connect_test.parse_host_session_ids(output), [41, 42])
+        self.assertEqual(
+            secure_connect_test.parse_host_lifecycles(output),
+            [(1, 1, 1, 1), (2, 2, 2, 2)],
+        )
+        client_output = """handshake: active session_id=41
+received: session_id=41 frames=3
+handshake: active session_id=42
+received: session_id=42 frames=3
+"""
+        self.assertEqual(
+            secure_connect_test.parse_client_session_ids(client_output), [41, 42]
+        )
+        self.assertEqual(
+            secure_connect_test.parse_received_all(client_output), [(41, 3), (42, 3)]
+        )
 
     def test_does_not_accept_legacy_or_malformed_session_logs(self) -> None:
         self.assertIsNone(
@@ -118,6 +145,22 @@ class FailClosedValidationTests(unittest.TestCase):
 
         self.assertFalse(checks["client_fallback_selected"])
         self.assertTrue(any("fallback" in error for error in errors))
+
+    def test_successor_requires_first_cleanup_and_distinct_session(self) -> None:
+        checks, errors = self.validate(
+            first_session_completed=False,
+            host_survived_first_session=False,
+            successor_session_distinct=False,
+            release_all_between_sessions=False,
+        )
+        for name in (
+            "first_session_completed",
+            "host_survived_first_session",
+            "successor_session_distinct",
+            "release_all_between_sessions",
+        ):
+            self.assertFalse(checks[name])
+        self.assertGreaterEqual(len(errors), 4)
 
     def test_rogue_must_exit_itself_before_product_session(self) -> None:
         checks, errors = self.validate(rogue_timed_out=True, rogue_session_id=73)
@@ -206,7 +249,11 @@ class CommandConstructionTests(unittest.TestCase):
         self.assertIn("--max-height", host)
         self.assertIn("--fps", host)
         self.assertEqual(host[host.index("--frames") + 1], "16")
+        self.assertEqual(host[host.index("--max-sessions") + 1], "2")
+        self.assertEqual(rogue.count("--frames"), 1)
+        self.assertEqual(rogue[rogue.index("--frames") + 1], "1")
         self.assertEqual(client[client.index("--frames") + 1], "8")
+        self.assertEqual(client[client.index("--session-count") + 1], "2")
         self.assertEqual(client[client.index("--connect") + 1], "127.0.0.1:34568")
         self.assertEqual(
             client[client.index("--fallback-address") + 1], "127.0.0.1:34567"

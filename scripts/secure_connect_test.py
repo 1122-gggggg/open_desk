@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Fail-closed Linux X11 process smoke for LatencyDesk's secure QUIC path.
 
-The test deliberately uses three short-lived identities.  A client presenting
-the rogue identity must be rejected without terminating the host; the pinned
-client must then establish the product session and reassemble real X11 frames.
+The test deliberately uses three short-lived identities. A client presenting
+the rogue identity must be rejected without terminating the host; one pinned
+Client process must then create two sequential connections with distinct,
+monotonic product sessions and reassemble real X11 frames. ReleaseAll must occur
+between the two sessions.
 No identity material or command containing private-key paths is written to the
 JSON artifact.
 """
@@ -48,11 +50,15 @@ HOST_REJECTION_MARKER = "mTLS: rejected unauthenticated connection"
 HOST_STREAM_MARKER = "stream: NV12"
 HOST_SHUTDOWN_MARKER = "shutdown: Ctrl-C requested"
 HOST_PEER_COMPLETED_MARKER = "session: peer completed normally"
-CLIENT_MTLS_MARKER = "transport: QUIC v1 / TLS 1.3 / exact-certificate mTLS"
+CLIENT_MTLS_MARKER = "mTLS: exact host certificate authenticated"
 ROGUE_REJECTION_MARKER = "exact-peer mTLS connection failed"
 
 HOST_SESSION_RE = re.compile(
     r"^session:\s*active\s+session_id=(\d+)\s*$", re.IGNORECASE | re.MULTILINE
+)
+HOST_LIFECYCLE_RE = re.compile(
+    r"^session-lifecycle:\s*generation=(\d+)\s+authorization_epoch=(\d+)\s+display_epoch=(\d+)\s+codec_epoch=(\d+)\s*$",
+    re.IGNORECASE | re.MULTILINE,
 )
 CLIENT_SESSION_RE = re.compile(
     r"^handshake:\s*active\s+session_id=(\d+)\s*$", re.IGNORECASE | re.MULTILINE
@@ -236,9 +242,21 @@ def parse_host_session_id(output: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def parse_host_session_ids(output: str) -> list[int]:
+    return [int(value) for value in HOST_SESSION_RE.findall(output)]
+
+
+def parse_host_lifecycles(output: str) -> list[tuple[int, int, int, int]]:
+    return [tuple(int(value) for value in match) for match in HOST_LIFECYCLE_RE.findall(output)]
+
+
 def parse_client_session_id(output: str) -> int | None:
     match = CLIENT_SESSION_RE.search(output)
     return int(match.group(1)) if match else None
+
+
+def parse_client_session_ids(output: str) -> list[int]:
+    return [int(value) for value in CLIENT_SESSION_RE.findall(output)]
 
 
 def parse_received(output: str) -> tuple[int | None, int]:
@@ -249,11 +267,19 @@ def parse_received(output: str) -> tuple[int | None, int]:
     return int(session), int(frames)
 
 
+def parse_received_all(output: str) -> list[tuple[int, int]]:
+    return [(int(session), int(frames)) for session, frames in RECEIVED_RE.findall(output)]
+
+
 def parse_client_route(output: str) -> tuple[str | None, int]:
-    match = CLIENT_ROUTE_RE.search(output)
-    if match is None:
+    routes = parse_client_routes(output)
+    if not routes:
         return None, 0
-    return match.group(1), int(match.group(2))
+    return routes[0]
+
+
+def parse_client_routes(output: str) -> list[tuple[str, int]]:
+    return [(remote, int(count)) for remote, count in CLIENT_ROUTE_RE.findall(output)]
 
 
 def sanitize_log(text: str, sensitive_root: Path, limit: int = TAIL_CHARS) -> str:
@@ -334,6 +360,8 @@ def build_secure_commands(
         str(fps),
         "--frames",
         str(host_frames),
+        "--max-sessions",
+        "2",
     ]
     rogue_command = [
         str(client_bin),
@@ -370,6 +398,8 @@ def build_secure_commands(
         str(valid_pairing_timeout),
         "--frames",
         str(client_frames),
+        "--session-count",
+        "2",
     ]
     return host_command, rogue_command, valid_command
 
@@ -393,6 +423,10 @@ def validate_secure_result(
     host_exact_mtls_log: bool,
     client_exact_mtls_log: bool,
     client_fallback_selected: bool,
+    first_session_completed: bool,
+    host_survived_first_session: bool,
+    successor_session_distinct: bool,
+    release_all_between_sessions: bool,
     host_session_id: int | None,
     client_session_id: int | None,
     received_session_id: int | None,
@@ -426,6 +460,10 @@ def validate_secure_result(
         "host_exact_mtls_log": host_exact_mtls_log,
         "client_exact_mtls_log": client_exact_mtls_log,
         "client_fallback_selected": client_fallback_selected,
+        "first_session_completed": first_session_completed,
+        "host_survived_first_session": host_survived_first_session,
+        "successor_session_distinct": successor_session_distinct,
+        "release_all_between_sessions": release_all_between_sessions,
         "product_session_nonzero": (
             host_session_id is not None
             and client_session_id is not None
@@ -465,6 +503,10 @@ def validate_secure_result(
         "client_fallback_selected": (
             "valid client did not authenticate through the configured fallback address"
         ),
+        "first_session_completed": "first valid session did not receive its requested frames",
+        "host_survived_first_session": "host listener exited before the successor session",
+        "successor_session_distinct": "successor session did not receive a fresh lifecycle identity",
+        "release_all_between_sessions": "ReleaseAll was not completed before successor activation",
         "product_session_nonzero": "both ProductSession IDs must be present and nonzero",
         "product_session_ids_match": (
             f"ProductSession ID mismatch host={host_session_id!r} client={client_session_id!r}"
@@ -566,7 +608,7 @@ def new_report(
 ) -> dict[str, object]:
     revision, dirty = repository_state()
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "status": "pending",
         "ok": False,
@@ -594,6 +636,7 @@ def new_report(
             "capture": "Linux X11 pixels; asserted only after completed client reassembly",
             "viewer": "headless frame reassembly only; no interactive rendering asserted",
             "input": "ReleaseAll transport/host handling only; no visible input effect asserted",
+            "successor": "two sequential exact-pinned sessions on one Host endpoint; no abrupt-loss or interactive reconnect claim",
             "competitive_claim": "not evidence of superiority over AnyDesk or RustDesk",
         },
         "credentials": {
@@ -633,12 +676,18 @@ def run_secure_smoke(
         "host_timed_out": False,
         "client_exit": None,
         "client_timed_out": False,
+        "first_client_session_id": None,
+        "first_client_received_frames": 0,
         "host_shutdown_requested": False,
         "host_graceful_shutdown_log": False,
         "host_peer_completed_log": False,
         "host_exact_mtls_log": False,
         "client_exact_mtls_log": False,
         "client_fallback_selected": False,
+        "first_session_completed": False,
+        "host_survived_first_session": False,
+        "successor_session_distinct": False,
+        "release_all_between_sessions": False,
         "host_session_id": None,
         "client_session_id": None,
         "received_session_id": None,
@@ -726,18 +775,9 @@ def run_secure_smoke(
             15.0,
             (valid_pairing * 2.0) + (args.frames / args.fps) + 5.0,
         )
-        client_received_marker = client_process.wait_for_text(
-            "received: session_id=", valid_process_timeout
-        )
-        if client_received_marker:
-            observation["host_shutdown_requested"] = (
-                host_process.request_graceful_interrupt()
-            )
-        client_exit, client_timed_out = client_process.finish(5.0)
+        client_exit, client_timed_out = client_process.finish(valid_process_timeout)
         observation["client_exit"] = client_exit
-        observation["client_timed_out"] = (
-            not client_received_marker or client_timed_out
-        )
+        observation["client_timed_out"] = client_timed_out
         client_output = client_process.output()
 
         host_exit, host_timed_out = host_process.finish(
@@ -781,7 +821,7 @@ def run_secure_smoke(
     }
 
     observation["host_exact_mtls_log"] = (
-        HOST_MTLS_MARKER.lower() in host_output.lower()
+        host_output.lower().count(HOST_MTLS_MARKER.lower()) >= 2
     )
     observation["rogue_rejection_logged"] = bool(
         observation["rogue_rejection_logged"]
@@ -793,19 +833,73 @@ def run_secure_smoke(
         HOST_PEER_COMPLETED_MARKER.lower() in host_output.lower()
     )
     observation["client_exact_mtls_log"] = (
-        CLIENT_MTLS_MARKER.lower() in client_output.lower()
+        client_output.lower().count(CLIENT_MTLS_MARKER.lower()) >= 2
     )
-    selected_remote, candidate_attempts = parse_client_route(client_output)
+    client_routes = parse_client_routes(client_output)
+    selected_remote, candidate_attempts = client_routes[-1] if client_routes else (None, 0)
     observation["client_fallback_selected"] = (
         listen_addr is not None
-        and selected_remote == listen_addr
-        and candidate_attempts >= 2
+        and len(client_routes) >= 2
+        and all(remote == listen_addr and attempts >= 2 for remote, attempts in client_routes[-2:])
     )
-    observation["host_session_id"] = parse_host_session_id(host_output)
-    observation["client_session_id"] = parse_client_session_id(client_output)
-    received_session, received_frames = parse_received(client_output)
+    host_session_ids = parse_host_session_ids(host_output)
+    host_lifecycles = parse_host_lifecycles(host_output)
+    client_session_ids = parse_client_session_ids(client_output)
+    received_sessions = parse_received_all(client_output)
+    observation["host_session_id"] = host_session_ids[-1] if host_session_ids else None
+    observation["client_session_id"] = client_session_ids[-1] if client_session_ids else None
+    received_session, received_frames = received_sessions[-1] if received_sessions else (None, 0)
     observation["received_session_id"] = received_session
     observation["received_frames"] = received_frames
+    first_client_session_id = client_session_ids[-2] if len(client_session_ids) >= 2 else None
+    first_received_session, first_received_frames = (
+        received_sessions[-2] if len(received_sessions) >= 2 else (None, 0)
+    )
+    observation["first_client_session_id"] = first_client_session_id
+    observation["first_client_received_frames"] = first_received_frames
+    observation["first_session_completed"] = (
+        first_client_session_id is not None
+        and first_received_session == first_client_session_id
+        and first_received_frames >= args.frames
+    )
+    successor_client_session_id = observation["client_session_id"]
+    lifecycle_advanced = (
+        len(host_lifecycles) >= 2
+        and all(
+            current > previous
+            for previous, current in zip(host_lifecycles[-2], host_lifecycles[-1])
+        )
+    )
+    observation["successor_session_distinct"] = (
+        len(host_session_ids) >= 2
+        and first_client_session_id is not None
+        and successor_client_session_id is not None
+        and host_session_ids[-2] == first_client_session_id
+        and host_session_ids[-1] == successor_client_session_id
+        and host_session_ids[-2] != host_session_ids[-1]
+        and lifecycle_advanced
+    )
+    if len(host_session_ids) >= 2:
+        first_marker = host_output.find(
+            f"session: active session_id={host_session_ids[-2]}"
+        )
+        successor_marker = host_output.find(
+            f"session: active session_id={host_session_ids[-1]}", first_marker + 1
+        )
+        release_marker = host_output.find("input: ReleaseAll applied", first_marker + 1)
+        observation["release_all_between_sessions"] = (
+            first_marker >= 0
+            and release_marker > first_marker
+            and successor_marker > release_marker
+        )
+        waiting_marker = host_output.find(
+            "listener: waiting for authenticated successor session", first_marker + 1
+        )
+        observation["host_survived_first_session"] = (
+            first_marker >= 0
+            and waiting_marker > first_marker
+            and successor_marker > waiting_marker
+        )
 
     checks, errors = validate_secure_result(
         identity_generation_ok=bool(observation["identity_generation_ok"]),
@@ -825,6 +919,10 @@ def run_secure_smoke(
         host_exact_mtls_log=bool(observation["host_exact_mtls_log"]),
         client_exact_mtls_log=bool(observation["client_exact_mtls_log"]),
         client_fallback_selected=bool(observation["client_fallback_selected"]),
+        first_session_completed=bool(observation["first_session_completed"]),
+        host_survived_first_session=bool(observation["host_survived_first_session"]),
+        successor_session_distinct=bool(observation["successor_session_distinct"]),
+        release_all_between_sessions=bool(observation["release_all_between_sessions"]),
         host_session_id=observation["host_session_id"],
         client_session_id=observation["client_session_id"],
         received_session_id=observation["received_session_id"],
@@ -843,13 +941,20 @@ def run_secure_smoke(
             "results": {
                 "host_exit": observation["host_exit"],
                 "rogue_client_exit": observation["rogue_exit"],
-                "valid_client_exit": observation["client_exit"],
+                "valid_client_successor_sequence_exit": observation["client_exit"],
                 "host_session_id": observation["host_session_id"],
+                "host_session_ids": host_session_ids,
+                "host_lifecycles": host_lifecycles,
+                "first_client_session_id": observation["first_client_session_id"],
+                "first_client_received_frames": observation["first_client_received_frames"],
                 "client_session_id": observation["client_session_id"],
+                "client_session_ids": client_session_ids,
                 "received_session_id": observation["received_session_id"],
                 "received_frames": observation["received_frames"],
+                "received_sessions": received_sessions,
                 "selected_remote": selected_remote,
                 "candidate_attempts": candidate_attempts,
+                "client_routes": client_routes,
                 "host_shutdown_mode": (
                     "peer_completed"
                     if observation["host_peer_completed_log"]
