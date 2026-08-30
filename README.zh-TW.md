@@ -22,7 +22,7 @@ Client。
 | 其他 Client | 已有可攜式軟體 Viewer（OpenH264／raw NV12 顯示與輸入轉送），並保留 headless 收幀及 input probe | Alpha 實作；跨機器與原生 UX 證據仍待完成 |
 | Windows Host | 因真實 capture/input provider 尚未接線，安全 Host 會在開 socket 前拒絕執行 | 不支援 |
 | 媒體 | raw NV12 分片後以 QUIC DATAGRAM 傳輸；沒有正式 H.264／AV1 encode/decode 路徑 | 僅適合低解析 LAN preview |
-| WAN 連線 | 只能 direct IP；沒有 rendezvous、NAT traversal、relay、discovery 或無縫 reconnect | 未實作 |
+| WAN 連線 | Direct IP，並可為同一台 exact-pinned Host 同時競速最多 4 個已知位址 | 已實作 alternate-address failover；尚無 rendezvous、NAT traversal、relay、discovery 或 active-session reconnect |
 | 發行 | 沒有受支援的簽章安裝程式、更新器或正式服務 | 未實作 |
 | 舊傳輸 | 明文自製 UDP，必須明確加入 `--unsafe-udp-lab` | 僅限本機相容性測試 |
 
@@ -155,6 +155,10 @@ cargo run --locked -p latencydesk-client -- \
 `--frames 60`。可攜式 Viewer 仍是 Alpha 軟體路徑；跨機器呈現、可見輸入
 效果、resize／DPI 與長時間復原仍是產品就緒度 gate，不能視為已驗證支援。
 
+`--fallback-address` 為選用參數，最多可重複 3 次。所有位址都必須是同一張 Host
+certificate；Client 會同時競速，只採用第一條完成 exact-pinned TLS 驗證的路徑。
+這是已知位址 failover，不是 ICE／STUN／TURN，也不是未驗證的 proxy。
+
 ### 4. 同時開啟多台 exact-pinned Host
 
 每台 Host 各加入一組可重複的 `--target`。所有 Host 都必須信任同一張 Client
@@ -198,6 +202,10 @@ RustDesk 或其他產品的比較，都必須使用相同內容、codec／品質
 硬體、display mode 與網路條件，並提供重複試驗、raw data 及第三方重現。
 缺漏或為零的指標不能當作證據。量化門檻請見
 [產品就緒度](docs/PRODUCT_READINESS.md)。
+
+只有 `scripts/optical_latency_benchmark.py superiority-gate` 可以把延遲門檻標為
+通過。它要求 LAN 與 WAN 的 matched raw physical samples，預設至少改善 20% p95、
+p95 confidence interval 不重疊，且 p99 不得退步。
 
 ## 安全與授權
 

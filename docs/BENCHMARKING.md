@@ -11,6 +11,11 @@ LatencyDesk cannot be validated by encoder API timings alone. The benchmark suit
 
 Only category 4 supports a broad latency claim. Host and client monotonic timestamps belong to different clock domains and cannot be directly subtracted.
 
+The strict optical comparison CLI accepts superiority evidence only when it can
+parse and hash the raw samples itself, at least 30 analyzed physical repetitions
+remain after warm-up, and the p95 bootstrap interval is informative. Metrics-only
+JSON and caller-asserted hashes are development inputs, not admissible proof.
+
 ## 2. Required per-frame telemetry
 
 Host-local:
@@ -117,6 +122,23 @@ For AnyDesk, RustDesk, Sunshine/Moonlight, Parsec, RDP, or another system:
 - report failures, disconnects, black frames, and recovery time.
 
 A valid conclusion is workload-specific, for example: “On the defined 1440p120 LAN IDE workload and reference hardware, LatencyDesk commit X had lower optical p95 input-to-photon than product Y version Z.” It is not “faster everywhere.”
+
+The machine gate requires at least one matched LAN profile (RTT <= 5 ms), one
+matched WAN profile (RTT >= 20 ms), a 20% p95 improvement by default,
+non-overlapping p95 bootstrap confidence intervals, and no p99 regression:
+
+```bash
+python3 scripts/optical_latency_benchmark.py superiority-gate \
+  --pair artifacts/anydesk-lan.json artifacts/latencydesk-lan.json \
+  --pair artifacts/anydesk-wan.json artifacts/latencydesk-wan.json \
+  --min-p95-improvement-percent 20 \
+  --max-p99-regression-percent 0 \
+  --json
+```
+
+A passing gate remains scoped to the exact hardware, workload, codec, quality,
+display, and network profiles in the reports. Independent reproduction is still
+required before a public superiority claim.
 
 ## 8. M6 desktop-refinement gates
 

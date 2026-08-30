@@ -23,7 +23,7 @@ Windows client on a trusted, low-latency LAN.
 | Other clients | Portable software viewer with OpenH264/raw-NV12 presentation and input forwarding; headless receive and input probe remain available | Alpha implementation; cross-machine and native-UX evidence pending |
 | Windows host | Secure hosting is rejected before opening a socket because real capture/input providers are not connected | Unsupported |
 | Media | Raw NV12 fragmented across QUIC DATAGRAMs; no production H.264/AV1 encode/decode path | Low-resolution LAN preview only |
-| WAN connectivity | Direct IP only; no rendezvous, NAT traversal, relay, discovery, or seamless reconnect | Not implemented |
+| WAN connectivity | Direct IP plus a bounded race across up to four known exact-pinned addresses for the same Host | Alternate-address failover implemented; no rendezvous, NAT traversal, relay, discovery, or active-session reconnect |
 | Distribution | No supported signed installer, updater, or production service | Not implemented |
 | Legacy transport | Plaintext custom UDP, available only with explicit `--unsafe-udp-lab` | Local compatibility test only |
 
@@ -164,6 +164,11 @@ For a bounded headless receive check on any supported client platform, add
 rendering, input effects, resize/DPI behavior, and long-duration recovery remain
 product-readiness gates rather than verified support claims.
 
+`--fallback-address` is optional and repeatable up to three times. Every address
+must identify the same Host certificate; the Client races them concurrently and
+uses only the first path that completes exact-pinned TLS authentication. This is
+known-address failover, not ICE/STUN/TURN or an unauthenticated proxy.
+
 ### 4. Open several exact-pinned Hosts concurrently
 
 Use one repeatable `--target` entry per Host. Each Host must trust the same
@@ -211,6 +216,11 @@ same content, codec/quality, resolution, frame rate, hardware, display mode,
 network profile, repeated trials, raw data, and third-party reproducibility.
 Missing or zero metrics are not evidence. See the quantitative gates in
 [Product readiness](docs/PRODUCT_READINESS.md).
+
+`scripts/optical_latency_benchmark.py superiority-gate` is the only automated
+path that may mark the latency threshold as passed. It requires raw physical
+samples from matched LAN and WAN profiles, a 20% p95 improvement by default,
+non-overlapping p95 confidence intervals, and no p99 regression.
 
 ## Security and license
 
