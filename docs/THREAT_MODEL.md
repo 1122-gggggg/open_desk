@@ -77,6 +77,12 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
 - timeouts for incomplete frames and handshakes;
 - fuzz targets for wire, reassembly, input, tile, and local IPC parsers;
 - no recursion controlled by peer input.
+- a multi-target supervisor installs cancellation handling before the first
+  direct child spawn; cancellation kills and reaps each direct child under a
+  fixed deadline and joins pipe-draining threads only after process EOF;
+- failure to kill, wait, or reap is an explicit orphan-risk error and can never
+  be reported as clean cancellation. Descendant process-tree containment still
+  requires a later platform job/process-group abstraction.
 
 ### Privilege separation
 

@@ -16,7 +16,7 @@ Client。
 | 安全傳輸 | Quinn QUIC 上僅允許 TLS 1.3 的 mTLS；雙方 pin 並逐 byte 檢查預期 leaf certificate；不會自動降級 UDP | 預設產品路徑；in-process 測試通過 |
 | 裝置身分 | `latencydesk-identity` 產生持久的 self-signed certificate DER 與 PKCS#8 private-key DER，且不覆寫現有身分 | 已實作；certificate 仍須手動交換 |
 | 控制與輸入 | 已驗證的產品握手、帶 session stamp 的可靠 QUIC lane；input 優先權高於 control；Client／Host 會明確協商 capability，Linux opt-in probe 只在 XTEST 加後續 X11 sync reply 完成後取得完整 stamp ACK | 已有單 target 與同時多 target 的 application-ACK 程序證據；實體 input-to-photon 仍待完成 |
-| 同時連線多台 Host | 可重複使用 `--target <ADDR>,<PEER_CERT>`，以 2–16 個隔離的安全 Client 子程序同時開啟多台 exact-pinned Host | 單機 2／4 target gate 每台保留 256 筆、8／16 target 每台保留 1024 筆互相重疊的 raw input-ACK 與精確 process-group／資源快照；壞 target 不會中止健康 target；跨機器 soak 仍待完成 |
+| 同時連線多台 Host | 可重複使用 `--target <ADDR>,<PEER_CERT>`，以 2–16 個隔離的安全 Client 子程序同時開啟多台 exact-pinned Host | 單機 2／4 target gate 每台保留 256 筆、8／16 target 每台保留 1024 筆互相重疊的 raw input-ACK 與精確 process-group／資源快照；壞 target 不會中止健康 target，Ctrl-C 會以有界 kill／reap 及 output-forwarder join 收尾；跨機器 soak 仍待完成 |
 | Linux Host | 真實 X11 root 擷取、CPU BGRA-to-NV12 轉換，以及在獨立連線／task 中執行、不受擷取與軟體編碼阻塞的 XTEST 輸入 | 安全 Alpha 路徑；X11 到 headless 的 process loopback 已驗證，可見輸入延遲與跨機器呈現仍待完成 |
 | Successor session | Linux X11 Host 可保留同一個 endpoint，依序接受 1–16 個 exact-pinned session；headless Client 支援 clean sequence，亦可對已驗證 QUIC reset／idle timeout 做有界恢復；每個 successor 都在 ReleaseAll 後取得新 identity 與嚴格遞增 epoch | Clean 與 loopback blackhole recovery 已實作；互動式 reconnect、Windows Host persistence、實體 handoff 與跨機器 soak 仍待完成 |
 | Windows Client | 嚴格 raw-NV12 驗證、Direct3D 11 Viewer、有界 latest-frame 呈現及原生輸入轉送；`--frames` 可 headless 執行 | 安全 Alpha 路徑；Windows Viewer 跨機器 E2E 證據仍待完成 |
@@ -235,6 +235,13 @@ cargo run --locked -p latencydesk-client -- \
 
 目前上限是 16 組不重複的 address／certificate，且 local bind port 必須為 0。
 此功能是「一個 Client 控制多台 Host」，不代表單一 Host 可接受多個 controller。
+
+Supervisor 會在啟動第一個 child 前安裝 Ctrl-C handler。取消時會停止所有仍在
+執行的直接 child、最多等待 5 秒完成 reap，並只在 process EOF 後 join captured
+output forwarder，最後以非零狀態退出。Linux 程序 gate 會在 4 條 probe session
+互相重疊時只對 supervisor PID 發 SIGINT，接著要求 4 個 child 都已 reap、8 個
+forwarder 都已 join、PID／start-time／執行檔身分全部消失，且各 Host 完成
+ReleaseAll。這還不代表任意 grandchild process tree 或跨機器 GUI soak 已通過。
 
 這是預期的安全操作流程。倉庫已保留成功的單機 X11 到 headless process
 結果，但尚未有跨機器 Windows Viewer 結果。請把失敗視為 Alpha 缺陷，
