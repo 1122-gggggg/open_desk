@@ -144,7 +144,7 @@ impl X11DesktopSession {
         &mut self,
         max_width: u32,
         max_height: u32,
-    ) -> Result<(u32, u32, Vec<u8>), X11DesktopError> {
+    ) -> Result<(u32, u32, &[u8]), X11DesktopError> {
         self.capture_root_bgra()?;
         let src_w = self.screen_width;
         let src_h = self.screen_height;
@@ -166,7 +166,7 @@ impl X11DesktopSession {
                 src_stride,
                 &mut self.nv12_scratch,
             )?;
-            return Ok((src_w, src_h, self.nv12_scratch.clone()));
+            return Ok((src_w, src_h, &self.nv12_scratch));
         }
         let geom = letterbox_scale_bgra_into(
             &self.bgra_scratch,
@@ -185,7 +185,7 @@ impl X11DesktopSession {
             geom.out_width as usize * 4,
             &mut self.nv12_scratch,
         )?;
-        Ok((geom.out_width, geom.out_height, self.nv12_scratch.clone()))
+        Ok((geom.out_width, geom.out_height, &self.nv12_scratch))
     }
 
     pub fn inject(&mut self, action: AppliedInput) -> Result<(), X11DesktopError> {

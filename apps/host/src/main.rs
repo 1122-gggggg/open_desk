@@ -12,7 +12,7 @@ use latencydesk_platform::{
     NativePresentationCompletion, PlatformError, ProviderDiagnostics,
 };
 #[cfg(target_os = "linux")]
-use latencydesk_platform_linux::{pack_nv12_access_unit, X11DesktopSession};
+use latencydesk_platform_linux::{nv12_len, pack_nv12_access_unit_into, X11DesktopSession};
 use latencydesk_protocol::{media_flags, ControlKind, ControlPacket, HelloMessage, MediaKind};
 use latencydesk_runtime::HostMediaBackend;
 use latencydesk_session::authorization::SessionId;
@@ -841,6 +841,9 @@ fn run_host_media_loop(
     let mut last_frame_time = Instant::now();
     #[cfg(target_os = "linux")]
     let mut announced_stream = false;
+    #[cfg(target_os = "linux")]
+    let mut encoded_data =
+        Vec::with_capacity(8_usize.saturating_add(nv12_len(args.max_width, args.max_height)));
 
     loop {
         #[cfg(target_os = "linux")]
@@ -865,7 +868,7 @@ fn run_host_media_loop(
                     println!("stream: nv12 {width}x{height}");
                     announced_stream = true;
                 }
-                let encoded_data = pack_nv12_access_unit(width, height, &nv12);
+                pack_nv12_access_unit_into(width, height, nv12, &mut encoded_data);
                 send_video_frame(session, &encoded_data, frame_id, is_keyframe)?;
                 if frame_id == 1 || frame_id % 60 == 0 {
                     println!("streaming: frame {frame_id} bytes={}", encoded_data.len());

@@ -44,10 +44,21 @@ pub fn nv12_len(width: u32, height: u32) -> usize {
 #[must_use]
 pub fn pack_nv12_access_unit(width: u32, height: u32, nv12: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + nv12.len());
+    pack_nv12_access_unit_into(width, height, nv12, &mut out);
+    out
+}
+
+/// Packs one raw NV12 access unit into caller-owned storage.
+///
+/// Reusing the same output across frames avoids a full-frame allocation in the
+/// raw preview path while preserving the exact wire representation produced by
+/// [`pack_nv12_access_unit`].
+pub fn pack_nv12_access_unit_into(width: u32, height: u32, nv12: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(8_usize.saturating_add(nv12.len()));
     out.extend_from_slice(&width.to_le_bytes());
     out.extend_from_slice(&height.to_le_bytes());
     out.extend_from_slice(nv12);
-    out
 }
 
 pub fn parse_nv12_access_unit(bytes: &[u8]) -> Option<(u32, u32, &[u8])> {
@@ -475,6 +486,20 @@ mod tests {
     fn pack_and_parse_round_trip() {
         let payload = vec![1u8, 2, 3, 4, 5, 6];
         let packed = pack_nv12_access_unit(2, 2, &payload);
+        let (w, h, body) = parse_nv12_access_unit(&packed).expect("parse");
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(body, payload.as_slice());
+    }
+
+    #[test]
+    fn pack_into_reuses_reserved_output_storage() {
+        let payload = vec![1u8, 2, 3, 4, 5, 6];
+        let mut packed = Vec::with_capacity(64);
+        let allocation = packed.as_ptr();
+
+        pack_nv12_access_unit_into(2, 2, &payload, &mut packed);
+
+        assert_eq!(packed.as_ptr(), allocation);
         let (w, h, body) = parse_nv12_access_unit(&packed).expect("parse");
         assert_eq!((w, h), (2, 2));
         assert_eq!(body, payload.as_slice());

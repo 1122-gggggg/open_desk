@@ -31,7 +31,8 @@ mod desktop_convert;
 pub use desktop_convert::{
     bgra_to_nv12_bt601_limited, even_dimension, letterbox_geom, letterbox_scale_bgra,
     map_letterboxed_pointer, nv12_len, nv12_to_argb_u32, pack_nv12_access_unit,
-    parse_nv12_access_unit, yuv_to_rgb_bt601_limited, ConvertError, LetterboxGeom,
+    pack_nv12_access_unit_into, parse_nv12_access_unit, yuv_to_rgb_bt601_limited, ConvertError,
+    LetterboxGeom,
 };
 
 #[cfg(target_os = "linux")]

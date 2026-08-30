@@ -86,7 +86,9 @@ mod linux {
     use bytes::Bytes;
     use latencydesk_h264::{H264Error, LowDelayPolicy, SoftwareH264Encoder};
     use latencydesk_input::{InputMessage, InputReconciler, ReconcileOutcome};
-    use latencydesk_platform_linux::{letterbox_geom, pack_nv12_access_unit, X11DesktopSession};
+    use latencydesk_platform_linux::{
+        letterbox_geom, nv12_len, pack_nv12_access_unit_into, X11DesktopSession,
+    };
     use latencydesk_protocol::{
         media_flags, select_host_codec, ControlKind, MediaKind, VideoCodec, VideoCodecCapabilities,
         VideoProfile, VideoStreamConfig, VIDEO_CODEC_CONTRACT_VERSION,
@@ -98,6 +100,7 @@ mod linux {
     use latencydesk_socket_transport::product::{ProductSession, ProductSessionError};
     use latencydesk_socket_transport::quic::{bind_server, QuicTransportError};
     use latencydesk_transport::FragmentSpec;
+    use std::borrow::Cow;
     use std::error::Error;
     use std::num::NonZeroU64;
     use std::path::Path;
@@ -484,6 +487,9 @@ mod linux {
         let mut announced_stream = false;
         let mut priority = WorkPriority::Input;
         let mut media_drop_log = MediaDropLog::default();
+        let mut raw_access_unit = Vec::with_capacity(
+            8_usize.saturating_add(nv12_len(stream_config.width, stream_config.height)),
+        );
 
         loop {
             // Shutdown is first in both biased selections. When media and
@@ -549,9 +555,9 @@ mod linux {
                         as u64;
                     let (frame, is_keyframe, dependency, encoded_frame_id) =
                         if let Some(encoder) = encoder.as_mut() {
-                            match encoder.encode_nv12(&nv12, capture_timestamp_ns) {
+                            match encoder.encode_nv12(nv12, capture_timestamp_ns) {
                                 Ok(unit) => (
-                                    unit.bytes,
+                                    Cow::Owned(unit.bytes),
                                     unit.meta.recovery_point,
                                     unit.meta.dependency_frame_id,
                                     unit.meta.frame_id,
@@ -568,8 +574,9 @@ mod linux {
                             let keyframe_interval =
                                 u64::from(stream_config.fps).saturating_mul(2).max(1);
                             let is_keyframe = frame_id == 1 || frame_id % keyframe_interval == 0;
+                            pack_nv12_access_unit_into(width, height, nv12, &mut raw_access_unit);
                             (
-                                pack_nv12_access_unit(width, height, &nv12),
+                                Cow::Borrowed(raw_access_unit.as_slice()),
                                 is_keyframe,
                                 (!is_keyframe).then_some(frame_id - 1),
                                 frame_id,

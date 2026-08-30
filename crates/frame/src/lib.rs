@@ -6,7 +6,7 @@ use latencydesk_media::{
     TileRefinementMeta,
 };
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 /// Maximum raw frame allocation accepted by the deterministic laboratory.
@@ -321,6 +321,7 @@ pub enum FrameError {
     CorruptedTilePayload,
     StaleEpoch { expected: u32, actual: u32 },
     TileCacheLimitExceeded,
+    TileCacheInvariant,
 }
 
 impl fmt::Display for FrameError {
@@ -997,7 +998,8 @@ impl TileChangeDetector {
     pub fn reset(&mut self, grid: TileGrid, display_epoch: u32) {
         self.grid = grid;
         self.display_epoch = display_epoch;
-        self.previous_hashes = vec![0_u64; grid.total_tiles()];
+        self.previous_hashes.resize(grid.total_tiles(), 0);
+        self.previous_hashes.fill(0);
         self.initialized = false;
     }
 
@@ -1015,17 +1017,16 @@ impl TileChangeDetector {
         let mut max_y = 0_u32;
 
         let total = self.grid.total_tiles();
-        let mut new_hashes = Vec::with_capacity(total);
+        debug_assert_eq!(self.previous_hashes.len(), total);
 
         for ty in 0..self.grid.tiles_y {
             for tx in 0..self.grid.tiles_x {
                 let coord = TileCoord::new(tx, ty);
                 let (x, y, w, h) = self.grid.tile_bounds(coord)?;
                 let hash = compute_tile_hash(frame, x, y, w, h)?;
-                new_hashes.push(hash);
-
                 let idx = (ty as usize) * (self.grid.tiles_x as usize) + (tx as usize);
                 let is_dirty = !self.initialized || hash != self.previous_hashes[idx];
+                self.previous_hashes[idx] = hash;
 
                 if is_dirty {
                     dirty_tiles.push(coord);
@@ -1039,7 +1040,6 @@ impl TileChangeDetector {
             }
         }
 
-        self.previous_hashes = new_hashes;
         self.initialized = true;
 
         let dirty_rect = if dirty_tiles.is_empty() {
@@ -1475,6 +1475,7 @@ pub struct TileRefinementCache {
     display_epoch: u32,
     grid: Option<TileGrid>,
     entries: HashMap<TileCoord, CachedTileEntry>,
+    lru_index: BTreeSet<(u64, u32, u32)>,
     access_counter: u64,
     stats: TileCacheStats,
 }
@@ -1488,6 +1489,7 @@ impl TileRefinementCache {
             display_epoch,
             grid,
             entries: HashMap::new(),
+            lru_index: BTreeSet::new(),
             access_counter: 0,
             stats: TileCacheStats {
                 cached_tiles: 0,
@@ -1528,6 +1530,7 @@ impl TileRefinementCache {
 
     pub fn invalidate_epoch(&mut self, new_epoch: u32, new_grid: Option<TileGrid>) {
         self.entries.clear();
+        self.lru_index.clear();
         self.current_bytes = 0;
         self.display_epoch = new_epoch;
         self.grid = new_grid;
@@ -1553,40 +1556,89 @@ impl TileRefinementCache {
         packet.validate()?;
         let raw_pixels = packet.decompress_data()?;
         let coord = packet.meta.coord;
-        self.access_counter = self.access_counter.wrapping_add(1);
 
         let entry_size = raw_pixels.len() + std::mem::size_of::<CachedTileEntry>() + 32;
         if entry_size > self.max_bytes {
             return Err(FrameError::TileCacheLimitExceeded);
         }
+        if self.entries.len() != self.lru_index.len() {
+            return Err(FrameError::TileCacheInvariant);
+        }
+        self.advance_access_counter();
 
-        if let Some(existing) = self.entries.get_mut(&coord) {
-            if existing.meta.hash == packet.meta.hash {
-                existing.last_accessed = self.access_counter;
+        let existing = self.entries.get(&coord).map(|entry| {
+            let size = entry.raw_pixels.len() + std::mem::size_of::<CachedTileEntry>() + 32;
+            (entry.last_accessed, entry.meta.hash, size)
+        });
+        if let Some((old_access, old_hash, _)) = existing {
+            if old_hash == packet.meta.hash {
+                if !self.lru_index.remove(&(old_access, coord.x, coord.y)) {
+                    return Err(FrameError::TileCacheInvariant);
+                }
+                self.entries.get_mut(&coord).unwrap().last_accessed = self.access_counter;
+                self.lru_index
+                    .insert((self.access_counter, coord.x, coord.y));
                 self.stats.hits += 1;
                 return Ok(true);
             }
-            let old_size = existing.raw_pixels.len() + std::mem::size_of::<CachedTileEntry>() + 32;
-            self.current_bytes = self.current_bytes.saturating_sub(old_size);
         }
 
-        while self.current_bytes + entry_size > self.max_bytes && !self.entries.is_empty() {
-            let oldest_coord = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_accessed)
-                .map(|(c, _)| *c);
-
-            if let Some(to_evict) = oldest_coord {
-                if let Some(evicted) = self.entries.remove(&to_evict) {
-                    let evicted_size =
-                        evicted.raw_pixels.len() + std::mem::size_of::<CachedTileEntry>() + 32;
-                    self.current_bytes = self.current_bytes.saturating_sub(evicted_size);
-                    self.stats.evictions += 1;
+        let base_bytes = match existing {
+            Some((old_access, _, old_size)) => {
+                if !self.lru_index.contains(&(old_access, coord.x, coord.y)) {
+                    return Err(FrameError::TileCacheInvariant);
                 }
-            } else {
+                self.current_bytes
+                    .checked_sub(old_size)
+                    .ok_or(FrameError::TileCacheInvariant)?
+            }
+            None => self.current_bytes,
+        };
+        let mut freed_bytes = 0_usize;
+        let mut eviction_plan = Vec::new();
+        for &(last_accessed, x, y) in &self.lru_index {
+            let candidate = TileCoord::new(x, y);
+            if candidate == coord {
+                continue;
+            }
+            if base_bytes
+                .saturating_sub(freed_bytes)
+                .checked_add(entry_size)
+                .is_some_and(|total| total <= self.max_bytes)
+            {
                 break;
             }
+            let Some(entry) = self.entries.get(&candidate) else {
+                return Err(FrameError::TileCacheInvariant);
+            };
+            if entry.last_accessed != last_accessed {
+                return Err(FrameError::TileCacheInvariant);
+            }
+            let size = entry.raw_pixels.len() + std::mem::size_of::<CachedTileEntry>() + 32;
+            freed_bytes = freed_bytes
+                .checked_add(size)
+                .ok_or(FrameError::TileCacheInvariant)?;
+            eviction_plan.push(((last_accessed, x, y), candidate));
+        }
+
+        let new_current_bytes = base_bytes
+            .checked_sub(freed_bytes)
+            .and_then(|remaining| remaining.checked_add(entry_size))
+            .filter(|total| *total <= self.max_bytes)
+            .ok_or(FrameError::TileCacheInvariant)?;
+
+        if let Some((old_access, _, _)) = existing {
+            assert!(self.lru_index.remove(&(old_access, coord.x, coord.y)));
+            self.entries
+                .remove(&coord)
+                .expect("planned replacement entry must remain present");
+        }
+        for (lru_key, candidate) in eviction_plan {
+            assert!(self.lru_index.remove(&lru_key));
+            self.entries
+                .remove(&candidate)
+                .expect("planned eviction entry must remain present");
+            self.stats.evictions += 1;
         }
 
         self.entries.insert(
@@ -1598,7 +1650,9 @@ impl TileRefinementCache {
                 last_accessed: self.access_counter,
             },
         );
-        self.current_bytes += entry_size;
+        self.lru_index
+            .insert((self.access_counter, coord.x, coord.y));
+        self.current_bytes = new_current_bytes;
         self.stats.cached_tiles = self.entries.len();
         self.stats.memory_bytes = self.current_bytes;
 
@@ -1606,12 +1660,20 @@ impl TileRefinementCache {
     }
 
     pub fn get(&mut self, coord: TileCoord) -> Option<&[u8]> {
-        self.access_counter = self.access_counter.wrapping_add(1);
+        self.advance_access_counter();
         let counter = self.access_counter;
-        if let Some(entry) = self.entries.get_mut(&coord) {
-            entry.last_accessed = counter;
+        if let Some(old_access) = self.entries.get(&coord).map(|entry| entry.last_accessed) {
+            if !self.lru_index.remove(&(old_access, coord.x, coord.y)) {
+                self.rebuild_lru_index();
+                if !self.lru_index.remove(&(old_access, coord.x, coord.y)) {
+                    self.stats.misses += 1;
+                    return None;
+                }
+            }
+            self.entries.get_mut(&coord).unwrap().last_accessed = counter;
+            self.lru_index.insert((counter, coord.x, coord.y));
             self.stats.hits += 1;
-            Some(&entry.raw_pixels)
+            Some(&self.entries.get(&coord).unwrap().raw_pixels)
         } else {
             self.stats.misses += 1;
             None
@@ -1653,6 +1715,30 @@ impl TileRefinementCache {
             }
         }
         Ok(count)
+    }
+
+    fn advance_access_counter(&mut self) {
+        if self.access_counter == u64::MAX {
+            let mut ordered: Vec<_> = self.entries.keys().copied().collect();
+            ordered.sort_by_key(|coord| self.entries[coord].last_accessed);
+            self.lru_index.clear();
+            for (counter, coord) in ordered.into_iter().enumerate() {
+                let counter = counter as u64;
+                self.entries.get_mut(&coord).unwrap().last_accessed = counter;
+                self.lru_index.insert((counter, coord.x, coord.y));
+            }
+            self.access_counter = self.entries.len() as u64;
+        }
+        self.access_counter += 1;
+    }
+
+    fn rebuild_lru_index(&mut self) {
+        self.lru_index.clear();
+        self.lru_index.extend(
+            self.entries
+                .iter()
+                .map(|(coord, entry)| (entry.last_accessed, coord.x, coord.y)),
+        );
     }
 }
 
@@ -1918,6 +2004,30 @@ mod tests {
     }
 
     #[test]
+    fn tile_change_detector_reuses_hash_storage_across_frames_and_reset() {
+        let grid = TileGrid::new(128, 128, 64).expect("grid");
+        let mut detector = TileChangeDetector::new(grid, 1);
+        let capacity = detector.previous_hashes.capacity();
+        let address = detector.previous_hashes.as_ptr();
+        let frame = FakeCapture::new(FakeCaptureConfig {
+            width: 128,
+            height: 128,
+            format: PixelFormat::Bgra8,
+            pattern: Pattern::Gradient,
+            seed: 1,
+        })
+        .expect("capture")
+        .capture(0)
+        .expect("frame");
+        detector.detect_changes(&frame).expect("detect");
+        assert_eq!(detector.previous_hashes.capacity(), capacity);
+        assert_eq!(detector.previous_hashes.as_ptr(), address);
+        detector.reset(grid, 2);
+        assert_eq!(detector.previous_hashes.capacity(), capacity);
+        assert_eq!(detector.previous_hashes.as_ptr(), address);
+    }
+
+    #[test]
     fn packbits_lossless_round_trip() {
         let original = vec![255_u8; 1024];
         let compressed = compress_packbits(&original).expect("compress");
@@ -2045,6 +2155,80 @@ mod tests {
                 .expect("stale");
         assert!(!cache.put(&p_stale).expect("stale put"));
         assert_eq!(cache.stats().stale_rejections, 1);
+    }
+
+    #[test]
+    fn tile_refinement_cache_rejects_a_missing_lru_index_without_mutation() {
+        let grid = TileGrid::new(64, 64, 64).expect("grid");
+        let mut cache = TileRefinementCache::new(DEFAULT_MAX_CACHE_BYTES, 1, Some(grid));
+        let mut capture = FakeCapture::new(FakeCaptureConfig {
+            width: 64,
+            height: 64,
+            format: PixelFormat::Bgra8,
+            pattern: Pattern::Gradient,
+            seed: 7,
+        })
+        .expect("capture");
+        let first = capture.capture(0).expect("first");
+        let replacement = capture.capture(1).expect("replacement");
+        let coord = TileCoord::new(0, 0);
+        let first_packet =
+            TileRefinementPacket::from_frame(&first, &grid, coord, 1, 1, false).expect("packet");
+        let replacement_packet =
+            TileRefinementPacket::from_frame(&replacement, &grid, coord, 1, 2, false)
+                .expect("replacement packet");
+        cache.put(&first_packet).expect("initial put");
+        let original_bytes = cache.current_bytes;
+        let original_hash = cache.entries[&coord].meta.hash;
+        cache.lru_index.clear();
+
+        assert_eq!(
+            cache.put(&replacement_packet),
+            Err(FrameError::TileCacheInvariant)
+        );
+        assert_eq!(cache.current_bytes, original_bytes);
+        assert_eq!(cache.entries[&coord].meta.hash, original_hash);
+    }
+
+    #[test]
+    fn tile_refinement_cache_plans_eviction_before_replacing_an_entry() {
+        let grid = TileGrid::new(128, 64, 64).expect("grid");
+        let mut cache = TileRefinementCache::new(DEFAULT_MAX_CACHE_BYTES, 1, Some(grid));
+        let mut capture = FakeCapture::new(FakeCaptureConfig {
+            width: 128,
+            height: 64,
+            format: PixelFormat::Bgra8,
+            pattern: Pattern::Gradient,
+            seed: 8,
+        })
+        .expect("capture");
+        let first = capture.capture(0).expect("first");
+        let replacement = capture.capture(1).expect("replacement");
+        let coord0 = TileCoord::new(0, 0);
+        let coord1 = TileCoord::new(1, 0);
+        let p0 = TileRefinementPacket::from_frame(&first, &grid, coord0, 1, 1, false).expect("p0");
+        let p1 = TileRefinementPacket::from_frame(&first, &grid, coord1, 1, 1, false).expect("p1");
+        let replacement_packet =
+            TileRefinementPacket::from_frame(&replacement, &grid, coord0, 1, 2, false)
+                .expect("replacement packet");
+        cache.put(&p0).expect("put p0");
+        cache.put(&p1).expect("put p1");
+        cache.max_bytes = cache.current_bytes / 2 + 1;
+        let p1_access = cache.entries[&coord1].last_accessed;
+        assert!(cache.lru_index.remove(&(p1_access, coord1.x, coord1.y)));
+        cache
+            .lru_index
+            .insert((p1_access.saturating_add(100), coord1.x, coord1.y));
+        let original_bytes = cache.current_bytes;
+        let original_hash = cache.entries[&coord0].meta.hash;
+
+        assert_eq!(
+            cache.put(&replacement_packet),
+            Err(FrameError::TileCacheInvariant)
+        );
+        assert_eq!(cache.current_bytes, original_bytes);
+        assert_eq!(cache.cached_tile_count(), 2);
+        assert_eq!(cache.entries[&coord0].meta.hash, original_hash);
     }
 
     #[test]
