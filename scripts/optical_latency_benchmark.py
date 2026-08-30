@@ -28,6 +28,8 @@ MAX_REPORT_BYTES = 25_000_000
 MAX_SAMPLES = 100_000
 BOOTSTRAP_REPETITIONS = 2000
 BOOTSTRAP_SEED = 42
+MIN_SUPERIORITY_PROFILE_PAIRS = 2
+MAX_SUPERIORITY_PROFILE_PAIRS = 8
 
 OPTICAL_METHODS = {"high_speed_camera", "photodiode_oscilloscope", "microcontroller_optical_rig"}
 VALID_CLOCK_DOMAINS = {"unified_single_clock", "single_oscilloscope", "single_logic_analyzer", "high_speed_camera_frames"}
@@ -534,6 +536,10 @@ def validate_optical_report(
         "analyzed_sample_count": len(latencies) if latencies else metrics_obj.sample_count,
         "warmup_samples": warmup_samples,
         "is_synthetic": is_synthetic,
+        # Comparisons must be based on measurements parsed in this invocation,
+        # never on a claimed metrics/sample hash supplied by a report.
+        "has_raw_samples": bool(latencies),
+        "hash_computed": bool(latencies),
     }
 
     return (
@@ -581,6 +587,19 @@ def optical_comparability_errors(
             errors.append("baseline report is marked as synthetic/template fixture and cannot be used as real benchmark evidence")
         if candidate.provenance.get("is_synthetic"):
             errors.append("candidate report is marked as synthetic/template fixture and cannot be used as real benchmark evidence")
+
+        for role, report in (("baseline", baseline), ("candidate", candidate)):
+            if not report.provenance.get("has_raw_samples"):
+                errors.append(f"{role} report must include raw optical samples or samples_file; metrics-only evidence is not admissible")
+            if not report.provenance.get("hash_computed"):
+                errors.append(f"{role} report requires a SHA-256 hash computed from raw samples")
+            if report.provenance.get("analyzed_sample_count", 0) < 30:
+                errors.append(f"{role} report requires at least 30 analyzed physical samples")
+            if report.metrics.min == report.metrics.max:
+                errors.append(f"{role} report has identical raw samples; superiority comparison is uninformative")
+            p95_ci = report.metrics.ci_95.get("p95") if isinstance(report.metrics.ci_95, dict) else None
+            if not isinstance(p95_ci, (list, tuple)) or len(p95_ci) != 2 or p95_ci[0] == p95_ci[1]:
+                errors.append(f"{role} report has a degenerate p95 bootstrap confidence interval")
 
     for field in (
         "hardware", "resolution", "stream_fps", "refresh_rate_hz", "color_space",
@@ -642,6 +661,195 @@ def compare_optical_reports(baseline: ValidatedOpticalReport, candidate: Validat
         "summary": summary_statement,
         "disclaimer": disclaimer,
     }
+
+
+def load_strict_optical_pair(
+    baseline_path: Path, candidate_path: Path, pair_label: str
+) -> tuple[ValidatedOpticalReport | None, ValidatedOpticalReport | None, list[str]]:
+    errors: list[str] = []
+    baseline_raw, baseline_load_errors = load_optical_report(
+        baseline_path, f"{pair_label}.baseline"
+    )
+    candidate_raw, candidate_load_errors = load_optical_report(
+        candidate_path, f"{pair_label}.candidate"
+    )
+    errors.extend(baseline_load_errors)
+    errors.extend(candidate_load_errors)
+    if errors or baseline_raw is None or candidate_raw is None:
+        return None, None, errors
+
+    baseline, baseline_errors = validate_optical_report(
+        baseline_raw, f"{pair_label}.baseline", base_dir=baseline_path.parent
+    )
+    candidate, candidate_errors = validate_optical_report(
+        candidate_raw, f"{pair_label}.candidate", base_dir=candidate_path.parent
+    )
+    errors.extend(baseline_errors)
+    errors.extend(candidate_errors)
+    if errors or baseline is None or candidate is None:
+        return None, None, errors
+
+    errors.extend(optical_comparability_errors(baseline, candidate))
+    return baseline, candidate, errors
+
+
+def evaluate_superiority_gate(
+    path_pairs: list[tuple[Path, Path]],
+    *,
+    min_p95_improvement_percent: float,
+    max_p99_regression_percent: float,
+) -> tuple[dict[str, Any], list[str]]:
+    errors: list[str] = []
+    if len(path_pairs) < MIN_SUPERIORITY_PROFILE_PAIRS:
+        errors.append(
+            f"superiority gate requires at least {MIN_SUPERIORITY_PROFILE_PAIRS} matched network profiles"
+        )
+    if len(path_pairs) > MAX_SUPERIORITY_PROFILE_PAIRS:
+        errors.append(
+            f"superiority gate accepts at most {MAX_SUPERIORITY_PROFILE_PAIRS} profile pairs"
+        )
+    if not math.isfinite(min_p95_improvement_percent) or min_p95_improvement_percent <= 0:
+        errors.append("minimum p95 improvement must be a finite number greater than zero")
+    if not math.isfinite(max_p99_regression_percent) or max_p99_regression_percent < 0:
+        errors.append("maximum p99 regression must be a finite number greater than or equal to zero")
+
+    validated_pairs: list[tuple[ValidatedOpticalReport, ValidatedOpticalReport]] = []
+    if len(path_pairs) <= MAX_SUPERIORITY_PROFILE_PAIRS:
+        for index, (baseline_path, candidate_path) in enumerate(path_pairs, start=1):
+            baseline, candidate, pair_errors = load_strict_optical_pair(
+                baseline_path, candidate_path, f"pair[{index}]"
+            )
+            errors.extend(pair_errors)
+            if baseline is not None and candidate is not None:
+                validated_pairs.append((baseline, candidate))
+
+    profiles: list[dict[str, Any]] = []
+    seen_profiles: set[tuple[str, float]] = set()
+    controlled_reference: dict[str, Any] | None = None
+    baseline_identity: tuple[str, str, str | None] | None = None
+    candidate_identity: tuple[str, str, str | None] | None = None
+    rtts: list[float] = []
+    cross_profile_fields = (
+        "hardware",
+        "resolution",
+        "stream_fps",
+        "refresh_rate_hz",
+        "color_space",
+        "codec",
+        "bitrate",
+        "cursor_mode",
+        "presentation_mode",
+        "workload",
+    )
+
+    for index, (baseline, candidate) in enumerate(validated_pairs, start=1):
+        network = candidate.comparison_config["network_profile"]
+        name = str(network.get("name", "")).strip()
+        rtt_value = network.get("rtt_ms")
+        rtt_ms = float(rtt_value) if isinstance(rtt_value, (int, float)) else math.nan
+        profile_key = (name, rtt_ms)
+        if not name or not math.isfinite(rtt_ms):
+            errors.append(f"pair[{index}] network profile requires a finite rtt_ms and name")
+        elif profile_key in seen_profiles:
+            errors.append(f"pair[{index}] duplicates network profile {name!r} at {rtt_ms} ms RTT")
+        else:
+            seen_profiles.add(profile_key)
+            rtts.append(rtt_ms)
+
+        current_baseline_identity = (
+            baseline.product_name,
+            baseline.product_version,
+            baseline.product_commit,
+        )
+        current_candidate_identity = (
+            candidate.product_name,
+            candidate.product_version,
+            candidate.product_commit,
+        )
+        if baseline_identity is None:
+            baseline_identity = current_baseline_identity
+            candidate_identity = current_candidate_identity
+        else:
+            if current_baseline_identity != baseline_identity:
+                errors.append(f"pair[{index}] baseline product/version/commit changed across profiles")
+            if current_candidate_identity != candidate_identity:
+                errors.append(f"pair[{index}] candidate product/version/commit changed across profiles")
+
+        controlled = {
+            field: candidate.comparison_config[field] for field in cross_profile_fields
+        }
+        if controlled_reference is None:
+            controlled_reference = controlled
+        elif controlled != controlled_reference:
+            errors.append(f"pair[{index}] changes controlled configuration across network profiles")
+
+        baseline_p95 = baseline.metrics.p95
+        candidate_p95 = candidate.metrics.p95
+        if baseline_p95 <= 0:
+            errors.append(f"pair[{index}] baseline p95 must be greater than zero")
+            p95_improvement = math.nan
+        else:
+            p95_improvement = (baseline_p95 - candidate_p95) / baseline_p95 * 100.0
+            if p95_improvement < min_p95_improvement_percent:
+                errors.append(
+                    f"pair[{index}] p95 improvement {p95_improvement:.2f}% is below required {min_p95_improvement_percent:.2f}%"
+                )
+
+        baseline_p99 = baseline.metrics.p99
+        candidate_p99 = candidate.metrics.p99
+        if baseline_p99 <= 0:
+            errors.append(f"pair[{index}] baseline p99 must be greater than zero")
+            p99_regression = math.nan
+        else:
+            p99_regression = (candidate_p99 - baseline_p99) / baseline_p99 * 100.0
+            if p99_regression > max_p99_regression_percent:
+                errors.append(
+                    f"pair[{index}] p99 regression {p99_regression:.2f}% exceeds allowed {max_p99_regression_percent:.2f}%"
+                )
+
+        baseline_p95_lower = baseline.metrics.ci_95["p95"][0]
+        candidate_p95_upper = candidate.metrics.ci_95["p95"][1]
+        if candidate_p95_upper >= baseline_p95_lower:
+            errors.append(
+                f"pair[{index}] p95 confidence intervals overlap; candidate upper {candidate_p95_upper:.3f} ms is not below baseline lower {baseline_p95_lower:.3f} ms"
+            )
+
+        profiles.append(
+            {
+                "network_profile": network,
+                "p95_improvement_percent": p95_improvement,
+                "p99_regression_percent": p99_regression,
+                "comparison": compare_optical_reports(baseline, candidate),
+            }
+        )
+
+    if len(rtts) >= MIN_SUPERIORITY_PROFILE_PAIRS:
+        if min(rtts) > 5.0:
+            errors.append("superiority gate requires a LAN profile with RTT <= 5 ms")
+        if max(rtts) < 20.0:
+            errors.append("superiority gate requires a WAN profile with RTT >= 20 ms")
+
+    return (
+        {
+            "schema_version": 1,
+            "passed": not errors,
+            "profile_count": len(validated_pairs),
+            "required": {
+                "min_p95_improvement_percent": min_p95_improvement_percent,
+                "max_p99_regression_percent": max_p99_regression_percent,
+                "min_profile_pairs": MIN_SUPERIORITY_PROFILE_PAIRS,
+                "requires_lan_and_wan": True,
+                "requires_nonoverlapping_p95_ci": True,
+            },
+            "profiles": profiles,
+            "errors": errors,
+            "scope_notice": (
+                "Passing is evidence only for the exact controlled workload, hardware, quality, "
+                "and network profiles; independent reproduction remains required."
+            ),
+        },
+        errors,
+    )
 
 
 def render_comparison_text(result: dict[str, Any]) -> str:
@@ -844,6 +1052,28 @@ def main(argv: list[str] | None = None) -> int:
     cmp_parser.add_argument("--allow-synthetic", action="store_true", help="Allow synthetic test fixtures (test suite only)")
     cmp_parser.add_argument("--output", "-o", type=Path, default=None, help="Save comparison output")
 
+    gate_parser = subparsers.add_parser(
+        "superiority-gate",
+        help="Require evidence-backed p95 superiority across matched LAN and WAN profiles",
+    )
+    gate_parser.add_argument(
+        "--pair",
+        nargs=2,
+        action="append",
+        type=Path,
+        metavar=("BASELINE", "CANDIDATE"),
+        required=True,
+        help="Matched baseline/candidate raw optical reports; repeat for each network profile",
+    )
+    gate_parser.add_argument(
+        "--min-p95-improvement-percent", type=float, default=20.0
+    )
+    gate_parser.add_argument(
+        "--max-p99-regression-percent", type=float, default=0.0
+    )
+    gate_parser.add_argument("--json", action="store_true")
+    gate_parser.add_argument("--output", "-o", type=Path, default=None)
+
     parser.add_argument("--baseline", type=Path, default=None, help="Baseline report path")
     parser.add_argument("--candidate", type=Path, default=None, help="Candidate report path")
     parser.add_argument("--inventory", action="store_true", help="Run inventory probe")
@@ -851,6 +1081,37 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", "-o", type=Path, default=None, help="Output file")
 
     args = parser.parse_args(argv)
+
+    if args.command == "superiority-gate":
+        path_pairs = [(pair[0], pair[1]) for pair in args.pair]
+        gate_report, gate_errors = evaluate_superiority_gate(
+            path_pairs,
+            min_p95_improvement_percent=args.min_p95_improvement_percent,
+            max_p99_regression_percent=args.max_p99_regression_percent,
+        )
+        if gate_errors:
+            print("Superiority gate failed:", file=sys.stderr)
+            for error in gate_errors:
+                print(f"  - {error}", file=sys.stderr)
+            return 1
+        rendered = (
+            json.dumps(gate_report, indent=2)
+            if args.json
+            else "\n".join(
+                [
+                    "=== Optical Superiority Gate: PASS ===",
+                    f"Profiles: {gate_report['profile_count']}",
+                    gate_report["scope_notice"],
+                ]
+            )
+        )
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(rendered, encoding="utf-8")
+            print(f"Wrote superiority gate evidence to {args.output}")
+        else:
+            print(rendered)
+        return 0
 
     if args.inventory or args.command == "inventory":
         inv = probe_host_inventory()

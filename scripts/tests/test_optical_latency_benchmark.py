@@ -309,6 +309,77 @@ class OpticalLatencyBenchmarkTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("cannot be used as real benchmark evidence", result.stderr)
 
+    def test_compare_rejects_metrics_only_even_with_claimed_hash(self) -> None:
+        baseline = valid_optical_report("AnyDesk", "9.7.12")
+        candidate = valid_optical_report("LatencyDesk", "0.1.0")
+        for report in (baseline, candidate):
+            report.pop("samples")
+            report["metrics"] = {
+                "p50": 20, "p95": 25, "p99": 26, "min": 19, "max": 27,
+                "mean": 23, "stddev": 2, "sample_count": 35,
+                "unit": "ms", "ci_95": {"p95": [24, 26]},
+            }
+            report["provenance"] = {"sample_sha256": "a" * 64}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = [Path(tmp_dir) / name for name in ("baseline.json", "candidate.json")]
+            for path, report in zip(paths, (baseline, candidate)):
+                path.write_text(json.dumps(report), encoding="utf-8")
+            result = self.run_cli("compare", *(str(path) for path in paths))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("metrics-only evidence is not admissible", result.stderr)
+
+    def test_compare_rejects_insufficient_physical_repetitions(self) -> None:
+        baseline = valid_optical_report("AnyDesk", "9.7.12")
+        candidate = valid_optical_report("LatencyDesk", "0.1.0")
+        baseline["product"]["commit"] = candidate["product"]["commit"] = "real-build"
+        baseline["samples"] = [20 + i * 0.1 for i in range(20)]
+        candidate["samples"] = [15 + i * 0.1 for i in range(20)]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = [Path(tmp_dir) / name for name in ("baseline.json", "candidate.json")]
+            for path, report in zip(paths, (baseline, candidate)):
+                path.write_text(json.dumps(report), encoding="utf-8")
+            result = self.run_cli("compare", *(str(path) for path in paths))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("sample count (20) is less than declared repetitions", result.stderr)
+
+    def test_compare_rejects_identical_samples(self) -> None:
+        baseline = valid_optical_report("AnyDesk", "9.7.12", commit="anydesk-real-build")
+        candidate = valid_optical_report("LatencyDesk", "0.1.0", commit="latencydesk-real-build")
+        baseline["samples"] = [20.0] * 35
+        candidate["samples"] = [15.0] * 35
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = [Path(tmp_dir) / name for name in ("baseline.json", "candidate.json")]
+            for path, report in zip(paths, (baseline, candidate)):
+                path.write_text(json.dumps(report), encoding="utf-8")
+            result = self.run_cli("compare", *(str(path) for path in paths))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("all 35 samples identical", result.stderr)
+
+    def test_compare_rejects_degenerate_p95_ci(self) -> None:
+        baseline = valid_optical_report("AnyDesk", "9.7.12", commit="anydesk-real-build")
+        candidate = valid_optical_report("LatencyDesk", "0.1.0", commit="latencydesk-real-build")
+        for report in (baseline, candidate):
+            report.pop("samples")
+            report["metrics"] = {
+                "p50": 20,
+                "p95": 25,
+                "p99": 26,
+                "min": 19,
+                "max": 27,
+                "mean": 23,
+                "stddev": 2,
+                "sample_count": 35,
+                "unit": "ms",
+                "ci_95": {"p95": [25, 25]},
+            }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = [Path(tmp_dir) / name for name in ("baseline.json", "candidate.json")]
+            for path, report in zip(paths, (baseline, candidate)):
+                path.write_text(json.dumps(report), encoding="utf-8")
+            result = self.run_cli("compare", *(str(path) for path in paths))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("degenerate p95 bootstrap confidence interval", result.stderr)
+
     def test_compare_matched_reports_with_allow_synthetic(self) -> None:
         baseline_report = valid_optical_report("AnyDesk", "9.7.12", commit="test-commit-hash")
         baseline_report["samples"] = [30.0 + (i % 5) * 1.1 for i in range(35)]
@@ -331,6 +402,99 @@ class OpticalLatencyBenchmarkTests(unittest.TestCase):
             self.assertLess(comp["metrics"]["p95"]["candidate"], comp["metrics"]["p95"]["baseline"])
             self.assertIn("Workload-specific conclusion per docs/BENCHMARKING.md", comp["disclaimer"])
             self.assertIn("must not be generalized as 'faster everywhere'", comp["disclaimer"])
+
+    def test_superiority_gate_requires_two_distinct_network_profiles(self) -> None:
+        baseline = valid_optical_report("AnyDesk", "9.7.12", commit="anydesk-real-build")
+        candidate = valid_optical_report(
+            "LatencyDesk", "0.1.0", commit="latencydesk-real-build"
+        )
+        baseline["samples"] = [30.0 + (i % 5) * 0.4 for i in range(35)]
+        candidate["samples"] = [20.0 + (i % 5) * 0.3 for i in range(35)]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            baseline_path = Path(tmp_dir) / "baseline.json"
+            candidate_path = Path(tmp_dir) / "candidate.json"
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+            candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+            result = self.run_cli(
+                "superiority-gate",
+                "--pair",
+                str(baseline_path),
+                str(candidate_path),
+                "--json",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("at least 2", result.stderr)
+
+    def test_superiority_gate_passes_only_with_lan_and_wan_p95_margin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pairs: list[str] = []
+            for index, (name, rtt_ms, base_ms, candidate_ms) in enumerate(
+                (
+                    ("Clean LAN", 1.0, 30.0, 20.0),
+                    ("Good WAN", 20.0, 55.0, 40.0),
+                )
+            ):
+                baseline = valid_optical_report(
+                    "AnyDesk", "9.7.12", commit="anydesk-real-build"
+                )
+                candidate = valid_optical_report(
+                    "LatencyDesk", "0.1.0", commit="latencydesk-real-build"
+                )
+                for report in (baseline, candidate):
+                    report["network_profile"]["name"] = name
+                    report["network_profile"]["rtt_ms"] = rtt_ms
+                baseline["samples"] = [base_ms + (i % 5) * 0.4 for i in range(35)]
+                candidate["samples"] = [
+                    candidate_ms + (i % 5) * 0.3 for i in range(35)
+                ]
+                baseline_path = Path(tmp_dir) / f"baseline-{index}.json"
+                candidate_path = Path(tmp_dir) / f"candidate-{index}.json"
+                baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+                candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+                pairs.extend(("--pair", str(baseline_path), str(candidate_path)))
+
+            result = self.run_cli(
+                "superiority-gate",
+                *pairs,
+                "--min-p95-improvement-percent",
+                "20",
+                "--json",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertTrue(report["passed"])
+            self.assertEqual(report["profile_count"], 2)
+
+    def test_superiority_gate_rejects_an_insufficient_p95_margin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pairs: list[str] = []
+            for index, (name, rtt_ms) in enumerate((("Clean LAN", 1.0), ("Good WAN", 20.0))):
+                baseline = valid_optical_report(
+                    "AnyDesk", "9.7.12", commit="anydesk-real-build"
+                )
+                candidate = valid_optical_report(
+                    "LatencyDesk", "0.1.0", commit="latencydesk-real-build"
+                )
+                for report in (baseline, candidate):
+                    report["network_profile"]["name"] = name
+                    report["network_profile"]["rtt_ms"] = rtt_ms
+                baseline["samples"] = [30.0 + (i % 5) * 0.4 for i in range(35)]
+                candidate["samples"] = [27.0 + (i % 5) * 0.4 for i in range(35)]
+                baseline_path = Path(tmp_dir) / f"baseline-{index}.json"
+                candidate_path = Path(tmp_dir) / f"candidate-{index}.json"
+                baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+                candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+                pairs.extend(("--pair", str(baseline_path), str(candidate_path)))
+
+            result = self.run_cli(
+                "superiority-gate",
+                *pairs,
+                "--min-p95-improvement-percent",
+                "20",
+                "--json",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("p95 improvement", result.stderr)
 
     def test_compare_mismatched_workload_rejected(self) -> None:
         baseline = valid_optical_report("AnyDesk", "9.7.12")
