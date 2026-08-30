@@ -19,12 +19,12 @@ Windows client on a trusted, low-latency LAN.
 | Control and input | Authenticated product handshake; session-stamped reliable QUIC lanes; the input stream has higher Quinn send priority than control | Implemented and tested in process |
 | Concurrent targets | Repeatable `--target <ADDR>,<PEER_CERT>` launches 2–16 isolated secure client processes so one controller can open several exact-pinned Hosts at once | Implemented and parser/planner tested; cross-machine multi-Host soak remains pending |
 | Linux host | Real X11 root capture, CPU BGRA-to-NV12 conversion, and reconciled XTEST input on a connection/task isolated from blocking capture and software encode | Secure alpha path; X11-to-headless process loopback is verified, while visible input latency and cross-machine rendering remain pending |
-| Successor sessions | Linux X11 Host can retain one endpoint for 1–16 sequential exact-pinned sessions; a headless Client can automatically create the same bounded clean sequence; every successor receives a fresh random identity and strictly increasing lifecycle epochs after ReleaseAll | Clean Host/headless-Client successor path implemented; abrupt loss, interactive reconnect, Windows Host persistence, and network handoff remain pending |
+| Successor sessions | Linux X11 Host retains one endpoint for 1–16 sequential exact-pinned sessions; a headless Client supports clean sequences plus bounded recovery from authenticated QUIC reset/idle timeout; every successor follows ReleaseAll and receives a fresh identity with strictly increasing epochs | Clean and loopback-blackhole recovery paths implemented; interactive reconnect, Windows Host persistence, physical handoff, and cross-machine soak remain pending |
 | Windows client | Strict raw-NV12 validation, Direct3D 11 viewer, bounded latest-frame presentation, and native input forwarding; `--frames` provides headless mode | Secure alpha path; Windows viewer cross-machine E2E evidence is still pending |
 | Other clients | Portable software viewer with OpenH264/raw-NV12 presentation and input forwarding; headless receive and input probe remain available | Alpha implementation; cross-machine and native-UX evidence pending |
 | Windows host | Secure hosting is rejected before opening a socket because real capture/input providers are not connected | Unsupported |
 | Media | Raw NV12 fragmented across QUIC DATAGRAMs; no production H.264/AV1 encode/decode path | Low-resolution LAN preview only |
-| WAN connectivity | Direct IP plus a bounded race across up to four known exact-pinned addresses for the same Host | Alternate-address failover implemented; no rendezvous, NAT traversal, relay, discovery, or active-session reconnect |
+| WAN connectivity | Direct IP plus a bounded race across up to four known exact-pinned addresses for the same Host; opt-in headless recovery reruns the authenticated race | Alternate-address and bounded headless recovery implemented; no rendezvous, NAT traversal, relay, discovery, interactive recovery, or QUIC path migration |
 | Distribution | No supported signed installer, updater, or production service | Not implemented |
 | Legacy transport | Plaintext custom UDP, available only with explicit `--unsafe-udp-lab` | Local compatibility test only |
 
@@ -146,6 +146,12 @@ default value `1` until native provider restart has separate soak evidence.
 For a bounded headless verification sequence, add `--frames 3 --session-count 2`
 to the Client; it closes each ProductSession, retains its Client endpoint, and
 requires a fresh identity plus strictly newer lifecycle epochs on every successor.
+To retry only recoverable QUIC reset/idle-timeout failures, add
+`--reconnect-attempts 3` (maximum 8) to a headless Client and provision enough
+Host `--max-sessions` capacity. Authentication, protocol, codec, provider, and
+explicit application-close failures remain terminal. Retry delay is jittered,
+capped at two seconds, and constrained by a monotonic total budget equal to the
+smaller of the pairing timeout and 15 seconds.
 
 ### 3. Start an interactive viewer
 

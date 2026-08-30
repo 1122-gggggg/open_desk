@@ -33,6 +33,13 @@ session ID or fails to advance any epoch; old
 disconnect, input, control, and media records therefore cannot target the
 successor even if delayed work survives transport teardown.
 
+An established path is eligible for automatic replacement only when Quinn
+reports peer reset or idle timeout. The replacement repeats TLS 1.3,
+exact-certificate verification, and the product handshake; it never resumes old
+streams or 0-RTT input. Certificate mismatch, malformed protocol data,
+non-monotonic lifecycle values, explicit application close, and local/provider
+failure are terminal. A retired input epoch remains rejected after ReleaseAll.
+
 ## 3. Capability negotiation
 
 Each peer advertises:
