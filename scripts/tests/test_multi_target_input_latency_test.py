@@ -299,11 +299,20 @@ class MultiTargetInputCliTests(unittest.TestCase):
 
     def test_target_count_accepts_only_scale_checkpoints(self):
         for count in (2, 4, 8, 16):
-            args = module.parse_args(["--target-count", str(count)])
+            samples = 1024 if count >= 8 else 256
+            args = module.parse_args(
+                ["--target-count", str(count), "--samples", str(samples)]
+            )
             self.assertEqual(args.target_count, count)
         for count in (0, 1, 3, 17):
             with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
                 module.parse_args(["--target-count", str(count)])
+
+        for count, samples in ((4, 255), (8, 256), (16, 1023)):
+            with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+                module.parse_args(
+                    ["--target-count", str(count), "--samples", str(samples)]
+                )
 
 
 if __name__ == "__main__":

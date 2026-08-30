@@ -16,7 +16,7 @@ Client。
 | 安全傳輸 | Quinn QUIC 上僅允許 TLS 1.3 的 mTLS；雙方 pin 並逐 byte 檢查預期 leaf certificate；不會自動降級 UDP | 預設產品路徑；in-process 測試通過 |
 | 裝置身分 | `latencydesk-identity` 產生持久的 self-signed certificate DER 與 PKCS#8 private-key DER，且不覆寫現有身分 | 已實作；certificate 仍須手動交換 |
 | 控制與輸入 | 已驗證的產品握手、帶 session stamp 的可靠 QUIC lane；input 優先權高於 control；Client／Host 會明確協商 capability，Linux opt-in probe 只在 XTEST 加後續 X11 sync reply 完成後取得完整 stamp ACK | 已有單 target 與同時多 target 的 application-ACK 程序證據；實體 input-to-photon 仍待完成 |
-| 同時連線多台 Host | 可重複使用 `--target <ADDR>,<PEER_CERT>`，以 2–16 個隔離的安全 Client 子程序同時開啟多台 exact-pinned Host | 單機 2／4／8／16 target gate 會為每台保留 256 筆互相重疊的 raw input-ACK 與精確 process-group／資源快照；壞 target 不會中止健康 target；跨機器 soak 仍待完成 |
+| 同時連線多台 Host | 可重複使用 `--target <ADDR>,<PEER_CERT>`，以 2–16 個隔離的安全 Client 子程序同時開啟多台 exact-pinned Host | 單機 2／4 target gate 每台保留 256 筆、8／16 target 每台保留 1024 筆互相重疊的 raw input-ACK 與精確 process-group／資源快照；壞 target 不會中止健康 target；跨機器 soak 仍待完成 |
 | Linux Host | 真實 X11 root 擷取、CPU BGRA-to-NV12 轉換，以及在獨立連線／task 中執行、不受擷取與軟體編碼阻塞的 XTEST 輸入 | 安全 Alpha 路徑；X11 到 headless 的 process loopback 已驗證，可見輸入延遲與跨機器呈現仍待完成 |
 | Successor session | Linux X11 Host 可保留同一個 endpoint，依序接受 1–16 個 exact-pinned session；headless Client 支援 clean sequence，亦可對已驗證 QUIC reset／idle timeout 做有界恢復；每個 successor 都在 ReleaseAll 後取得新 identity 與嚴格遞增 epoch | Clean 與 loopback blackhole recovery 已實作；互動式 reconnect、Windows Host persistence、實體 handoff 與跨機器 soak 仍待完成 |
 | Windows Client | 嚴格 raw-NV12 驗證、Direct3D 11 Viewer、有界 latest-frame 呈現及原生輸入轉送；`--frames` 可 headless 執行 | 安全 Alpha 路徑；Windows Viewer 跨機器 E2E 證據仍待完成 |
@@ -112,7 +112,8 @@ xvfb-run -a python3 scripts/multi_target_input_latency_test.py \
   --output artifacts/multi-target-input-latency.json
 ```
 
-CI 另以 `--target-count 4`、`8`、`16` 重跑。Host 使用 OS 分配的 loopback port；
+CI 以 256 samples 重跑 `--target-count 4`，並以 1024 samples 重跑 `8`、`16`，
+讓快速 child 在兩次 fail-closed `/proc` snapshot 完成前保持存活。Host 使用 OS 分配的 loopback port；
 Linux `/proc` 必須證明一個 supervisor、恰好 N 個 Client child 與 N 個隔離 Host
 process group，PID／start-time／執行檔身分保持穩定。RSS、CPU tick、FD、thread
 只作當下觀測，不設武斷的通用上限。Host／Client 每個隔離 process 固定使用兩個

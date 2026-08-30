@@ -530,9 +530,8 @@ mod tests {
 
     #[test]
     fn retransmission_and_total_deadline_are_bounded() {
-        let unused = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve address");
-        let unused_address = unused.local_addr().expect("unused address");
-        drop(unused);
+        let silent_server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("silent server");
+        let unused_address = silent_server.local_addr().expect("silent address");
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client");
         let started = Instant::now();
         let result = discover_server_reflexive_with_transaction(

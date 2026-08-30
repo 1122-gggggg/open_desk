@@ -123,11 +123,16 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           for target_count in 4 8 16; do
+            samples=256
+            if [ "$target_count" -ge 8 ]; then
+              # Keep every process alive through both fail-closed /proc snapshots.
+              samples=1024
+            fi
             xvfb-run -a python3 scripts/multi_target_input_latency_test.py \
               --host-bin target/debug/latencydesk-host \
               --client-bin target/debug/latencydesk-client \
               --identity-bin target/debug/latencydesk-identity \
-              --target-count "$target_count" --samples 256 --timeout 60 \
+              --target-count "$target_count" --samples "$samples" --timeout 120 \
               --output "artifacts/ci/multi-target-input-latency-${target_count}.json"
           done
       - name: Upload concurrent input latency scale evidence

@@ -589,7 +589,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--timeout", type=secure.bounded_int("timeout", 10, 120), default=45
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    minimum_samples = 1024 if args.target_count >= 8 else 256
+    if args.samples < minimum_samples:
+        parser.error(
+            f"--target-count {args.target_count} requires at least {minimum_samples} samples "
+            "so every process remains alive through both topology snapshots"
+        )
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
