@@ -4,6 +4,7 @@
 //! anti-replay protection, monotonic epoch tracking, MTU fragmentation/reassembly,
 //! and adaptive congestion control.
 
+pub mod ice;
 pub mod identity;
 pub mod product;
 pub mod quic;

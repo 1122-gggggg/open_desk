@@ -38,6 +38,7 @@ authors = ["LatencyDesk contributors"]
 
 [workspace.dependencies]
 bytes = "=1.12.1"
+ice-core = { package = "is", version = "=0.11.0", default-features = false, features = ["sha1"] }
 getrandom = "0.2"
 quinn = { version = "=0.11.8", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
 rcgen = { version = "=0.13.2", default-features = false, features = ["ring"] }
