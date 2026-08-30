@@ -7,6 +7,7 @@
 use core::fmt;
 
 pub mod quic;
+pub mod stun;
 
 /// Current wire protocol version.
 pub const WIRE_VERSION: u8 = 1;
