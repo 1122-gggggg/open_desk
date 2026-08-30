@@ -17,7 +17,7 @@ Windows client on a trusted, low-latency LAN.
 | Secure transport | TLS 1.3-only mTLS over Quinn QUIC; both sides pin and byte-check the expected leaf certificate; no automatic UDP downgrade | Default product path; in-process tests pass |
 | Device identity | `latencydesk-identity` creates persistent self-signed certificate DER and PKCS#8 private-key DER files without overwriting an existing identity | Implemented; certificate exchange is manual |
 | Control and input | Authenticated product handshake; session-stamped reliable QUIC lanes; the input stream has higher Quinn send priority than control | Implemented and tested in process |
-| Concurrent targets | Repeatable `--target <ADDR>,<PEER_CERT>` launches 2–16 isolated secure client processes so one controller can open several exact-pinned Hosts at once | Implemented and parser/planner tested; cross-machine multi-Host soak remains pending |
+| Concurrent targets | Repeatable `--target <ADDR>,<PEER_CERT>` launches 2–16 isolated secure client processes so one controller can open several exact-pinned Hosts at once | Two distinct-cert Hosts are process-verified concurrently and a failed target is isolated; cross-machine 2/4/8/16-Host soak remains pending |
 | Linux host | Real X11 root capture, CPU BGRA-to-NV12 conversion, and reconciled XTEST input on a connection/task isolated from blocking capture and software encode | Secure alpha path; X11-to-headless process loopback is verified, while visible input latency and cross-machine rendering remain pending |
 | Successor sessions | Linux X11 Host retains one endpoint for 1–16 sequential exact-pinned sessions; a headless Client supports clean sequences plus bounded recovery from authenticated QUIC reset/idle timeout; every successor follows ReleaseAll and receives a fresh identity with strictly increasing epochs | Clean and loopback-blackhole recovery paths implemented; interactive reconnect, Windows Host persistence, physical handoff, and cross-machine soak remain pending |
 | Windows client | Strict raw-NV12 validation, Direct3D 11 viewer, bounded latest-frame presentation, and native input forwarding; `--frames` provides headless mode | Secure alpha path; Windows viewer cross-machine E2E evidence is still pending |
@@ -86,6 +86,23 @@ loopback. It does **not** prove Linux-to-Windows rendering, visible XTEST input
 effects, packet-capture confidentiality, cross-machine operation, or
 long-running network reliability. Those gates remain Pending in
 [Product readiness](docs/PRODUCT_READINESS.md).
+
+The multi-target process gate starts two distinct-certificate Hosts, proves
+both are authenticated and streaming at the same time, then runs a second
+phase where an unreachable target fails while the healthy target still
+completes:
+
+```bash
+xvfb-run -a python3 scripts/multi_target_connect_test.py \
+  --host-bin target/debug/latencydesk-host \
+  --client-bin target/debug/latencydesk-client \
+  --identity-bin target/debug/latencydesk-identity \
+  --frames 5 --fps 10 --max-width 320 --max-height 180 \
+  --output artifacts/multi-target-connect.json
+```
+
+This is two-Host loopback process evidence, not cross-machine scale or a
+16-Host resource/latency result.
 
 ## Secure LAN preview quick start
 
