@@ -344,6 +344,9 @@ fn stream_config_is_offered(config: latencydesk_protocol::VideoStreamConfig, fla
             || flags
                 & latencydesk_protocol::video_capability_flags::AUTHENTICATED_CANDIDATE_EXCHANGE
                 != 0)
+        && (!config.supports_authenticated_ice_credentials()
+            || flags & latencydesk_protocol::video_capability_flags::AUTHENTICATED_ICE_CREDENTIALS
+                != 0)
 }
 
 fn require_input_ack_capability(
@@ -2184,6 +2187,30 @@ mod tests {
                 latencydesk_protocol::VideoProfile::RawNv12
             )
         );
+    }
+
+    #[test]
+    fn authenticated_ice_selection_must_have_been_offered() {
+        let config = latencydesk_protocol::VideoStreamConfig {
+            contract_version: latencydesk_protocol::VIDEO_CODEC_CONTRACT_VERSION,
+            codec: latencydesk_protocol::VideoCodec::RawNv12,
+            profile: latencydesk_protocol::VideoProfile::RawNv12,
+            pixel_format: u32::from_le_bytes(*b"NV12"),
+            stream_id: 1,
+            codec_epoch: 1,
+            width: 2,
+            height: 2,
+            fps: 1,
+            target_bitrate_bps: 1,
+            flags: latencydesk_protocol::video_stream_flags::AUTHENTICATED_ICE_CREDENTIALS,
+        };
+        let codec_only = latencydesk_protocol::video_capability_flags::RAW_NV12;
+        assert!(!stream_config_is_offered(config, codec_only));
+        assert!(stream_config_is_offered(
+            config,
+            codec_only
+                | latencydesk_protocol::video_capability_flags::AUTHENTICATED_ICE_CREDENTIALS
+        ));
     }
 
     #[test]

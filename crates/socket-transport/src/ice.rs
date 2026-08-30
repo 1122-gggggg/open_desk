@@ -34,6 +34,24 @@ pub enum IceRole {
     Controlled,
 }
 
+impl IceRole {
+    #[must_use]
+    pub const fn from_signaling(role: latencydesk_protocol::IceCredentialRole) -> Self {
+        match role {
+            latencydesk_protocol::IceCredentialRole::Controlling => Self::Controlling,
+            latencydesk_protocol::IceCredentialRole::Controlled => Self::Controlled,
+        }
+    }
+
+    #[must_use]
+    pub const fn to_signaling(self) -> latencydesk_protocol::IceCredentialRole {
+        match self {
+            Self::Controlling => latencydesk_protocol::IceCredentialRole::Controlling,
+            Self::Controlled => latencydesk_protocol::IceCredentialRole::Controlled,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IceCandidateKind {
     Host,
@@ -87,15 +105,25 @@ impl IceCredentials {
         Self::from_parts(ufrag, password)
     }
 
-    pub fn from_parts(ufrag: String, password: String) -> Result<Self, IceError> {
+    pub fn from_parts(mut ufrag: String, mut password: String) -> Result<Self, IceError> {
         if !(4..=256).contains(&ufrag.len())
             || !(22..=256).contains(&password.len())
             || !ufrag.bytes().all(is_ice_char)
             || !password.bytes().all(is_ice_char)
         {
+            ufrag.zeroize();
+            password.zeroize();
             return Err(IceError::InvalidCredentials);
         }
         Ok(Self { ufrag, password })
+    }
+
+    pub fn from_signaling(
+        exchange: &latencydesk_protocol::IceCredentialExchange,
+    ) -> Result<Self, IceError> {
+        exchange.with_password(|password| {
+            Self::from_parts(exchange.ufrag().to_owned(), password.to_owned())
+        })
     }
 
     #[must_use]
@@ -819,6 +847,24 @@ mod tests {
         assert!(!rendered.contains(fixed.ufrag()));
         assert!(!rendered.contains(&"s".repeat(ICE_PASSWORD_LEN)));
         assert!(IceCredentials::from_parts("bad!".into(), "x".repeat(22)).is_err());
+
+        let signaled = latencydesk_protocol::IceCredentialExchange::new(
+            1,
+            7,
+            1,
+            latencydesk_protocol::IceCredentialRole::Controlled,
+            "peerUfrag".into(),
+            "P".repeat(22),
+        )
+        .unwrap();
+        let converted = IceCredentials::from_signaling(&signaled).unwrap();
+        assert_eq!(converted.ufrag(), "peerUfrag");
+        assert_eq!(converted.password_len(), 22);
+        assert_eq!(IceRole::from_signaling(signaled.role), IceRole::Controlled);
+        assert_eq!(
+            IceRole::Controlling.to_signaling(),
+            latencydesk_protocol::IceCredentialRole::Controlling
+        );
     }
 
     #[test]

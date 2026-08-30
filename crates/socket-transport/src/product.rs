@@ -11,7 +11,8 @@ use latencydesk_protocol::quic::{
 };
 use latencydesk_protocol::{
     CandidateExchange, ControlHeader, ControlKind, ControlPacket, HandshakeCompletedMessage,
-    ProtocolError, MEDIA_HEADER_LEN,
+    IceCredentialExchange, IceCredentialRole, ProtocolError, VideoCodecCapabilities,
+    VideoStreamConfig, MEDIA_HEADER_LEN,
 };
 use latencydesk_transport::{
     frame_fragments_with_packet_budget, FragmentSpec, IngestOutcome, ReassembledFrame, Reassembler,
@@ -23,6 +24,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
 const ACTIVE_GENERATION: u64 = 1;
 const ACTIVE_EPOCH: u32 = 1;
@@ -45,6 +47,12 @@ pub struct ProductSession {
     clock_origin: Instant,
     inbound_control: Arc<Mutex<Option<QuicInboundStream>>>,
     candidate_exchange: Arc<Mutex<CandidateExchangeTracker>>,
+    ice_generation: Arc<Mutex<IceGenerationTracker>>,
+    ice_roles: Arc<Mutex<Option<IceSignalingRoles>>>,
+    ice_role_assignment: IceSignalingRoles,
+    control_send: Arc<Mutex<()>>,
+    #[cfg(test)]
+    ice_send_cancellation_hook: Option<Arc<IceSendCancellationHook>>,
 }
 
 /// Receiver for the dedicated ordered input lane.
@@ -62,6 +70,8 @@ pub struct ControlReceiver {
     stream: QuicInboundStream,
     expected_stamp: SessionStamp,
     candidate_exchange: CandidateExchangeTracker,
+    ice_generation: IceGenerationTracker,
+    ice_roles: Arc<Mutex<Option<IceSignalingRoles>>>,
 }
 
 /// Enforces the ordered, per-peer candidate advertisement sequence.
@@ -69,6 +79,129 @@ pub struct ControlReceiver {
 pub struct CandidateExchangeTracker {
     exchange_id: Option<u64>,
     generation: u32,
+}
+
+/// Couples credentials and candidates into one authenticated, ordered update.
+#[derive(Debug, Clone, Default)]
+pub struct IceGenerationTracker {
+    exchange_id: Option<u64>,
+    generation: u32,
+    pending: Option<u32>,
+    mode: Option<IceSignalingMode>,
+    poisoned: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IceSignalingMode {
+    AdvertisementOnly,
+    CredentialGenerations,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IceSignalingRoles {
+    local: IceCredentialRole,
+    remote: IceCredentialRole,
+}
+
+impl IceGenerationTracker {
+    fn ensure_mode(&self, requested: IceSignalingMode) -> Result<(), IceGenerationViolation> {
+        if self.poisoned {
+            return Err(IceGenerationViolation::Poisoned);
+        }
+        if self.mode.is_some_and(|current| current != requested) {
+            return Err(IceGenerationViolation::ModeConflict);
+        }
+        Ok(())
+    }
+
+    fn advertisement(&self) -> Result<Self, IceGenerationViolation> {
+        self.ensure_mode(IceSignalingMode::AdvertisementOnly)?;
+        let mut next = self.clone();
+        next.mode = Some(IceSignalingMode::AdvertisementOnly);
+        Ok(next)
+    }
+
+    fn begin(
+        &self,
+        credentials: &IceCredentialExchange,
+        session_id: u64,
+    ) -> Result<Self, IceGenerationViolation> {
+        self.ensure_mode(IceSignalingMode::CredentialGenerations)?;
+        if credentials.exchange_id != session_id {
+            return Err(IceGenerationViolation::ExchangeId {
+                expected: session_id,
+                actual: credentials.exchange_id,
+            });
+        }
+        let expected = self
+            .generation
+            .checked_add(1)
+            .ok_or(IceGenerationViolation::GenerationExhausted)?;
+        if credentials.generation != expected {
+            return Err(IceGenerationViolation::Generation {
+                expected,
+                actual: credentials.generation,
+            });
+        }
+        if self.pending.is_some() {
+            return Err(IceGenerationViolation::Pending);
+        }
+        let mut next = self.clone();
+        next.mode = Some(IceSignalingMode::CredentialGenerations);
+        next.exchange_id = Some(session_id);
+        next.pending = Some(credentials.generation);
+        Ok(next)
+    }
+    fn finish(mut self, candidates: &CandidateExchange) -> Result<Self, IceGenerationViolation> {
+        let generation = self
+            .pending
+            .ok_or(IceGenerationViolation::CandidateBeforeCredentials)?;
+        if candidates.exchange_id != self.exchange_id.unwrap_or_default() {
+            return Err(IceGenerationViolation::ExchangeId {
+                expected: self.exchange_id.unwrap_or_default(),
+                actual: candidates.exchange_id,
+            });
+        }
+        if candidates.generation != generation {
+            return Err(IceGenerationViolation::Generation {
+                expected: generation,
+                actual: candidates.generation,
+            });
+        }
+        self.generation = generation;
+        self.pending = None;
+        Ok(self)
+    }
+
+    fn poison(&mut self) {
+        self.poisoned = true;
+        self.pending = None;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IceGenerationViolation {
+    Malformed(ProtocolError),
+    ExchangeId {
+        expected: u64,
+        actual: u64,
+    },
+    Generation {
+        expected: u32,
+        actual: u32,
+    },
+    GenerationExhausted,
+    Pending,
+    CandidateBeforeCredentials,
+    IceControlRequiresTypedApi,
+    IceCapabilityNotNegotiated,
+    IceSignalingNotNegotiated,
+    ModeConflict,
+    Poisoned,
+    RoleMismatch {
+        expected: IceCredentialRole,
+        actual: IceCredentialRole,
+    },
 }
 
 impl CandidateExchangeTracker {
@@ -125,10 +258,89 @@ pub enum CandidateExchangeViolation {
 }
 
 /// Validated product control message with an owned payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProductControlMessage {
     pub kind: ControlKind,
     pub payload: Bytes,
+}
+
+impl fmt::Debug for ProductControlMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProductControlMessage")
+            .field("kind", &self.kind)
+            .field("payload", &"<redacted>")
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
+}
+
+struct PrivateControlMessage {
+    kind: ControlKind,
+    payload: Zeroizing<Vec<u8>>,
+}
+
+struct FailClosedIceWrite<'a> {
+    tracker: &'a mut IceGenerationTracker,
+    connection: QuicConnection,
+    armed: bool,
+}
+
+impl<'a> FailClosedIceWrite<'a> {
+    fn new(tracker: &'a mut IceGenerationTracker, connection: QuicConnection) -> Self {
+        Self {
+            tracker,
+            connection,
+            armed: true,
+        }
+    }
+
+    fn commit(mut self, next: IceGenerationTracker) {
+        *self.tracker = next;
+        self.armed = false;
+    }
+}
+
+impl Drop for FailClosedIceWrite<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.tracker.poison();
+            self.connection.close_for_protocol_violation();
+        }
+    }
+}
+
+struct FailClosedControlRead {
+    connection: QuicConnection,
+    armed: bool,
+}
+
+impl FailClosedControlRead {
+    fn new(connection: QuicConnection) -> Self {
+        Self {
+            connection,
+            armed: true,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FailClosedControlRead {
+    fn drop(&mut self) {
+        if self.armed {
+            self.connection.close_for_protocol_violation();
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct IceSendCancellationHook {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,17 +384,34 @@ pub enum ProductProtocolViolation {
     /// The initial control payload was not a handshake-completion record.
     UnexpectedHandshakeKind(ControlKind),
     /// The nested control header was not bound to the outer session stamp.
-    ControlSessionMismatch { expected: u64, actual: u64 },
+    ControlSessionMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    /// The reliable control record did not contain a valid bounded packet.
+    MalformedControl(ProtocolError),
     /// The handshake body was not bound to the outer session stamp.
-    HandshakeSessionMismatch { expected: u64, actual: u64 },
+    HandshakeSessionMismatch {
+        expected: u64,
+        actual: u64,
+    },
     /// The handshake body carried another authorization epoch.
-    HandshakeAuthorizationMismatch { expected: u32, actual: u32 },
+    HandshakeAuthorizationMismatch {
+        expected: u32,
+        actual: u32,
+    },
     /// The post-mTLS handshake used a non-canonical legacy nonce value.
     HandshakeNonceMismatch,
     /// A control record was not a candidate advertisement.
-    UnexpectedCandidateKind { actual: ControlKind },
+    UnexpectedCandidateKind {
+        actual: ControlKind,
+    },
+    UnexpectedCredentialsKind {
+        actual: ControlKind,
+    },
     /// Candidate advertisement bytes or ordering were invalid.
     CandidateExchange(CandidateExchangeViolation),
+    IceGeneration(IceGenerationViolation),
     /// A replacement connection reused its session identity or did not advance
     /// every lifecycle epoch beyond the prior authenticated session.
     NonMonotonicSuccessor {
@@ -199,6 +428,7 @@ pub enum ProductSessionError {
     Transport(TransportError),
     PeerProtocol(ProductProtocolViolation),
     CandidateExchange(CandidateExchangeViolation),
+    IceGeneration(IceGenerationViolation),
     /// QUIC DATAGRAM support was not negotiated.
     DatagramsUnsupported,
     /// The path cannot fit an outer QUIC-media header, one inner media header,
@@ -243,6 +473,7 @@ impl fmt::Display for ProductSessionError {
             Self::CandidateExchange(error) => {
                 write!(formatter, "local candidate exchange is invalid: {error:?}")
             }
+            Self::IceGeneration(error) => write!(formatter, "local ICE generation is invalid: {error:?}"),
             Self::DatagramsUnsupported => {
                 formatter.write_str("QUIC DATAGRAM support was not negotiated")
             }
@@ -285,6 +516,7 @@ impl Error for ProductSessionError {
             Self::Transport(error) => Some(error),
             Self::PeerProtocol(_)
             | Self::CandidateExchange(_)
+            | Self::IceGeneration(_)
             | Self::DatagramsUnsupported
             | Self::DatagramBudgetTooSmall { .. }
             | Self::InvalidMediaMaxAge
@@ -510,6 +742,15 @@ impl ProductSession {
                 clock_origin: Instant::now(),
                 inbound_control: Arc::new(Mutex::new(Some(stream))),
                 candidate_exchange: Arc::new(Mutex::new(CandidateExchangeTracker::default())),
+                ice_generation: Arc::new(Mutex::new(IceGenerationTracker::default())),
+                ice_roles: Arc::new(Mutex::new(None)),
+                ice_role_assignment: IceSignalingRoles {
+                    local: IceCredentialRole::Controlling,
+                    remote: IceCredentialRole::Controlled,
+                },
+                control_send: Arc::new(Mutex::new(())),
+                #[cfg(test)]
+                ice_send_cancellation_hook: None,
             })
         };
         match tokio::time::timeout(timeout, operation).await {
@@ -557,13 +798,96 @@ impl ProductSession {
         self.connection.remote_address()
     }
 
+    /// Enables authenticated ICE signaling only when both the validated offer
+    /// and the selected stream configuration negotiated it. The connection
+    /// initiator is always controlling and the Host is always controlled, so
+    /// callers cannot create a same-role pair.
+    pub async fn enable_authenticated_ice_signaling(
+        &self,
+        offered: VideoCodecCapabilities,
+        selected: VideoStreamConfig,
+    ) -> Result<(), ProductSessionError> {
+        offered.encode()?;
+        selected.encode()?;
+        if !offered.supports_authenticated_ice_credentials()
+            || !selected.supports_authenticated_ice_credentials()
+        {
+            return Err(ProductSessionError::IceGeneration(
+                IceGenerationViolation::IceCapabilityNotNegotiated,
+            ));
+        }
+        let mut roles = self.ice_roles.lock().await;
+        if roles.is_none() {
+            *roles = Some(self.ice_role_assignment);
+        }
+        Ok(())
+    }
+
     /// Writes one typed product message on the persistent reliable control lane.
     pub async fn send_control(
         &self,
         kind: ControlKind,
         payload: &[u8],
     ) -> Result<(), ProductSessionError> {
-        let control = ControlPacket::encode(
+        if matches!(
+            kind,
+            ControlKind::IceCredentials | ControlKind::IceCandidate
+        ) {
+            return Err(ProductSessionError::IceGeneration(
+                IceGenerationViolation::IceControlRequiresTypedApi,
+            ));
+        }
+        let _send_guard = self.control_send.lock().await;
+        self.send_control_unlocked(kind, payload).await
+    }
+
+    /// Sends one credentials/candidates generation as an indivisible ordered pair.
+    pub async fn send_ice_generation(
+        &self,
+        credentials: IceCredentialExchange,
+        candidates: CandidateExchange,
+    ) -> Result<(), ProductSessionError> {
+        let roles = (*self.ice_roles.lock().await).ok_or(ProductSessionError::IceGeneration(
+            IceGenerationViolation::IceSignalingNotNegotiated,
+        ))?;
+        if credentials.role != roles.local {
+            return Err(ProductSessionError::IceGeneration(
+                IceGenerationViolation::RoleMismatch {
+                    expected: roles.local,
+                    actual: credentials.role,
+                },
+            ));
+        }
+        let payload = credentials
+            .encode()
+            .map_err(IceGenerationViolation::Malformed)
+            .map_err(ProductSessionError::IceGeneration)?;
+        let candidate_payload = candidates.encode()?;
+        let mut tracker = self.ice_generation.lock().await;
+        let next = tracker
+            .begin(&credentials, self.stamp.session_id)
+            .map_err(ProductSessionError::IceGeneration)?;
+        let next = next
+            .finish(&candidates)
+            .map_err(ProductSessionError::IceGeneration)?;
+        let _send_guard = self.control_send.lock().await;
+        let transaction = FailClosedIceWrite::new(&mut tracker, self.connection.clone());
+        self.send_control_unlocked(ControlKind::IceCredentials, &payload)
+            .await?;
+        #[cfg(test)]
+        self.pause_after_ice_write_for_cancellation_test().await;
+        self.send_control_unlocked(ControlKind::IceCandidate, &candidate_payload)
+            .await?;
+        transaction.commit(next);
+        Ok(())
+    }
+
+    async fn send_control_unlocked(
+        &self,
+        kind: ControlKind,
+        payload: &[u8],
+    ) -> Result<(), ProductSessionError> {
+        let control = Zeroizing::new(ControlPacket::encode(
             ControlHeader {
                 kind,
                 flags: 0,
@@ -572,10 +896,22 @@ impl ProductSession {
                     .map_err(|_| ProtocolError::ControlLength(u32::MAX))?,
             },
             payload,
-        )?;
-        let record = StreamRecord::encode(StreamKind::Control, self.stamp, &control)?;
+        )?);
+        let record = Zeroizing::new(StreamRecord::encode(
+            StreamKind::Control,
+            self.stamp,
+            &control,
+        )?);
         self.connection.send_control(&record).await?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    async fn pause_after_ice_write_for_cancellation_test(&self) {
+        if let Some(hook) = &self.ice_send_cancellation_hook {
+            hook.reached.notify_one();
+            hook.release.notified().await;
+        }
     }
 
     /// Sends one validated, sequential ICE candidate advertisement.
@@ -592,14 +928,23 @@ impl ProductSession {
                 },
             ));
         }
-        let mut tracker = self.candidate_exchange.lock().await;
-        let mut next_tracker = tracker.clone();
-        next_tracker
+        let mut mode_tracker = self.ice_generation.lock().await;
+        let next_mode = mode_tracker
+            .advertisement()
+            .map_err(ProductSessionError::IceGeneration)?;
+        let mut candidate_tracker = self.candidate_exchange.lock().await;
+        let mut next_candidate = candidate_tracker.clone();
+        next_candidate
             .accept_validated(&exchange)
             .map_err(ProductSessionError::CandidateExchange)?;
-        self.send_control(ControlKind::IceCandidate, &payload)
+        let _send_guard = self.control_send.lock().await;
+        let transaction = FailClosedIceWrite::new(&mut mode_tracker, self.connection.clone());
+        self.send_control_unlocked(ControlKind::IceCandidate, &payload)
             .await?;
-        *tracker = next_tracker;
+        #[cfg(test)]
+        self.pause_after_ice_write_for_cancellation_test().await;
+        *candidate_tracker = next_candidate;
+        transaction.commit(next_mode);
         Ok(())
     }
 
@@ -630,6 +975,8 @@ impl ProductSession {
             stream,
             expected_stamp: self.stamp,
             candidate_exchange: CandidateExchangeTracker::default(),
+            ice_generation: IceGenerationTracker::default(),
+            ice_roles: Arc::clone(&self.ice_roles),
         })
     }
 
@@ -850,6 +1197,15 @@ impl ProductSession {
             clock_origin: Instant::now(),
             inbound_control: Arc::new(Mutex::new(None)),
             candidate_exchange: Arc::new(Mutex::new(CandidateExchangeTracker::default())),
+            ice_generation: Arc::new(Mutex::new(IceGenerationTracker::default())),
+            ice_roles: Arc::new(Mutex::new(None)),
+            ice_role_assignment: IceSignalingRoles {
+                local: IceCredentialRole::Controlled,
+                remote: IceCredentialRole::Controlling,
+            },
+            control_send: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            ice_send_cancellation_hook: None,
         })
     }
 
@@ -881,8 +1237,114 @@ impl InputReceiver {
 }
 
 impl ControlReceiver {
-    /// Reads and validates the next typed control message.
+    /// Receives one credentials/candidates pair, requiring the complementary role.
+    pub async fn next_ice_generation(
+        &mut self,
+    ) -> Result<(IceCredentialExchange, CandidateExchange), ProductSessionError> {
+        let roles = (*self.ice_roles.lock().await).ok_or(ProductSessionError::IceGeneration(
+            IceGenerationViolation::IceSignalingNotNegotiated,
+        ))?;
+        self.ice_generation
+            .ensure_mode(IceSignalingMode::CredentialGenerations)
+            .map_err(ProductSessionError::IceGeneration)?;
+        let mut operation = FailClosedControlRead::new(self.connection.clone());
+        let credentials_message = self.next_control_private().await?;
+        if credentials_message.kind != ControlKind::IceCredentials {
+            return fail_peer_protocol(
+                &self.connection,
+                ProductProtocolViolation::UnexpectedCredentialsKind {
+                    actual: credentials_message.kind,
+                },
+            );
+        }
+        let credentials =
+            IceCredentialExchange::decode(&credentials_message.payload).map_err(|error| {
+                self.connection.close_for_protocol_violation();
+                ProductSessionError::PeerProtocol(ProductProtocolViolation::IceGeneration(
+                    IceGenerationViolation::Malformed(error),
+                ))
+            })?;
+        if credentials.exchange_id != self.expected_stamp.session_id {
+            return fail_peer_protocol(
+                &self.connection,
+                ProductProtocolViolation::IceGeneration(IceGenerationViolation::ExchangeId {
+                    expected: self.expected_stamp.session_id,
+                    actual: credentials.exchange_id,
+                }),
+            );
+        }
+        if credentials.role != roles.remote {
+            return fail_peer_protocol(
+                &self.connection,
+                ProductProtocolViolation::IceGeneration(IceGenerationViolation::RoleMismatch {
+                    expected: roles.remote,
+                    actual: credentials.role,
+                }),
+            );
+        }
+        let next = self
+            .ice_generation
+            .begin(&credentials, self.expected_stamp.session_id)
+            .map_err(|v| {
+                self.connection.close_for_protocol_violation();
+                ProductSessionError::PeerProtocol(ProductProtocolViolation::IceGeneration(v))
+            })?;
+        // Persist the half-generation before the second network await. If the
+        // future is externally cancelled, the mode cannot fall back to legacy
+        // advertisement and the armed operation guard closes the connection.
+        self.ice_generation = next;
+        let candidate_message = self.next_control_private().await?;
+        if candidate_message.kind != ControlKind::IceCandidate {
+            return fail_peer_protocol(
+                &self.connection,
+                ProductProtocolViolation::UnexpectedCandidateKind {
+                    actual: candidate_message.kind,
+                },
+            );
+        }
+        let candidates =
+            CandidateExchange::decode(&candidate_message.payload).map_err(|error| {
+                self.connection.close_for_protocol_violation();
+                ProductSessionError::PeerProtocol(ProductProtocolViolation::CandidateExchange(
+                    CandidateExchangeViolation::Malformed(error),
+                ))
+            })?;
+        let committed = self
+            .ice_generation
+            .clone()
+            .finish(&candidates)
+            .map_err(|v| {
+                self.connection.close_for_protocol_violation();
+                ProductSessionError::PeerProtocol(ProductProtocolViolation::IceGeneration(v))
+            })?;
+        self.ice_generation = committed;
+        operation.commit();
+        Ok((credentials, candidates))
+    }
+
+    /// Reads one non-ICE control message. ICE credentials and candidates must
+    /// use their typed APIs so capability, role, generation, and mode state
+    /// cannot be bypassed.
     pub async fn next_control(&mut self) -> Result<ProductControlMessage, ProductSessionError> {
+        let mut operation = FailClosedControlRead::new(self.connection.clone());
+        let message = self.next_control_private().await?;
+        if matches!(
+            message.kind,
+            ControlKind::IceCredentials | ControlKind::IceCandidate
+        ) {
+            return Err(ProductSessionError::IceGeneration(
+                IceGenerationViolation::IceControlRequiresTypedApi,
+            ));
+        }
+        let result = ProductControlMessage {
+            kind: message.kind,
+            payload: Bytes::copy_from_slice(&message.payload),
+        };
+        operation.commit();
+        Ok(result)
+    }
+
+    async fn next_control_private(&mut self) -> Result<PrivateControlMessage, ProductSessionError> {
         let record = self
             .stream
             .next_record()
@@ -897,7 +1359,15 @@ impl ControlReceiver {
                 },
             );
         }
-        let packet = ControlPacket::decode(&record.payload)?;
+        let packet = match ControlPacket::decode(&record.payload) {
+            Ok(packet) => packet,
+            Err(error) => {
+                return fail_peer_protocol(
+                    &self.connection,
+                    ProductProtocolViolation::MalformedControl(error),
+                )
+            }
+        };
         if packet.header.session_id != self.expected_stamp.session_id {
             return fail_peer_protocol(
                 &self.connection,
@@ -907,9 +1377,9 @@ impl ControlReceiver {
                 },
             );
         }
-        Ok(ProductControlMessage {
+        Ok(PrivateControlMessage {
             kind: packet.header.kind,
-            payload: Bytes::copy_from_slice(packet.payload),
+            payload: Zeroizing::new(packet.payload.to_vec()),
         })
     }
 
@@ -918,7 +1388,12 @@ impl ControlReceiver {
     pub async fn next_candidate_exchange(
         &mut self,
     ) -> Result<CandidateExchange, ProductSessionError> {
-        let message = self.next_control().await?;
+        let next_mode = self
+            .ice_generation
+            .advertisement()
+            .map_err(ProductSessionError::IceGeneration)?;
+        let mut operation = FailClosedControlRead::new(self.connection.clone());
+        let message = self.next_control_private().await?;
         if message.kind != ControlKind::IceCandidate {
             return fail_peer_protocol(
                 &self.connection,
@@ -949,12 +1424,16 @@ impl ControlReceiver {
                 ),
             );
         }
-        if let Err(violation) = self.candidate_exchange.accept_validated(&exchange) {
+        let mut next_candidate = self.candidate_exchange.clone();
+        if let Err(violation) = next_candidate.accept_validated(&exchange) {
             return fail_peer_protocol(
                 &self.connection,
                 ProductProtocolViolation::CandidateExchange(violation),
             );
         }
+        self.candidate_exchange = next_candidate;
+        self.ice_generation = next_mode;
+        operation.commit();
         Ok(exchange)
     }
 }
@@ -1097,9 +1576,10 @@ mod tests {
     use super::*;
     use crate::quic::{bind_client, bind_server};
     use latencydesk_protocol::{
-        media_flags, video_capability_flags, CandidateType, IceCandidate, MediaKind, MediaPacket,
-        RelayProvider, TransportProtocol, VideoCodec, VideoCodecCapabilities, VideoProfile,
-        VideoStreamConfig, WireIpAddr, VIDEO_CODEC_CONTRACT_VERSION,
+        media_flags, video_capability_flags, video_stream_flags, CandidateType, IceCandidate,
+        MediaKind, MediaPacket, RelayProvider, TransportProtocol, VideoCodec,
+        VideoCodecCapabilities, VideoProfile, VideoStreamConfig, WireIpAddr,
+        VIDEO_CODEC_CONTRACT_VERSION,
     };
     use latencydesk_transport::{fragment_frame_with_packet_budget, FrameKey};
     use rcgen::generate_simple_self_signed;
@@ -1138,6 +1618,131 @@ mod tests {
                 related_address: None,
             }],
         }
+    }
+
+    fn credentials(
+        generation: u32,
+        exchange_id: u64,
+        role: IceCredentialRole,
+    ) -> IceCredentialExchange {
+        IceCredentialExchange::new(
+            1,
+            exchange_id,
+            generation,
+            role,
+            "ufrag".into(),
+            "abcdefghijklmnopqrstuv".into(),
+        )
+        .unwrap()
+    }
+
+    fn authenticated_ice_offer() -> VideoCodecCapabilities {
+        VideoCodecCapabilities {
+            contract_version: VIDEO_CODEC_CONTRACT_VERSION,
+            flags: video_capability_flags::RAW_NV12
+                | video_capability_flags::AUTHENTICATED_ICE_CREDENTIALS,
+            max_width: 2,
+            max_height: 2,
+            max_fps: 1,
+        }
+    }
+
+    fn authenticated_ice_selection() -> VideoStreamConfig {
+        VideoStreamConfig {
+            contract_version: VIDEO_CODEC_CONTRACT_VERSION,
+            codec: VideoCodec::RawNv12,
+            profile: VideoProfile::RawNv12,
+            pixel_format: u32::from_le_bytes(*b"NV12"),
+            stream_id: 1,
+            codec_epoch: 1,
+            width: 2,
+            height: 2,
+            fps: 1,
+            target_bitrate_bps: 1,
+            flags: video_stream_flags::AUTHENTICATED_ICE_CREDENTIALS,
+        }
+    }
+
+    #[test]
+    fn ice_generation_tracker_accepts_two_complete_generations() {
+        let mut tracker = IceGenerationTracker::default();
+        tracker = tracker
+            .begin(&credentials(1, 42, IceCredentialRole::Controlling), 42)
+            .unwrap();
+        tracker = tracker.finish(&candidate_exchange(1, 42)).unwrap();
+        tracker = tracker
+            .begin(&credentials(2, 42, IceCredentialRole::Controlling), 42)
+            .unwrap();
+        assert_eq!(
+            tracker
+                .finish(&candidate_exchange(2, 42))
+                .unwrap()
+                .generation,
+            2
+        );
+    }
+
+    #[test]
+    fn ice_generation_tracker_rejects_candidate_before_credentials() {
+        assert!(matches!(
+            IceGenerationTracker::default().finish(&candidate_exchange(1, 42)),
+            Err(IceGenerationViolation::CandidateBeforeCredentials)
+        ));
+    }
+
+    #[test]
+    fn ice_generation_tracker_rejects_id_generation_replay_gap_and_overflow() {
+        let mut tracker = IceGenerationTracker::default();
+        assert!(matches!(
+            tracker.begin(&credentials(1, 9, IceCredentialRole::Controlled), 42),
+            Err(IceGenerationViolation::ExchangeId { .. })
+        ));
+        tracker = tracker
+            .begin(&credentials(1, 42, IceCredentialRole::Controlled), 42)
+            .unwrap();
+        assert!(matches!(
+            tracker.begin(&credentials(1, 42, IceCredentialRole::Controlled), 42),
+            Err(IceGenerationViolation::Pending)
+        ));
+        tracker = tracker.finish(&candidate_exchange(1, 42)).unwrap();
+        assert!(matches!(
+            tracker.begin(&credentials(3, 42, IceCredentialRole::Controlled), 42),
+            Err(IceGenerationViolation::Generation { .. })
+        ));
+        let exhausted = IceGenerationTracker {
+            exchange_id: Some(42),
+            generation: u32::MAX,
+            pending: None,
+            mode: Some(IceSignalingMode::CredentialGenerations),
+            poisoned: false,
+        };
+        assert!(matches!(
+            exhausted.begin(&credentials(1, 42, IceCredentialRole::Controlled), 42),
+            Err(IceGenerationViolation::GenerationExhausted)
+        ));
+    }
+
+    #[test]
+    fn ice_generation_tracker_rejects_candidate_id_or_generation_mismatch() {
+        let tracker = IceGenerationTracker::default()
+            .begin(&credentials(1, 42, IceCredentialRole::Controlling), 42)
+            .unwrap();
+        assert!(matches!(
+            tracker.clone().finish(&candidate_exchange(1, 43)),
+            Err(IceGenerationViolation::ExchangeId { .. })
+        ));
+        assert!(matches!(
+            tracker.finish(&candidate_exchange(2, 42)),
+            Err(IceGenerationViolation::Generation { .. })
+        ));
+    }
+
+    #[test]
+    fn ice_credentials_debug_redacts_secret_and_role_is_explicit() {
+        let value = credentials(1, 42, IceCredentialRole::Controlled);
+        let debug = format!("{value:?}");
+        assert!(!debug.contains("abcdefghijklmnopqrstuv"));
+        assert!(debug.contains("<redacted>"));
     }
 
     #[test]
@@ -1325,6 +1930,539 @@ mod tests {
         (host.expect("host session"), client.expect("client session"))
     }
 
+    async fn configure_ice_pair(host: &ProductSession, client: &ProductSession) {
+        let offered = authenticated_ice_offer();
+        let selected = authenticated_ice_selection();
+        let (host_result, client_result) = tokio::join!(
+            host.enable_authenticated_ice_signaling(offered, selected),
+            client.enable_authenticated_ice_signaling(offered, selected),
+        );
+        host_result.unwrap();
+        client_result.unwrap();
+    }
+
+    async fn send_raw_product_control(session: &ProductSession, kind: ControlKind, payload: &[u8]) {
+        let control = ControlPacket::encode(
+            ControlHeader {
+                kind,
+                flags: 0,
+                session_id: session.stamp.session_id,
+                payload_len: u32::try_from(payload.len()).unwrap(),
+            },
+            payload,
+        )
+        .unwrap();
+        let record = StreamRecord::encode(StreamKind::Control, session.stamp, &control).unwrap();
+        session.connection.send_control(&record).await.unwrap();
+    }
+
+    async fn send_raw_ice_generation(
+        session: &ProductSession,
+        credentials: &IceCredentialExchange,
+        candidates: &CandidateExchange,
+    ) {
+        let credential_payload = credentials.encode().unwrap();
+        send_raw_product_control(session, ControlKind::IceCredentials, &credential_payload).await;
+        send_raw_product_control(
+            session,
+            ControlKind::IceCandidate,
+            &candidates.encode().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_generation_product_round_trip_is_ordered_and_role_bound() {
+        let (host, client) = product_pair(1_450).await;
+        configure_ice_pair(&host, &client).await;
+        client
+            .send_ice_generation(
+                credentials(1, 41, IceCredentialRole::Controlling),
+                candidate_exchange(1, 41),
+            )
+            .await
+            .unwrap();
+        let mut receiver = host.accept_control_receiver().await.unwrap();
+        for generation in 1..=2 {
+            if generation > 1 {
+                client
+                    .send_ice_generation(
+                        credentials(generation, 41, IceCredentialRole::Controlling),
+                        candidate_exchange(generation, 41),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let (received_credentials, received_candidates) =
+                receiver.next_ice_generation().await.unwrap();
+            assert_eq!(received_credentials.exchange_id, 41);
+            assert_eq!(received_credentials.generation, generation);
+            assert_eq!(received_credentials.role, IceCredentialRole::Controlling);
+            assert_eq!(received_credentials.password_len(), 22);
+            assert_eq!(received_candidates.generation, generation);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_generation_requires_negotiated_session_roles_and_typed_control() {
+        let (_host, client) = product_pair(1_450).await;
+        assert!(matches!(
+            client
+                .send_ice_generation(
+                    credentials(1, 41, IceCredentialRole::Controlling),
+                    candidate_exchange(1, 41),
+                )
+                .await,
+            Err(ProductSessionError::IceGeneration(
+                IceGenerationViolation::IceSignalingNotNegotiated
+            ))
+        ));
+        let mut receiver = client.accept_control_receiver().await.unwrap();
+        assert!(matches!(
+            receiver.next_ice_generation().await,
+            Err(ProductSessionError::IceGeneration(
+                IceGenerationViolation::IceSignalingNotNegotiated
+            ))
+        ));
+        let offered = authenticated_ice_offer();
+        let selected = authenticated_ice_selection();
+        assert!(matches!(
+            client
+                .enable_authenticated_ice_signaling(
+                    VideoCodecCapabilities {
+                        flags: video_capability_flags::RAW_NV12,
+                        ..offered
+                    },
+                    selected,
+                )
+                .await,
+            Err(ProductSessionError::IceGeneration(
+                IceGenerationViolation::IceCapabilityNotNegotiated
+            ))
+        ));
+        assert!(matches!(
+            client
+                .enable_authenticated_ice_signaling(
+                    offered,
+                    VideoStreamConfig {
+                        flags: 0,
+                        ..selected
+                    },
+                )
+                .await,
+            Err(ProductSessionError::IceGeneration(
+                IceGenerationViolation::IceCapabilityNotNegotiated
+            ))
+        ));
+        client
+            .enable_authenticated_ice_signaling(offered, selected)
+            .await
+            .unwrap();
+        client
+            .enable_authenticated_ice_signaling(offered, selected)
+            .await
+            .unwrap();
+        for kind in [ControlKind::IceCredentials, ControlKind::IceCandidate] {
+            assert!(matches!(
+                client.send_control(kind, &[1, 2, 3]).await,
+                Err(ProductSessionError::IceGeneration(
+                    IceGenerationViolation::IceControlRequiresTypedApi
+                ))
+            ));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_advertisement_and_credential_generations_are_mutually_exclusive() {
+        let (host, client) = product_pair(1_450).await;
+        configure_ice_pair(&host, &client).await;
+        let advertised = candidate_exchange(1, 41);
+        client
+            .send_candidate_exchange(advertised.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            client
+                .send_ice_generation(
+                    credentials(1, 41, IceCredentialRole::Controlling),
+                    candidate_exchange(1, 41),
+                )
+                .await,
+            Err(ProductSessionError::IceGeneration(
+                IceGenerationViolation::ModeConflict
+            ))
+        ));
+        let mut receiver = host.accept_control_receiver().await.unwrap();
+        assert_eq!(
+            receiver.next_candidate_exchange().await.unwrap(),
+            advertised
+        );
+        assert!(matches!(
+            receiver.next_ice_generation().await,
+            Err(ProductSessionError::IceGeneration(
+                IceGenerationViolation::ModeConflict
+            ))
+        ));
+
+        let (host, client) = product_pair(1_450).await;
+        configure_ice_pair(&host, &client).await;
+        client
+            .send_ice_generation(
+                credentials(1, 41, IceCredentialRole::Controlling),
+                candidate_exchange(1, 41),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            client
+                .send_candidate_exchange(candidate_exchange(1, 41))
+                .await,
+            Err(ProductSessionError::IceGeneration(
+                IceGenerationViolation::ModeConflict
+            ))
+        ));
+        let mut receiver = host.accept_control_receiver().await.unwrap();
+        receiver.next_ice_generation().await.unwrap();
+        assert!(matches!(
+            receiver.next_candidate_exchange().await,
+            Err(ProductSessionError::IceGeneration(
+                IceGenerationViolation::ModeConflict
+            ))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_mixed_ice_apis_select_exactly_one_wire_mode() {
+        let (host, client) = product_pair(1_450).await;
+        configure_ice_pair(&host, &client).await;
+        let advertisement_sender = client.clone();
+        let generation_sender = client.clone();
+        let advertisement = candidate_exchange(1, 41);
+        let (advertisement_result, generation_result) = tokio::join!(
+            advertisement_sender.send_candidate_exchange(advertisement.clone()),
+            generation_sender.send_ice_generation(
+                credentials(1, 41, IceCredentialRole::Controlling),
+                candidate_exchange(1, 41),
+            ),
+        );
+        assert_ne!(advertisement_result.is_ok(), generation_result.is_ok());
+        let mut receiver = host.accept_control_receiver().await.unwrap();
+        if advertisement_result.is_ok() {
+            assert!(matches!(
+                generation_result,
+                Err(ProductSessionError::IceGeneration(
+                    IceGenerationViolation::ModeConflict
+                ))
+            ));
+            assert_eq!(
+                receiver.next_candidate_exchange().await.unwrap(),
+                advertisement
+            );
+        } else {
+            assert!(matches!(
+                advertisement_result,
+                Err(ProductSessionError::IceGeneration(
+                    IceGenerationViolation::ModeConflict
+                ))
+            ));
+            let (received_credentials, received_candidates) =
+                receiver.next_ice_generation().await.unwrap();
+            assert_eq!(received_credentials.generation, 1);
+            assert_eq!(received_candidates.generation, 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_ice_senders_poison_mode_and_close_the_connection() {
+        let (host, mut client) = product_pair(1_450).await;
+        configure_ice_pair(&host, &client).await;
+        let hook = Arc::new(IceSendCancellationHook::default());
+        client.ice_send_cancellation_hook = Some(Arc::clone(&hook));
+        let sender = client.clone();
+        let task = tokio::spawn(async move {
+            sender
+                .send_ice_generation(
+                    credentials(1, 41, IceCredentialRole::Controlling),
+                    candidate_exchange(1, 41),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), hook.reached.notified())
+            .await
+            .expect("credentials reached the wire before cancellation");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(client.ice_generation.lock().await.poisoned);
+        tokio::time::timeout(Duration::from_secs(1), host.connection.closed())
+            .await
+            .expect("credential cancellation closed the peer connection");
+
+        let (host, mut client) = product_pair(1_450).await;
+        let hook = Arc::new(IceSendCancellationHook::default());
+        client.ice_send_cancellation_hook = Some(Arc::clone(&hook));
+        let sender = client.clone();
+        let task = tokio::spawn(async move {
+            sender
+                .send_candidate_exchange(candidate_exchange(1, 41))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), hook.reached.notified())
+            .await
+            .expect("candidate reached the wire before cancellation");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(client.ice_generation.lock().await.poisoned);
+        tokio::time::timeout(Duration::from_secs(1), host.connection.closed())
+            .await
+            .expect("candidate cancellation closed the peer connection");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_ice_receive_persists_pending_mode_and_closes() {
+        let (host, client) = product_pair(1_450).await;
+        configure_ice_pair(&host, &client).await;
+        let credential_payload = credentials(1, 41, IceCredentialRole::Controlling)
+            .encode()
+            .unwrap();
+        send_raw_product_control(&client, ControlKind::IceCredentials, &credential_payload).await;
+        let mut receiver = host.accept_control_receiver().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), receiver.next_ice_generation())
+                .await
+                .is_err()
+        );
+        assert_eq!(receiver.ice_generation.pending, Some(1));
+        assert_eq!(
+            receiver.ice_generation.mode,
+            Some(IceSignalingMode::CredentialGenerations)
+        );
+        assert!(matches!(
+            receiver.next_candidate_exchange().await,
+            Err(ProductSessionError::IceGeneration(
+                IceGenerationViolation::ModeConflict
+            ))
+        ));
+        tokio::time::timeout(Duration::from_secs(1), client.connection.closed())
+            .await
+            .expect("peer observed cancellation close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generic_control_receive_rejects_ice_and_debug_never_renders_payload() {
+        let message = ProductControlMessage {
+            kind: ControlKind::IceCredentials,
+            payload: Bytes::from_static(b"do-not-render-this-secret"),
+        };
+        let rendered = format!("{message:?}");
+        assert!(!rendered.contains("do-not-render-this-secret"));
+        assert!(rendered.contains("<redacted>"));
+
+        for kind in [ControlKind::IceCredentials, ControlKind::IceCandidate] {
+            let (host, client) = product_pair(1_450).await;
+            send_raw_product_control(&client, kind, &[1, 2, 3]).await;
+            let mut receiver = host.accept_control_receiver().await.unwrap();
+            assert!(matches!(
+                receiver.next_control().await,
+                Err(ProductSessionError::IceGeneration(
+                    IceGenerationViolation::IceControlRequiresTypedApi
+                ))
+            ));
+            tokio::time::timeout(Duration::from_secs(1), client.connection.closed())
+                .await
+                .expect("generic ICE receive closed the peer connection");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_duplicate_ice_generation_has_exactly_one_sender_winner() {
+        let (host, client) = product_pair(1_450).await;
+        configure_ice_pair(&host, &client).await;
+        let first = client.clone();
+        let second = client.clone();
+        let (first_result, second_result) = tokio::join!(
+            first.send_ice_generation(
+                credentials(1, 41, IceCredentialRole::Controlling),
+                candidate_exchange(1, 41),
+            ),
+            second.send_ice_generation(
+                credentials(1, 41, IceCredentialRole::Controlling),
+                candidate_exchange(1, 41),
+            ),
+        );
+        assert_ne!(first_result.is_ok(), second_result.is_ok());
+        let error = if let Err(error) = first_result {
+            error
+        } else {
+            second_result.unwrap_err()
+        };
+        assert!(matches!(
+            error,
+            ProductSessionError::IceGeneration(IceGenerationViolation::Generation {
+                expected: 2,
+                actual: 1
+            })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_generation_rejects_local_and_remote_role_mismatch() {
+        let (host, client) = product_pair(1_450).await;
+        configure_ice_pair(&host, &client).await;
+        assert!(matches!(
+            client
+                .send_ice_generation(
+                    credentials(1, 41, IceCredentialRole::Controlled),
+                    candidate_exchange(1, 41),
+                )
+                .await,
+            Err(ProductSessionError::IceGeneration(
+                IceGenerationViolation::RoleMismatch { .. }
+            ))
+        ));
+        send_raw_ice_generation(
+            &client,
+            &credentials(1, 41, IceCredentialRole::Controlled),
+            &candidate_exchange(1, 41),
+        )
+        .await;
+        let mut receiver = host.accept_control_receiver().await.unwrap();
+        assert!(matches!(
+            receiver.next_ice_generation().await,
+            Err(ProductSessionError::PeerProtocol(
+                ProductProtocolViolation::IceGeneration(
+                    IceGenerationViolation::RoleMismatch { .. }
+                )
+            ))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_before_credentials_and_malformed_credentials_fail_closed() {
+        let (host, client) = product_pair(1_450).await;
+        configure_ice_pair(&host, &client).await;
+        send_raw_product_control(
+            &client,
+            ControlKind::IceCandidate,
+            &candidate_exchange(1, 41).encode().unwrap(),
+        )
+        .await;
+        let mut receiver = host.accept_control_receiver().await.unwrap();
+        assert!(matches!(
+            receiver.next_ice_generation().await,
+            Err(ProductSessionError::PeerProtocol(
+                ProductProtocolViolation::UnexpectedCredentialsKind {
+                    actual: ControlKind::IceCandidate
+                }
+            ))
+        ));
+
+        let (host, client) = product_pair(1_450).await;
+        configure_ice_pair(&host, &client).await;
+        assert!(matches!(
+            client
+                .send_control(ControlKind::IceCredentials, &[1, 2, 3])
+                .await,
+            Err(ProductSessionError::IceGeneration(
+                IceGenerationViolation::IceControlRequiresTypedApi
+            ))
+        ));
+        send_raw_product_control(&client, ControlKind::IceCredentials, &[1, 2, 3]).await;
+        let mut receiver = host.accept_control_receiver().await.unwrap();
+        let error = receiver.next_ice_generation().await.unwrap_err();
+        assert!(matches!(
+            error,
+            ProductSessionError::PeerProtocol(ProductProtocolViolation::IceGeneration(
+                IceGenerationViolation::Malformed(_)
+            ))
+        ));
+        assert!(!format!("{error}").contains("abcdefghijklmnopqrstuv"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_typed_ice_write_poisoned_the_session_mode() {
+        let (host, client) = product_pair(1_450).await;
+        configure_ice_pair(&host, &client).await;
+        host.close(0x123, b"test peer shutdown");
+        tokio::time::timeout(Duration::from_secs(1), client.connection.closed())
+            .await
+            .expect("client observed peer shutdown");
+
+        assert!(matches!(
+            client
+                .send_ice_generation(
+                    credentials(1, 41, IceCredentialRole::Controlling),
+                    candidate_exchange(1, 41),
+                )
+                .await,
+            Err(ProductSessionError::Quic(_))
+        ));
+        assert!(matches!(
+            client
+                .send_ice_generation(
+                    credentials(1, 41, IceCredentialRole::Controlling),
+                    candidate_exchange(1, 41),
+                )
+                .await,
+            Err(ProductSessionError::IceGeneration(
+                IceGenerationViolation::Poisoned
+            ))
+        ));
+        assert!(matches!(
+            client
+                .send_candidate_exchange(candidate_exchange(1, 41))
+                .await,
+            Err(ProductSessionError::IceGeneration(
+                IceGenerationViolation::Poisoned
+            ))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_control_packet_closes_the_authenticated_connection() {
+        let (host, client) = product_pair(1_450).await;
+        let record = StreamRecord::encode(StreamKind::Control, client.stamp, &[1, 2, 3])
+            .expect("bounded malformed control record");
+        client.connection.send_control(&record).await.unwrap();
+        let mut receiver = host.accept_control_receiver().await.unwrap();
+        assert!(matches!(
+            receiver.next_control().await,
+            Err(ProductSessionError::PeerProtocol(
+                ProductProtocolViolation::MalformedControl(_)
+            ))
+        ));
+        tokio::time::timeout(Duration::from_secs(1), client.connection.closed())
+            .await
+            .expect("peer observed protocol close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_pre_handshake_ice_credentials_are_rejected() {
+        let pair = connected_pair(1_450).await;
+        let stamp = active_stamp(NonZeroU64::new(41).unwrap());
+        let credentials = credentials(1, 41, IceCredentialRole::Controlling);
+        let payload = credentials.encode().unwrap();
+        let packet = ControlPacket::encode(
+            ControlHeader {
+                kind: ControlKind::IceCredentials,
+                flags: 0,
+                session_id: 41,
+                payload_len: u32::try_from(payload.len()).unwrap(),
+            },
+            &payload,
+        )
+        .unwrap();
+        pair.server
+            .send_control(&StreamRecord::encode(StreamKind::Control, stamp, &packet).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            ProductSession::client(pair.client).await,
+            Err(ProductSessionError::PeerProtocol(
+                ProductProtocolViolation::UnexpectedHandshakeKind(ControlKind::IceCredentials)
+            ))
+        ));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn candidate_exchange_product_round_trip_and_sequence() {
         let (host, client) = product_pair(1_450).await;
@@ -1354,13 +2492,12 @@ mod tests {
             ))
         ));
 
-        client
-            .send_control(
-                ControlKind::IceCandidate,
-                &wrong_session.encode().expect("valid candidate payload"),
-            )
-            .await
-            .expect("raw mismatched advertisement");
+        send_raw_product_control(
+            &client,
+            ControlKind::IceCandidate,
+            &wrong_session.encode().expect("valid candidate payload"),
+        )
+        .await;
         let mut receiver = host.accept_control_receiver().await.expect("control lane");
         assert!(matches!(
             receiver.next_candidate_exchange().await,
@@ -1404,10 +2541,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn malformed_candidate_closes_active_connection() {
         let (host, client) = product_pair(1_450).await;
-        client
-            .send_control(ControlKind::IceCandidate, &[1, 2, 3])
-            .await
-            .unwrap();
+        send_raw_product_control(&client, ControlKind::IceCandidate, &[1, 2, 3]).await;
         let mut receiver = host.accept_control_receiver().await.unwrap();
         assert!(matches!(
             receiver.next_candidate_exchange().await,
