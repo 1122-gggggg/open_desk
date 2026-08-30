@@ -19,6 +19,7 @@ latencydesk-session = { path = "../../crates/session" }
 latencydesk-socket-transport = { path = "../../crates/socket-transport" }
 latencydesk-surface = { path = "../../crates/surface" }
 latencydesk-transport = { path = "../../crates/transport" }
+quinn = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 
 [target.'cfg(windows)'.dependencies]

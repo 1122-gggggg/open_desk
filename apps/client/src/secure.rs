@@ -2,6 +2,7 @@
 
 use super::ClientArgs;
 use latencydesk_input::{InputEvent, InputMessage};
+use latencydesk_protocol::quic::SessionStamp;
 #[cfg(test)]
 use latencydesk_socket_transport::identity::connect_exact_peer;
 use latencydesk_socket_transport::identity::{
@@ -15,6 +16,7 @@ use std::collections::VecDeque;
 use std::error::Error;
 #[cfg(any(windows, test))]
 use std::future::Future;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 const CLIENT_RELIABLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -30,6 +32,52 @@ const RECOVERY_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_QUEUED_ACCESS_UNITS: usize = 2;
 #[cfg(windows)]
 const VIEWER_IDLE_PARK: Duration = Duration::ZERO;
+
+async fn establish_product_session(
+    endpoint: &quinn::Endpoint,
+    candidates: &[SocketAddr],
+    exact_peer_certificate: &[u8],
+    operation_timeout: Duration,
+    previous: Option<SessionStamp>,
+) -> Result<(ProductSession, SocketAddr, usize), String> {
+    let candidate_timeout = operation_timeout.min(CLIENT_CANDIDATE_ATTEMPT_TIMEOUT);
+    tokio::time::timeout(operation_timeout, async {
+        let connected = connect_exact_peer_candidates(
+            endpoint,
+            candidates,
+            exact_peer_certificate,
+            candidate_timeout,
+        )
+        .await
+        .map_err(|error| format!("exact-peer mTLS connection failed: {error}"))?;
+        let selected_remote = connected.remote;
+        let attempts_started = connected.attempts_started;
+        let session = match previous {
+            Some(previous) => ProductSession::client_successor(connected.connection, previous).await,
+            None => ProductSession::client(connected.connection).await,
+        }
+        .map_err(|error| format!("secure product handshake failed: {error}"))?;
+        Ok::<_, String>((session, selected_remote, attempts_started))
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "secure connection timed out after {} seconds; verify address, firewall, and exchanged certificates",
+            operation_timeout.as_secs()
+        )
+    })?
+}
+
+fn log_active_session(session: &ProductSession, remote: SocketAddr, attempts_started: usize) {
+    let stamp = session.stamp();
+    println!("mTLS: exact host certificate authenticated");
+    println!("route: authenticated {remote} after racing {attempts_started} candidate(s)");
+    println!("handshake: active session_id={}", stamp.session_id);
+    println!(
+        "handshake-lifecycle: generation={} authorization_epoch={} display_epoch={} codec_epoch={}",
+        stamp.generation, stamp.authorization_epoch, stamp.display_epoch, stamp.codec_epoch
+    );
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -171,38 +219,31 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
     println!("transport: QUIC v1 / TLS 1.3 / exact-certificate mTLS");
 
     let candidates = super::connection_candidates(args);
-    let candidate_timeout = operation_timeout.min(CLIENT_CANDIDATE_ATTEMPT_TIMEOUT);
-    let (session, selected_remote, attempts_started) = runtime.block_on(async {
-        tokio::time::timeout(operation_timeout, async {
-            let connected = connect_exact_peer_candidates(
-                &endpoint,
-                &candidates,
-                &exact_peer_certificate,
-                candidate_timeout,
-            )
-            .await
-            .map_err(|error| format!("exact-peer mTLS connection failed: {error}"))?;
-            let selected_remote = connected.remote;
-            let attempts_started = connected.attempts_started;
-            let session = ProductSession::client(connected.connection)
-                .await
-                .map_err(|error| format!("secure product handshake failed: {error}"))?;
-            Ok::<_, String>((session, selected_remote, attempts_started))
-        })
-        .await
-        .map_err(|_| {
-            format!(
-                "secure connection timed out after {} seconds; verify address, firewall, and exchanged certificates",
-                operation_timeout.as_secs()
-            )
-        })?
-    })?;
+    let (session, selected_remote, attempts_started) =
+        runtime.block_on(establish_product_session(
+            &endpoint,
+            &candidates,
+            &exact_peer_certificate,
+            operation_timeout,
+            None,
+        ))?;
 
-    let session_id = session.stamp().session_id;
-    println!("route: authenticated {selected_remote} after racing {attempts_started} candidate(s)");
-    println!("handshake: active session_id={session_id}");
+    log_active_session(&session, selected_remote, attempts_started);
 
-    let result = if args.inject_probe {
+    let result = if args.session_count > 1 {
+        run_headless_successor_sequence(
+            SuccessorSequenceContext {
+                runtime: &runtime,
+                endpoint: &endpoint,
+                candidates: &candidates,
+                exact_peer_certificate: &exact_peer_certificate,
+                operation_timeout,
+            },
+            session,
+            args.max_frames.expect("parser requires frames"),
+            args.session_count,
+        )
+    } else if args.inject_probe {
         run_probe(
             &runtime,
             &session,
@@ -239,6 +280,75 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
             })
     });
     merge_cleanup_result(result, cleanup_result)
+}
+
+struct SuccessorSequenceContext<'a> {
+    runtime: &'a tokio::runtime::Runtime,
+    endpoint: &'a quinn::Endpoint,
+    candidates: &'a [SocketAddr],
+    exact_peer_certificate: &'a [u8],
+    operation_timeout: Duration,
+}
+
+fn run_headless_successor_sequence(
+    context: SuccessorSequenceContext<'_>,
+    first_session: ProductSession,
+    needed_frames: u64,
+    session_count: u32,
+) -> Result<(), Box<dyn Error>> {
+    let mut session = first_session;
+    for session_index in 1..=session_count {
+        let run_result = {
+            #[cfg(windows)]
+            {
+                run_headless_windows_h264(
+                    context.runtime,
+                    &session,
+                    needed_frames,
+                    context.operation_timeout,
+                )
+            }
+            #[cfg(not(windows))]
+            {
+                run_headless(
+                    context.runtime,
+                    &session,
+                    needed_frames,
+                    context.operation_timeout,
+                )
+            }
+        };
+        let previous = session.stamp();
+        session.close(
+            u32::from(run_result.is_err()),
+            if run_result.is_ok() {
+                b"client headless session complete"
+            } else {
+                b"client headless session failed"
+            },
+        );
+        run_result?;
+        if session_index >= session_count {
+            return Ok(());
+        }
+
+        println!(
+            "reconnect: starting authenticated successor {}/{}",
+            session_index + 1,
+            session_count
+        );
+        let (successor, remote, attempts_started) =
+            context.runtime.block_on(establish_product_session(
+                context.endpoint,
+                context.candidates,
+                context.exact_peer_certificate,
+                context.operation_timeout,
+                Some(previous),
+            ))?;
+        log_active_session(&successor, remote, attempts_started);
+        session = successor;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]

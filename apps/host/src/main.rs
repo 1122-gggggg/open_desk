@@ -34,6 +34,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LEGACY_MODE_ERROR: &str = "--client/--connect, --peer-alias, --approve/--auto-approve, --shared-secret, --device-fingerprint, --1080p120-profile, --width, and --height are legacy plaintext options; add --unsafe-udp-lab only in an isolated trusted lab, or use the secure certificate and capture options";
+const MAX_SECURE_SESSIONS: u32 = 16;
 
 const HOST_HELP: &str = "Usage: latencydesk-host [OPTIONS]\n\n\
 Options:\n  \
@@ -46,6 +47,7 @@ Options:\n  \
   --max-height <PIXELS>     Secure Linux X11 / Windows capture canvas height (default 720, even)\n  \
   --fps <FPS>               Secure capture frame rate, 1..=240 (default 60)\n  \
   --frames <COUNT>          Stop streaming after N frames\n  \
+  --max-sessions <COUNT>    Accept 1..=16 sequential secure sessions (Linux X11; default 1)\n  \
   --role host               Explicit role assertion\n  \
   --unsafe-udp-lab          Opt in to unauthenticated-server, plaintext legacy UDP\n  \
   --version, -V             Show the host version\n  \
@@ -76,6 +78,7 @@ pub struct HostArgs {
     pub max_height: u32,
     pub fps: u32,
     pub max_frames: Option<u64>,
+    pub max_sessions: u32,
     pub auto_approve: bool,
     pub shared_secret: Option<[u8; 32]>,
     pub pinned_fingerprints: Vec<[u8; 32]>,
@@ -85,6 +88,7 @@ pub struct HostArgs {
     pub unsafe_udp_lab: bool,
     pub show_version: bool,
     synthetic_geometry_explicit: bool,
+    max_sessions_explicit: bool,
 }
 
 impl Default for HostArgs {
@@ -101,6 +105,7 @@ impl Default for HostArgs {
             max_height: 720,
             fps: 60,
             max_frames: None,
+            max_sessions: 1,
             auto_approve: false,
             shared_secret: None,
             pinned_fingerprints: Vec::new(),
@@ -110,6 +115,7 @@ impl Default for HostArgs {
             unsafe_udp_lab: false,
             show_version: false,
             synthetic_geometry_explicit: false,
+            max_sessions_explicit: false,
         }
     }
 }
@@ -209,6 +215,14 @@ where
                 config.max_frames = Some(args[i + 1].parse()?);
                 i += 2;
             }
+            "--max-sessions" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --max-sessions".into());
+                }
+                config.max_sessions = args[i + 1].parse()?;
+                config.max_sessions_explicit = true;
+                i += 2;
+            }
             "--identity-cert" => {
                 if i + 1 >= args.len() {
                     return Err("missing value for --identity-cert".into());
@@ -301,6 +315,12 @@ where
     }
     if config.max_frames == Some(0) {
         return Err("frames must be positive and nonzero".into());
+    }
+    if !(1..=MAX_SECURE_SESSIONS).contains(&config.max_sessions) {
+        return Err(format!("max-sessions must be between 1 and {MAX_SECURE_SESSIONS}").into());
+    }
+    if config.unsafe_udp_lab && config.max_sessions_explicit {
+        return Err("--max-sessions is available only for secure Host mode".into());
     }
 
     let has_identity_flag = config.identity_cert.is_some()
@@ -416,7 +436,8 @@ impl SessionGate for HostSessionGate {
         if self.closed {
             return Err(AuthorityError::Closed);
         }
-        if permit.stamp().generation() != self.generation
+        if permit.stamp().session_id() != self.session_id
+            || permit.stamp().generation() != self.generation
             || permit.stamp().authorization_epoch() != self.authorization_epoch
             || permit.stamp().display_epoch() != self.display_epoch
             || permit.stamp().codec_epoch() != self.codec_epoch
@@ -1079,6 +1100,49 @@ mod tests {
         assert_eq!(args.identity_key, Some(PathBuf::from("host-key.der")));
         assert_eq!(args.peer_cert, Some(PathBuf::from("client.der")));
         assert!(!args.unsafe_udp_lab);
+    }
+
+    #[test]
+    fn host_parser_accepts_a_bounded_secure_session_count() {
+        let args = parse_host_args_from([
+            "latencydesk-host",
+            "--identity-cert",
+            "host.der",
+            "--identity-key",
+            "host-key.der",
+            "--peer-cert",
+            "client.der",
+            "--max-sessions",
+            "2",
+        ])
+        .expect("bounded persistent listener");
+        assert_eq!(args.max_sessions, 2);
+        assert_eq!(HostArgs::default().max_sessions, 1);
+
+        for invalid in ["0", "17"] {
+            assert!(parse_host_args_from(["latencydesk-host", "--max-sessions", invalid]).is_err());
+        }
+        assert!(parse_host_args_from([
+            "latencydesk-host",
+            "--unsafe-udp-lab",
+            "--approve",
+            "--max-sessions",
+            "2",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn host_session_gate_rejects_a_foreign_session_permit() {
+        let gate = HostSessionGate::new(SessionId::new(7).expect("session"));
+        let foreign = DispatchPermit::from_stamp(
+            DispatchStamp::new(SessionId::new(8).expect("foreign"), 1, 1, 1, 1)
+                .expect("foreign stamp"),
+        );
+        assert_eq!(
+            gate.recheck(&foreign, 0),
+            Err(AuthorityError::StaleDispatch)
+        );
     }
 
     #[test]

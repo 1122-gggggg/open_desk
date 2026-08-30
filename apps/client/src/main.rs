@@ -34,6 +34,7 @@ mod software_viewer;
 const MAX_PAIRING_TIMEOUT_SECS: u64 = 3_600;
 const MAX_CONCURRENT_TARGETS: usize = 16;
 const MAX_FALLBACK_ADDRESS_ARGUMENTS: usize = 16;
+const MAX_CLIENT_SESSIONS: u32 = 16;
 
 #[derive(Debug)]
 struct TargetChildPlan {
@@ -57,6 +58,7 @@ pub struct ClientArgs {
     pub pairing_timeout_secs: u64,
     pub profile_1080p120: bool,
     pub max_frames: Option<u64>,
+    pub session_count: u32,
     pub width: u32,
     pub height: u32,
     pub auto_approve: bool,
@@ -80,6 +82,7 @@ impl Default for ClientArgs {
             pairing_timeout_secs: 60,
             profile_1080p120: false,
             max_frames: None,
+            session_count: 1,
             width: 1280,
             height: 720,
             auto_approve: false,
@@ -167,6 +170,13 @@ where
                     return Err("missing value for --frames".into());
                 }
                 config.max_frames = Some(args[i + 1].parse()?);
+                i += 2;
+            }
+            "--session-count" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --session-count".into());
+                }
+                config.session_count = args[i + 1].parse()?;
                 i += 2;
             }
             "--width" => {
@@ -257,6 +267,7 @@ where
                        --width <PIXELS>          Probe coordinate width (--inject-probe only; default 1280)\n  \
                        --height <PIXELS>         Probe coordinate height (--inject-probe only; default 720)\n  \
                        --frames <COUNT>          Receive N completed frames then exit (headless)\n  \
+                       --session-count <COUNT>   Run 1..=16 clean sequential headless sessions (default 1)\n  \
                        --inject-probe            Send one pointer move and ReleaseAll, wait 3 frames, exit\n  \
                        --role client             Explicit role assertion\n  \
                        --version, -V             Show version information\n  \
@@ -285,6 +296,9 @@ where
     }
     if config.inject_probe && config.max_frames.is_some() {
         return Err("--inject-probe and --frames are mutually exclusive".into());
+    }
+    if !(1..=MAX_CLIENT_SESSIONS).contains(&config.session_count) {
+        return Err(format!("--session-count must be between 1 and {MAX_CLIENT_SESSIONS}").into());
     }
     if config.pairing_timeout_secs == 0 || config.pairing_timeout_secs > MAX_PAIRING_TIMEOUT_SECS {
         return Err(format!(
@@ -347,6 +361,16 @@ where
         if config.targets.len() == 1 {
             config.connect_addr = config.targets[0].0;
             config.peer_cert = Some(config.targets[0].1.clone());
+        }
+    }
+    if config.session_count > 1 {
+        if config.max_frames.is_none() {
+            return Err("--session-count greater than 1 currently requires --frames".into());
+        }
+        if config.unsafe_udp_lab || config.inject_probe || !config.targets.is_empty() {
+            return Err(
+                "--session-count greater than 1 requires one secure headless Host target".into(),
+            );
         }
     }
     if config.show_version {
@@ -1378,6 +1402,43 @@ mod tests {
         ])
         .expect_err("probe geometry has no multi-target meaning");
         assert!(error.to_string().contains("probe geometry"));
+    }
+
+    #[test]
+    fn client_parser_accepts_only_bounded_headless_successor_sessions() {
+        let args = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client.der",
+            "--identity-key",
+            "key.der",
+            "--peer-cert",
+            "host.der",
+            "--frames",
+            "3",
+            "--session-count",
+            "2",
+        ])
+        .expect("bounded headless reconnect sequence");
+        assert_eq!(args.session_count, 2);
+        assert_eq!(ClientArgs::default().session_count, 1);
+
+        for arguments in [
+            vec!["latencydesk-client", "--session-count", "0"],
+            vec!["latencydesk-client", "--session-count", "17"],
+            vec!["latencydesk-client", "--session-count", "2"],
+            vec![
+                "latencydesk-client",
+                "--unsafe-udp-lab",
+                "--approve",
+                "--frames",
+                "1",
+                "--session-count",
+                "2",
+            ],
+        ] {
+            assert!(parse_client_args_from(arguments).is_err());
+        }
     }
 
     #[test]

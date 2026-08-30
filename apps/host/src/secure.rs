@@ -92,6 +92,7 @@ mod linux {
         media_flags, select_host_codec, ControlKind, MediaKind, VideoCodec, VideoCodecCapabilities,
         VideoProfile, VideoStreamConfig, VIDEO_CODEC_CONTRACT_VERSION,
     };
+    use latencydesk_session::lifecycle::ProductStampAllocator;
     use latencydesk_socket_transport::identity::{
         accept_exact_peer_with_timeout, certificate_fingerprint, load_certificate_der,
         mtls_server_config, IdentityError, TlsIdentity,
@@ -172,6 +173,13 @@ mod linux {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SessionEnd {
+        PeerCompleted,
+        FrameLimit,
+        HostShutdown,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum AcceptFailureDisposition {
         RejectAndContinue,
         Fatal,
@@ -186,6 +194,7 @@ mod linux {
         let peer_certificate = load_certificate_der(peer_cert)?;
         let server_config = mtls_server_config(&identity, &peer_certificate)?;
         let endpoint = bind_server(server_config, args.listen_addr)?;
+        let mut stamp_allocator = ProductStampAllocator::new();
 
         println!("=== LatencyDesk Host ===");
         println!("Mode: TLS 1.3 mutual authentication over QUIC");
@@ -195,84 +204,97 @@ mod linux {
             hex(&certificate_fingerprint(&peer_certificate))
         );
         println!("Listening securely on {}", endpoint.local_addr()?);
+        println!(
+            "listener: accepting up to {} secure session(s)",
+            args.max_sessions
+        );
 
-        let pairing_deadline =
-            tokio::time::Instant::now() + Duration::from_secs(args.pairing_timeout_secs);
-        let mut rejected_connections = 0_u64;
-        // Deliberately sequential: only one application-level TLS
-        // authentication attempt is alive at a time. The inner timeout starts
-        // after Quinn yields an Incoming, while this outer timeout enforces the
-        // total pairing deadline including time spent waiting for Initials.
-        let connection = loop {
-            let now = tokio::time::Instant::now();
-            if now >= pairing_deadline {
-                close_endpoint!(endpoint, false, b"peer authentication timed out");
-                return Err(pairing_timeout_error(args, rejected_connections).into());
-            }
-
-            match tokio::time::timeout(
-                pairing_deadline.saturating_duration_since(now),
-                accept_exact_peer_with_timeout(
-                    &endpoint,
-                    &peer_certificate,
-                    AUTHENTICATION_ATTEMPT_TIMEOUT,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(connection)) => break connection,
-                Ok(Err(error))
-                    if classify_accept_failure(&error) == AcceptFailureDisposition::Fatal =>
-                {
-                    close_endpoint!(endpoint, false, b"QUIC listener failed");
-                    return Err(format!(
-                        "secure QUIC listener failed after rejecting {rejected_connections} unauthenticated connection(s): {error}"
-                    )
-                    .into());
-                }
-                Ok(Err(error)) => {
-                    rejected_connections = rejected_connections.saturating_add(1);
-                    if should_log_rejection(rejected_connections) {
-                        eprintln!(
-                            "mTLS: rejected unauthenticated connection #{rejected_connections}: {error}"
-                        );
-                    }
-                }
-                Err(_) => {
+        let mut completed_sessions = 0_u32;
+        loop {
+            let pairing_deadline =
+                tokio::time::Instant::now() + Duration::from_secs(args.pairing_timeout_secs);
+            let mut rejected_connections = 0_u64;
+            // Deliberately sequential: only one application-level TLS
+            // authentication attempt is alive at a time. The inner timeout starts
+            // after Quinn yields an Incoming, while this outer timeout enforces the
+            // total pairing deadline including time spent waiting for Initials.
+            let connection = loop {
+                let now = tokio::time::Instant::now();
+                if now >= pairing_deadline {
                     close_endpoint!(endpoint, false, b"peer authentication timed out");
                     return Err(pairing_timeout_error(args, rejected_connections).into());
                 }
-            }
-        };
-        println!(
+
+                match tokio::time::timeout(
+                    pairing_deadline.saturating_duration_since(now),
+                    accept_exact_peer_with_timeout(
+                        &endpoint,
+                        &peer_certificate,
+                        AUTHENTICATION_ATTEMPT_TIMEOUT,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(connection)) => break connection,
+                    Ok(Err(error))
+                        if classify_accept_failure(&error) == AcceptFailureDisposition::Fatal =>
+                    {
+                        close_endpoint!(endpoint, false, b"QUIC listener failed");
+                        return Err(format!(
+                        "secure QUIC listener failed after rejecting {rejected_connections} unauthenticated connection(s): {error}"
+                    )
+                    .into());
+                    }
+                    Ok(Err(error)) => {
+                        rejected_connections = rejected_connections.saturating_add(1);
+                        if should_log_rejection(rejected_connections) {
+                            eprintln!(
+                            "mTLS: rejected unauthenticated connection #{rejected_connections}: {error}"
+                        );
+                        }
+                    }
+                    Err(_) => {
+                        close_endpoint!(endpoint, false, b"peer authentication timed out");
+                        return Err(pairing_timeout_error(args, rejected_connections).into());
+                    }
+                }
+            };
+            println!(
             "mTLS: exact client certificate authenticated (rejected {rejected_connections} unauthenticated connection(s))"
         );
 
-        // X11 capture and XTEST input are intentionally opened only after the
-        // remote certificate has passed exact-byte verification.
-        let mut desktop = match X11DesktopSession::open() {
-            Ok(desktop) => desktop,
-            Err(error) => {
-                close_endpoint!(endpoint, false, b"capture provider initialization failed");
-                return Err(error.into());
-            }
-        };
-        let session_id = match NonZeroU64::new(super::super::assign_session_id()) {
-            Some(session_id) => session_id,
-            None => {
-                close_endpoint!(endpoint, false, b"session id allocation failed");
-                return Err("failed to allocate a nonzero session id".into());
-            }
-        };
-        let session = match ProductSession::host(connection, session_id).await {
-            Ok(session) => session,
-            Err(error) => {
-                close_endpoint!(endpoint, false, b"product session activation failed");
-                return Err(error.into());
-            }
-        };
-        println!("session: active session_id={session_id}");
-        let negotiation_result = async {
+            // X11 capture and XTEST input are intentionally opened only after the
+            // remote certificate has passed exact-byte verification.
+            let mut desktop = match X11DesktopSession::open() {
+                Ok(desktop) => desktop,
+                Err(error) => {
+                    close_endpoint!(endpoint, false, b"capture provider initialization failed");
+                    return Err(error.into());
+                }
+            };
+            let session_stamp = match stamp_allocator.allocate() {
+                Ok(stamp) => stamp,
+                Err(error) => {
+                    close_endpoint!(endpoint, false, b"session id allocation failed");
+                    return Err(error.into());
+                }
+            };
+            let session = match ProductSession::host_with_stamp(connection, session_stamp).await {
+                Ok(session) => session,
+                Err(error) => {
+                    close_endpoint!(endpoint, false, b"product session activation failed");
+                    return Err(error.into());
+                }
+            };
+            println!("session: active session_id={}", session_stamp.session_id);
+            println!(
+            "session-lifecycle: generation={} authorization_epoch={} display_epoch={} codec_epoch={}",
+            session_stamp.generation,
+            session_stamp.authorization_epoch,
+            session_stamp.display_epoch,
+            session_stamp.codec_epoch
+        );
+            let negotiation_result = async {
             let mut control_receiver = tokio::time::timeout(
                 AUTHENTICATION_ATTEMPT_TIMEOUT,
                 session.accept_control_receiver(),
@@ -364,116 +386,130 @@ mod linux {
             Ok::<_, Box<dyn Error>>((control_receiver, capture_plan, encoder))
         }
         .await;
-        let (_control_receiver, capture_plan, mut encoder) = match negotiation_result {
-            Ok(negotiated) => negotiated,
-            Err(error) => {
-                close_endpoint!(endpoint, false, b"codec negotiation failed");
-                return Err(error);
-            }
-        };
-
-        let (status_tx, mut status_rx) = mpsc::channel(INPUT_STATUS_CAPACITY);
-        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-        let input_session = session.clone();
-        let input_epoch = session.stamp().authorization_epoch;
-        let input_task = tokio::spawn(async move {
-            tokio::pin!(stop_rx);
-            let mut input_desktop = match X11DesktopSession::open() {
-                Ok(desktop) => desktop,
+            let (_control_receiver, capture_plan, mut encoder) = match negotiation_result {
+                Ok(negotiated) => negotiated,
                 Err(error) => {
-                    let failure = super::InputLaneFailure::new(format!(
-                        "input provider initialization failed: {error}"
-                    ));
-                    let _ = status_tx.try_send(InputWorkerStatus::Failed(failure.clone()));
-                    return Err(failure);
+                    close_endpoint!(endpoint, false, b"codec negotiation failed");
+                    return Err(error);
                 }
             };
-            let mut reconciler = InputReconciler::default();
-            let work_result = async {
-                let accepted = tokio::select! {
-                    biased;
-                    _ = &mut stop_rx => return Ok(()),
-                    result = input_session.accept_input_receiver() => result,
-                };
-                let mut receiver = match accepted {
-                    Ok(receiver) => receiver,
-                    Err(error) if is_clean_session_close(&error) => return Ok(()),
+
+            let (status_tx, mut status_rx) = mpsc::channel(INPUT_STATUS_CAPACITY);
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+            let input_session = session.clone();
+            let input_epoch = session.stamp().authorization_epoch;
+            let input_task = tokio::spawn(async move {
+                tokio::pin!(stop_rx);
+                let mut input_desktop = match X11DesktopSession::open() {
+                    Ok(desktop) => desktop,
                     Err(error) => {
-                        return Err(super::InputLaneFailure::new(format!(
-                            "failed to establish the reliable input lane: {error}"
-                        )))
+                        let failure = super::InputLaneFailure::new(format!(
+                            "input provider initialization failed: {error}"
+                        ));
+                        let _ = status_tx.try_send(InputWorkerStatus::Failed(failure.clone()));
+                        return Err(failure);
                     }
                 };
-
-                loop {
-                    let next = tokio::select! {
+                let mut reconciler = InputReconciler::default();
+                let work_result = async {
+                    let accepted = tokio::select! {
                         biased;
                         _ = &mut stop_rx => return Ok(()),
-                        result = receiver.next_input() => result,
+                        result = input_session.accept_input_receiver() => result,
                     };
-                    match next {
-                        Ok(payload) => {
-                            apply_input(&payload, input_epoch, &mut reconciler, &mut input_desktop)
-                                .map_err(|error| super::InputLaneFailure::new(error.to_string()))?
-                        }
+                    let mut receiver = match accepted {
+                        Ok(receiver) => receiver,
                         Err(error) if is_clean_session_close(&error) => return Ok(()),
                         Err(error) => {
                             return Err(super::InputLaneFailure::new(format!(
-                                "reliable input lane disconnected: {error}"
+                                "failed to establish the reliable input lane: {error}"
                             )))
+                        }
+                    };
+
+                    loop {
+                        let next = tokio::select! {
+                            biased;
+                            _ = &mut stop_rx => return Ok(()),
+                            result = receiver.next_input() => result,
+                        };
+                        match next {
+                            Ok(payload) => apply_input(
+                                &payload,
+                                input_epoch,
+                                &mut reconciler,
+                                &mut input_desktop,
+                            )
+                            .map_err(|error| super::InputLaneFailure::new(error.to_string()))?,
+                            Err(error) if is_clean_session_close(&error) => return Ok(()),
+                            Err(error) => {
+                                return Err(super::InputLaneFailure::new(format!(
+                                    "reliable input lane disconnected: {error}"
+                                )))
+                            }
                         }
                     }
                 }
-            }
+                .await;
+
+                // Cleanup is deliberately outside every receive/error branch. Once
+                // the provider has admitted any state, every terminal path reaches
+                // ReleaseAll before a lifecycle status is published.
+                let cleanup_result = release_all(&mut reconciler, &mut input_desktop)
+                    .map_err(|error| super::InputLaneFailure::new(error.to_string()));
+                let final_result = merge_input_worker_results(work_result, cleanup_result);
+                let status = match &final_result {
+                    Ok(()) => InputWorkerStatus::Completed,
+                    Err(error) => InputWorkerStatus::Failed(error.clone()),
+                };
+                let _ = status_tx.try_send(status);
+                final_result
+            });
+            let stream_result = stream_desktop(
+                args,
+                &session,
+                &mut status_rx,
+                &mut desktop,
+                capture_plan,
+                encoder.as_mut(),
+            )
             .await;
 
-            // Cleanup is deliberately outside every receive/error branch. Once
-            // the provider has admitted any state, every terminal path reaches
-            // ReleaseAll before a lifecycle status is published.
-            let cleanup_result = release_all(&mut reconciler, &mut input_desktop)
-                .map_err(|error| super::InputLaneFailure::new(error.to_string()));
-            let final_result = merge_input_worker_results(work_result, cleanup_result);
-            let status = match &final_result {
-                Ok(()) => InputWorkerStatus::Completed,
-                Err(error) => InputWorkerStatus::Failed(error.clone()),
+            let _ = stop_tx.send(());
+            let input_task_result = match input_task.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) if error.was_observed() => Ok(()),
+                Ok(Err(error)) => Err(error.into()),
+                Err(error) if error.is_cancelled() => {
+                    Err("input worker cancelled before cleanup".into())
+                }
+                Err(error) => Err(format!("reliable input task failed: {error}").into()),
             };
-            let _ = status_tx.try_send(status);
-            final_result
-        });
-        let stream_result = stream_desktop(
-            args,
-            &session,
-            &mut status_rx,
-            &mut desktop,
-            capture_plan,
-            encoder.as_mut(),
-        )
-        .await;
-
-        let _ = stop_tx.send(());
-        let input_task_result = match input_task.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) if error.was_observed() => Ok(()),
-            Ok(Err(error)) => Err(error.into()),
-            Err(error) if error.is_cancelled() => {
-                Err("input worker cancelled before cleanup".into())
+            let shutdown_result = input_task_result;
+            let final_result = merge_results(
+                stream_result,
+                shutdown_result,
+                "session shutdown also failed",
+            );
+            let session_end = match final_result {
+                Ok(session_end) => session_end,
+                Err(error) => {
+                    close_endpoint!(endpoint, false, b"host session failed");
+                    return Err(error);
+                }
+            };
+            session.close(0, b"host product session complete");
+            completed_sessions = completed_sessions.saturating_add(1);
+            println!(
+                "listener: completed secure session {completed_sessions}/{} ({session_end:?})",
+                args.max_sessions
+            );
+            if session_end == SessionEnd::HostShutdown || completed_sessions >= args.max_sessions {
+                close_endpoint!(endpoint, true, b"host session sequence ended");
+                return Ok(());
             }
-            Err(error) => Err(format!("reliable input task failed: {error}").into()),
-        };
-        let shutdown_result = input_task_result;
-        let final_result = merge_results(
-            stream_result,
-            shutdown_result,
-            "session shutdown also failed",
-        );
-        let succeeded = final_result.is_ok();
-        let close_reason: &[u8] = if succeeded {
-            b"host session ended"
-        } else {
-            b"host session failed"
-        };
-        close_endpoint!(endpoint, succeeded, close_reason);
-        final_result
+            println!("listener: waiting for authenticated successor session");
+        }
     }
 
     async fn stream_desktop(
@@ -483,7 +519,7 @@ mod linux {
         desktop: &mut X11DesktopSession,
         capture_plan: CapturePlan,
         mut encoder: Option<&mut SoftwareH264Encoder>,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<SessionEnd, Box<dyn Error>> {
         let stream_config = capture_plan.stream;
         let frame_period =
             frame_period(stream_config.fps).ok_or("fps must be positive and nonzero")?;
@@ -514,11 +550,11 @@ mod linux {
                 ScheduledWork::Shutdown(signal_result) => {
                     signal_result?;
                     println!("shutdown: Ctrl-C requested");
-                    return Ok(());
+                    return Ok(SessionEnd::HostShutdown);
                 }
                 ScheduledWork::Input(Some(InputWorkerStatus::Completed)) => {
                     println!("session: peer completed normally");
-                    return Ok(());
+                    return Ok(SessionEnd::PeerCompleted);
                 }
                 ScheduledWork::Input(Some(InputWorkerStatus::Failed(error))) => {
                     error.mark_observed();
@@ -592,7 +628,7 @@ mod linux {
                         Ok(report) => report,
                         Err(error) if is_clean_session_close(&error) => {
                             println!("session: peer completed normally");
-                            return Ok(());
+                            return Ok(SessionEnd::PeerCompleted);
                         }
                         Err(error) if is_transient_media_send(&error) => {
                             if let Some(encoder) = encoder.as_mut() {
@@ -604,7 +640,7 @@ mod linux {
                                 );
                             }
                             if args.max_frames.is_some_and(|maximum| frame_id >= maximum) {
-                                return Ok(());
+                                return Ok(SessionEnd::FrameLimit);
                             }
                             continue;
                         }
@@ -633,7 +669,7 @@ mod linux {
                     }
 
                     if args.max_frames.is_some_and(|maximum| frame_id >= maximum) {
-                        return Ok(());
+                        return Ok(SessionEnd::FrameLimit);
                     }
                 }
             }
@@ -724,14 +760,14 @@ mod linux {
         }
     }
 
-    fn merge_results(
-        primary: Result<(), Box<dyn Error>>,
+    fn merge_results<T>(
+        primary: Result<T, Box<dyn Error>>,
         secondary: Result<(), Box<dyn Error>>,
         secondary_context: &str,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<T, Box<dyn Error>> {
         match (primary, secondary) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
             (Err(primary), Err(secondary)) => {
                 Err(format!("{primary}; {secondary_context}: {secondary}").into())
             }
@@ -991,6 +1027,7 @@ mod windows {
         RateUpdateMessage, RecoveryRequest, VideoCodec, VideoCodecCapabilities, VideoProfile,
         VideoStreamConfig, VIDEO_CODEC_CONTRACT_VERSION,
     };
+    use latencydesk_session::lifecycle::ProductStampAllocator;
     use latencydesk_socket_transport::identity::{
         accept_exact_peer_with_timeout, certificate_fingerprint, load_certificate_der,
         mtls_server_config, IdentityError, TlsIdentity,
@@ -1105,11 +1142,18 @@ mod windows {
     }
 
     pub async fn run(args: &HostArgs) -> Result<(), Box<dyn Error>> {
+        if args.max_sessions != 1 {
+            return Err(
+                "--max-sessions greater than 1 is currently supported only by the Linux X11 secure Host"
+                    .into(),
+            );
+        }
         let (identity_cert, identity_key, peer_cert) = secure_identity_paths(args)?;
         let identity = TlsIdentity::load_der(identity_cert, identity_key)?;
         let peer_certificate = load_certificate_der(peer_cert)?;
         let server_config = mtls_server_config(&identity, &peer_certificate)?;
         let endpoint = bind_server(server_config, args.listen_addr)?;
+        let mut stamp_allocator = ProductStampAllocator::new();
 
         println!("=== LatencyDesk Host ===");
         println!("Mode: TLS 1.3 mutual authentication over QUIC");
@@ -1175,21 +1219,28 @@ mod windows {
                 return Err(error.into());
             }
         };
-        let session_id = match NonZeroU64::new(super::super::assign_session_id()) {
-            Some(session_id) => session_id,
-            None => {
+        let session_stamp = match stamp_allocator.allocate() {
+            Ok(stamp) => stamp,
+            Err(error) => {
                 close_endpoint!(endpoint, false, b"session id allocation failed");
-                return Err("failed to allocate a nonzero session id".into());
+                return Err(error.into());
             }
         };
-        let session = match ProductSession::host(connection, session_id).await {
+        let session = match ProductSession::host_with_stamp(connection, session_stamp).await {
             Ok(session) => session,
             Err(error) => {
                 close_endpoint!(endpoint, false, b"product session activation failed");
                 return Err(error.into());
             }
         };
-        println!("session: active session_id={session_id}");
+        println!("session: active session_id={}", session_stamp.session_id);
+        println!(
+            "session-lifecycle: generation={} authorization_epoch={} display_epoch={} codec_epoch={}",
+            session_stamp.generation,
+            session_stamp.authorization_epoch,
+            session_stamp.display_epoch,
+            session_stamp.codec_epoch
+        );
         let negotiation_result = async {
             let mut control_receiver = tokio::time::timeout(
                 AUTHENTICATION_ATTEMPT_TIMEOUT,

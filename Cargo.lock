@@ -519,6 +519,7 @@ dependencies = [
  "latencydesk-surface",
  "latencydesk-transport",
  "minifb",
+ "quinn",
  "tokio",
 ]
 
