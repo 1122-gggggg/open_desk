@@ -15,7 +15,7 @@ Client。
 | --- | --- | --- |
 | 安全傳輸 | Quinn QUIC 上僅允許 TLS 1.3 的 mTLS；雙方 pin 並逐 byte 檢查預期 leaf certificate；不會自動降級 UDP | 預設產品路徑；in-process 測試通過 |
 | 裝置身分 | `latencydesk-identity` 產生持久的 self-signed certificate DER 與 PKCS#8 private-key DER，且不覆寫現有身分 | 已實作；certificate 仍須手動交換 |
-| 控制與輸入 | 已驗證的產品握手、帶 session stamp 的可靠 QUIC lane；input stream 的 Quinn 傳送優先權高於 control | 已實作並通過 in-process 測試 |
+| 控制與輸入 | 已驗證的產品握手、帶 session stamp 的可靠 QUIC lane；input 優先權高於 control；Linux opt-in probe 只在 XTEST 加後續 X11 sync reply 完成後取得完整 stamp ACK | 已實作 128-sample application-ACK 程序證據；實體 input-to-photon 仍待完成 |
 | 同時連線多台 Host | 可重複使用 `--target <ADDR>,<PEER_CERT>`，以 2–16 個隔離的安全 Client 子程序同時開啟多台 exact-pinned Host | 兩台 distinct-cert Host 已通過同時連線程序驗證，且壞 target 不會中止健康 target；跨機器 2／4／8／16 Host soak 仍待完成 |
 | Linux Host | 真實 X11 root 擷取、CPU BGRA-to-NV12 轉換，以及在獨立連線／task 中執行、不受擷取與軟體編碼阻塞的 XTEST 輸入 | 安全 Alpha 路徑；X11 到 headless 的 process loopback 已驗證，可見輸入延遲與跨機器呈現仍待完成 |
 | Successor session | Linux X11 Host 可保留同一個 endpoint，依序接受 1–16 個 exact-pinned session；headless Client 支援 clean sequence，亦可對已驗證 QUIC reset／idle timeout 做有界恢復；每個 successor 都在 ReleaseAll 後取得新 identity 與嚴格遞增 epoch | Clean 與 loopback blackhole recovery 已實作；互動式 reconnect、Windows Host persistence、實體 handoff 與跨機器 soak 仍待完成 |

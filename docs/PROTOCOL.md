@@ -40,6 +40,17 @@ streams or 0-RTT input. Certificate mismatch, malformed protocol data,
 non-monotonic lifecycle values, explicit application close, and local/provider
 failure are terminal. A retired input epoch remains rejected after ReleaseAll.
 
+Input records reserve one versioned `ACK_REQUESTED` flag. When set, a Linux
+Host replies on the authenticated control lane only after reconciliation and
+all platform injection calls plus the probe's platform synchronization return.
+`InputAppliedAck` binds the full session
+stamp, input epoch, original sequence, and a per-session ACK sequence; it carries
+no key/button content. ACKs are measurement reports only and never authorize or
+replay input. Unknown input flags, ACK versions/statuses, reserved bits, stale
+stamps, and unexpected sequences fail closed. A platform injection or X11
+synchronization failure is reported as `ApplyFailed` before the Host terminates
+that input lane; only `Applied` ACKs may contribute latency samples.
+
 ## 3. Capability negotiation
 
 Each peer advertises:
