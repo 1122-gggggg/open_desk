@@ -13,14 +13,17 @@ use latencydesk_socket_transport::identity::{
 };
 use latencydesk_socket_transport::product::ProductSessionError;
 use latencydesk_socket_transport::product::{ControlReceiver, ProductSession};
-use latencydesk_socket_transport::quic::bind_client;
+use latencydesk_socket_transport::quic::{bind_client, bind_client_on_socket};
+use latencydesk_socket_transport::stun::{
+    discover_server_reflexive, StunDiscoveryConfig, StunDiscoveryReport,
+};
 #[cfg(any(windows, test))]
 use std::collections::VecDeque;
 use std::error::Error;
 #[cfg(any(windows, test))]
 use std::future::Future;
 use std::io::{self, Write};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 const CLIENT_RELIABLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -29,6 +32,9 @@ const CLIENT_CANDIDATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_RECONNECT_TOTAL_BUDGET: Duration = Duration::from_secs(15);
 const CLIENT_INPUT_PROBE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+const CLIENT_STUN_TOTAL_BUDGET: Duration = Duration::from_secs(5);
+const CLIENT_STUN_INITIAL_RTO: Duration = Duration::from_millis(500);
+const CLIENT_STUN_MAX_REQUESTS: u8 = 4;
 #[cfg(any(windows, test))]
 const CLIENT_CLEANUP_SCHEDULER_ALLOWANCE: Duration = Duration::from_millis(250);
 #[cfg(any(windows, test))]
@@ -415,13 +421,48 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
     // Quinn discovers Tokio through the currently-entered runtime context even
     // though endpoint construction itself is synchronous. Keep that invariant
     // in one helper so process startup cannot regress to "no async runtime".
-    let endpoint = in_runtime_context(&runtime, || {
-        bind_client(client_configuration, args.bind_addr)
-    })?;
+    let (endpoint, stun_report): (_, Option<StunDiscoveryReport>) =
+        if let Some(stun_server) = args.stun_server {
+            let socket = UdpSocket::bind(args.bind_addr)?;
+            let stun_budget = operation_timeout.min(CLIENT_STUN_TOTAL_BUDGET);
+            let stun_config = StunDiscoveryConfig::new(
+                CLIENT_STUN_INITIAL_RTO,
+                CLIENT_STUN_MAX_REQUESTS,
+                stun_budget,
+            )?;
+            let report = discover_server_reflexive(&socket, stun_server, stun_config)?;
+            let endpoint = in_runtime_context(&runtime, || {
+                bind_client_on_socket(client_configuration, socket)
+            })?;
+            (endpoint, Some(report))
+        } else {
+            (
+                in_runtime_context(&runtime, || {
+                    bind_client(client_configuration, args.bind_addr)
+                })?,
+                None,
+            )
+        };
 
     println!("=== LatencyDesk Client (secure QUIC) ===");
     println!("Target Host Address: {}", args.connect_addr);
     println!("Local Binding Address: {}", endpoint.local_addr()?);
+    if let Some(report) = stun_report {
+        if endpoint.local_addr()? != report.local_address {
+            return Err("QUIC endpoint did not retain the STUN-discovered UDP socket".into());
+        }
+        println!(
+            "stun: server={} local={} reflexive={} requests={} ignored={} drained={} elapsed_ms={}",
+            report.server_address,
+            report.local_address,
+            report.mapped_address,
+            report.requests_sent,
+            report.ignored_datagrams,
+            report.drained_datagrams,
+            report.elapsed.as_millis(),
+        );
+        println!("stun-scope: candidate discovery only; exact-certificate mTLS remains mandatory");
+    }
     println!(
         "client-certificate-sha256: {}",
         encode_hex(&identity.fingerprint())

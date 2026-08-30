@@ -57,6 +57,7 @@ pub struct ClientArgs {
     pub fallback_addresses: Vec<SocketAddr>,
     pub targets: Vec<(SocketAddr, PathBuf)>,
     pub bind_addr: SocketAddr,
+    pub stun_server: Option<SocketAddr>,
     pub peer_alias: Option<String>,
     pub pairing_timeout_secs: u64,
     pub profile_1080p120: bool,
@@ -83,6 +84,7 @@ impl Default for ClientArgs {
             fallback_addresses: Vec::new(),
             targets: Vec::new(),
             bind_addr: "0.0.0.0:0".parse().unwrap(),
+            stun_server: None,
             peer_alias: None,
             pairing_timeout_secs: 60,
             profile_1080p120: false,
@@ -152,6 +154,13 @@ where
                     return Err("missing value for --bind".into());
                 }
                 config.bind_addr = args[i + 1].parse()?;
+                i += 2;
+            }
+            "--stun-server" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --stun-server".into());
+                }
+                config.stun_server = Some(args[i + 1].parse()?);
                 i += 2;
             }
             "--peer-alias" => {
@@ -288,6 +297,7 @@ where
                        --fallback-address <ADDR> Alternate address for the same exact-pinned Host (repeatable, max 3)\n  \
                        --target <ADDR>,<CERT>    Connect to up to 16 exact-pinned Hosts concurrently (repeatable)\n  \
                        --bind <ADDR>             Local socket address to bind (default 0.0.0.0:0)\n  \
+                       --stun-server <IP:PORT>   Discover one srflx address on the same UDP socket\n  \
                        --identity-cert <PATH>    Client identity certificate in DER format\n  \
                        --identity-key <PATH>     Client PKCS#8 private key in DER format\n  \
                        --peer-cert <PATH>        Exact Host certificate to pin in DER format\n  \
@@ -396,6 +406,27 @@ where
         if config.targets.len() == 1 {
             config.connect_addr = config.targets[0].0;
             config.peer_cert = Some(config.targets[0].1.clone());
+        }
+    }
+    if let Some(stun_server) = config.stun_server {
+        let invalid_server = stun_server.port() == 0
+            || stun_server.ip().is_unspecified()
+            || stun_server.ip().is_multicast()
+            || matches!(stun_server.ip(), std::net::IpAddr::V4(ip) if ip.is_broadcast());
+        if invalid_server {
+            return Err("--stun-server requires a unicast IP address and nonzero port".into());
+        }
+        if stun_server.is_ipv4() != config.bind_addr.is_ipv4() {
+            return Err("--stun-server and --bind must use the same address family".into());
+        }
+        if config.targets.len() > 1 {
+            return Err(
+                "--stun-server currently supports one exact-pinned Host, not multi-target mode"
+                    .into(),
+            );
+        }
+        if config.unsafe_udp_lab {
+            return Err("--stun-server is available only for secure QUIC mode".into());
         }
     }
     if config.session_count > 1 {
@@ -1342,6 +1373,79 @@ mod tests {
                 "127.0.0.1:9002".parse().unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn client_parser_bounds_explicit_single_target_stun_discovery() {
+        let args = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client.der",
+            "--identity-key",
+            "key.der",
+            "--peer-cert",
+            "host.der",
+            "--connect",
+            "127.0.0.1:9000",
+            "--bind",
+            "127.0.0.1:0",
+            "--stun-server",
+            "127.0.0.1:3478",
+            "--frames",
+            "1",
+        ])
+        .expect("explicit STUN server");
+        assert_eq!(
+            args.stun_server,
+            Some("127.0.0.1:3478".parse().expect("STUN address"))
+        );
+
+        for invalid in [
+            vec![
+                "latencydesk-client",
+                "--unsafe-udp-lab",
+                "--approve",
+                "--stun-server",
+                "127.0.0.1:3478",
+            ],
+            vec![
+                "latencydesk-client",
+                "--identity-cert",
+                "client.der",
+                "--identity-key",
+                "key.der",
+                "--target",
+                "127.0.0.1:9001,a.der",
+                "--target",
+                "127.0.0.1:9002,b.der",
+                "--stun-server",
+                "127.0.0.1:3478",
+            ],
+            vec![
+                "latencydesk-client",
+                "--identity-cert",
+                "client.der",
+                "--identity-key",
+                "key.der",
+                "--peer-cert",
+                "host.der",
+                "--stun-server",
+                "0.0.0.0:3478",
+            ],
+            vec![
+                "latencydesk-client",
+                "--identity-cert",
+                "client.der",
+                "--identity-key",
+                "key.der",
+                "--peer-cert",
+                "host.der",
+                "--stun-server",
+                "[::1]:3478",
+            ],
+        ] {
+            assert!(parse_client_args_from(invalid).is_err());
+        }
     }
 
     #[test]

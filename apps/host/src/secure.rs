@@ -340,6 +340,7 @@ mod linux {
             println!(
             "mTLS: exact client certificate authenticated (rejected {rejected_connections} unauthenticated connection(s))"
         );
+            println!("quic-peer: source={}", connection.remote_address());
 
             // X11 capture and XTEST input are intentionally opened only after the
             // remote certificate has passed exact-byte verification.
@@ -1524,6 +1525,7 @@ mod windows {
         println!(
             "mTLS: exact client certificate authenticated (rejected {rejected_connections} unauthenticated connection(s))"
         );
+        println!("quic-peer: source={}", connection.remote_address());
 
         let mut desktop = match WindowsDesktopSession::open() {
             Ok(desktop) => desktop,
