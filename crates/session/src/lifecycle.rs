@@ -2,8 +2,12 @@
 
 use core::fmt;
 use latencydesk_protocol::quic::SessionStamp;
+use std::time::Duration;
 
 const MAX_ZERO_ID_RETRIES: usize = 4;
+pub const MAX_RECONNECT_ATTEMPTS: u32 = 8;
+pub const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+const RECONNECT_BASE_DELAY_MILLIS: [u64; 5] = [100, 200, 400, 800, 1_600];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProductStampAllocationError {
@@ -19,6 +23,60 @@ impl fmt::Display for ProductStampAllocationError {
 }
 
 impl std::error::Error for ProductStampAllocationError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconnectPolicyError {
+    TooManyAttempts,
+}
+
+impl fmt::Display for ReconnectPolicyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for ReconnectPolicyError {}
+
+/// Bounded exponential reconnect delay with deterministic per-session jitter.
+/// The random session identity naturally desynchronizes clients without adding
+/// another fallible entropy read to the recovery path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconnectPolicy {
+    maximum_attempts: u32,
+}
+
+impl ReconnectPolicy {
+    pub const fn new(maximum_attempts: u32) -> Result<Self, ReconnectPolicyError> {
+        if maximum_attempts > MAX_RECONNECT_ATTEMPTS {
+            return Err(ReconnectPolicyError::TooManyAttempts);
+        }
+        Ok(Self { maximum_attempts })
+    }
+
+    #[must_use]
+    pub const fn maximum_attempts(self) -> u32 {
+        self.maximum_attempts
+    }
+
+    #[must_use]
+    pub fn delay_for(self, attempt: u32, prior_session_id: u64) -> Option<Duration> {
+        if attempt == 0 || attempt > self.maximum_attempts {
+            return None;
+        }
+        let schedule_index = usize::try_from(attempt.saturating_sub(1).min(4)).ok()?;
+        let base_millis = RECONNECT_BASE_DELAY_MILLIS[schedule_index];
+        let jitter_span = base_millis / 4;
+        let jitter_attempt = u64::from(attempt.min(5));
+        let mut mixed = prior_session_id ^ jitter_attempt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        mixed ^= mixed >> 31;
+        let jitter_millis = mixed % jitter_span.saturating_add(1);
+        Some(Duration::from_millis(
+            base_millis.saturating_add(jitter_millis),
+        ))
+    }
+}
 
 /// Allocates fresh random session IDs and strictly monotonic lifecycle epochs.
 #[derive(Debug, Clone)]
@@ -163,5 +221,26 @@ mod tests {
             }),
             Err(ProductStampAllocationError::EpochExhausted)
         );
+    }
+
+    #[test]
+    fn reconnect_policy_is_bounded_capped_and_session_jittered() {
+        assert_eq!(
+            ReconnectPolicy::new(MAX_RECONNECT_ATTEMPTS + 1),
+            Err(ReconnectPolicyError::TooManyAttempts)
+        );
+        let disabled = ReconnectPolicy::new(0).expect("disabled policy");
+        assert_eq!(disabled.delay_for(1, 41), None);
+
+        let policy = ReconnectPolicy::new(8).expect("bounded policy");
+        let delays = (1..=8)
+            .map(|attempt| policy.delay_for(attempt, 41).expect("retry delay"))
+            .collect::<Vec<_>>();
+        assert!(delays.windows(2).all(|pair| pair[1] >= pair[0]));
+        assert!(delays.iter().all(|delay| *delay <= MAX_RECONNECT_DELAY));
+        assert_eq!(policy.delay_for(9, 41), None);
+        assert_eq!(policy.delay_for(0, 41), None);
+        assert_eq!(policy.delay_for(3, 41), policy.delay_for(3, 41));
+        assert_ne!(policy.delay_for(3, 41), policy.delay_for(3, 42));
     }
 }

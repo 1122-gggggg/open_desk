@@ -859,7 +859,7 @@ impl LinuxPortalInputBackend {
 
     pub fn set_focused(&mut self, focused: bool) -> Vec<AppliedInput> {
         if self.focused && !focused {
-            let actions = self.reconciler.disconnect_release_plan();
+            let actions = self.reconciler.release_all_plan();
             let _ = self.release_all(&actions);
             self.focused = false;
             actions

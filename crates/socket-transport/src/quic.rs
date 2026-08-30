@@ -159,24 +159,51 @@ impl Error for QuicTransportError {
 }
 
 impl QuicTransportError {
-    /// Returns true only for a peer-requested application close with code 0.
-    /// Transport failures, local shutdown, timeouts, and nonzero application
-    /// codes remain errors.
-    #[must_use]
-    pub fn is_clean_application_close(&self) -> bool {
-        let connection_error = match self {
+    fn connection_error(&self) -> Option<&quinn::ConnectionError> {
+        match self {
             Self::Connection(error) => Some(error),
             Self::Read(quinn::ReadExactError::ReadError(quinn::ReadError::ConnectionLost(
                 error,
             )))
             | Self::Write(quinn::WriteError::ConnectionLost(error)) => Some(error),
             _ => None,
-        };
+        }
+    }
+
+    /// Returns true only for a peer-requested application close with code 0.
+    /// Transport failures, local shutdown, timeouts, and nonzero application
+    /// codes remain errors.
+    #[must_use]
+    pub fn is_clean_application_close(&self) -> bool {
         matches!(
-            connection_error,
+            self.connection_error(),
             Some(quinn::ConnectionError::ApplicationClosed(close))
                 if close.error_code.into_inner() == 0
         )
+    }
+
+    /// Returns true only for an established path that lapsed or was reset by
+    /// the authenticated peer. Protocol errors, explicit application closes,
+    /// local shutdown, handshake failures, and resource exhaustion are
+    /// terminal so reconnect cannot hide a persistent fault.
+    #[must_use]
+    pub fn is_retryable_connection_loss(&self) -> bool {
+        matches!(
+            self.connection_error(),
+            Some(quinn::ConnectionError::TimedOut | quinn::ConnectionError::Reset)
+        )
+    }
+
+    /// Extends established-path recovery to bounded candidate setup timeouts.
+    /// TLS, certificate, protocol, and local endpoint failures remain terminal.
+    #[must_use]
+    pub fn is_retryable_connection_attempt(&self) -> bool {
+        self.is_retryable_connection_loss()
+            || matches!(
+                self,
+                Self::Io(error) if error.kind() == std::io::ErrorKind::TimedOut
+            )
+            || matches!(self, Self::HandshakeTimeout)
     }
 }
 
@@ -764,6 +791,39 @@ mod tests {
         assert!(nested_write.is_clean_application_close());
         assert!(!nonzero.is_clean_application_close());
         assert!(!local.is_clean_application_close());
+    }
+
+    #[test]
+    fn only_timeout_or_peer_reset_is_a_retryable_established_connection_loss() {
+        let retryable = [
+            QuicTransportError::Connection(quinn::ConnectionError::TimedOut),
+            QuicTransportError::Connection(quinn::ConnectionError::Reset),
+            QuicTransportError::Read(quinn::ReadExactError::ReadError(
+                quinn::ReadError::ConnectionLost(quinn::ConnectionError::TimedOut),
+            )),
+            QuicTransportError::Write(quinn::WriteError::ConnectionLost(
+                quinn::ConnectionError::Reset,
+            )),
+        ];
+        for error in retryable {
+            assert!(error.is_retryable_connection_loss(), "{error:?}");
+            assert!(!error.is_clean_application_close(), "{error:?}");
+        }
+
+        let terminal = [
+            QuicTransportError::Connection(quinn::ConnectionError::VersionMismatch),
+            QuicTransportError::Connection(quinn::ConnectionError::LocallyClosed),
+            QuicTransportError::Connection(quinn::ConnectionError::CidsExhausted),
+            QuicTransportError::Connection(quinn::ConnectionError::ApplicationClosed(
+                quinn::ApplicationClose {
+                    error_code: quinn::VarInt::from_u32(1),
+                    reason: Bytes::from_static(b"session failed"),
+                },
+            )),
+        ];
+        for error in terminal {
+            assert!(!error.is_retryable_connection_loss(), "{error:?}");
+        }
     }
 
     #[tokio::test]

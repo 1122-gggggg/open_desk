@@ -242,6 +242,19 @@ impl From<TransportError> for ProductSessionError {
     }
 }
 
+impl ProductSessionError {
+    /// True only when an already-authenticated QUIC path timed out or was
+    /// reset by its peer. Authentication, protocol, codec, framing, and local
+    /// resource failures are deliberately terminal.
+    #[must_use]
+    pub fn is_retryable_connection_loss(&self) -> bool {
+        matches!(
+            self,
+            Self::Quic(error) if error.is_retryable_connection_loss()
+        )
+    }
+}
+
 impl ProductSession {
     /// Activates the host side of an already mutually-authenticated connection
     /// and publishes the caller-assigned nonzero session ID on the reliable
@@ -940,6 +953,21 @@ mod tests {
     use rcgen::generate_simple_self_signed;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::net::{Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn only_quic_path_timeout_or_reset_is_a_retryable_product_failure() {
+        let timeout = ProductSessionError::Quic(QuicTransportError::Connection(
+            quinn::ConnectionError::TimedOut,
+        ));
+        let reset = ProductSessionError::Quic(QuicTransportError::Write(
+            quinn::WriteError::ConnectionLost(quinn::ConnectionError::Reset),
+        ));
+        let protocol = ProductSessionError::Protocol(ProtocolError::InvalidSessionStamp);
+
+        assert!(timeout.is_retryable_connection_loss());
+        assert!(reset.is_retryable_connection_loss());
+        assert!(!protocol.is_retryable_connection_loss());
+    }
 
     struct TestIdentity {
         certificate: CertificateDer<'static>,

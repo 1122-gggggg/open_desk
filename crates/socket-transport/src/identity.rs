@@ -49,10 +49,12 @@ pub const QUIC_DATAGRAM_RECEIVE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 pub const QUIC_DATAGRAM_SEND_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum exact-pinned endpoints raced for one logical Host connection.
 pub const MAX_PARALLEL_CONNECT_CANDIDATES: usize = 4;
+/// Negotiated idle bound for detecting a dead authenticated network path.
+pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Keepalive cadence used while an interactive session would otherwise be idle.
+pub const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(500);
 
 const QUIC_CRYPTO_BUFFER_BYTES: usize = 64 * 1024;
-const QUIC_IDLE_TIMEOUT_MILLIS: u32 = 30_000;
-const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const QUIC_INITIAL_RTT: Duration = Duration::from_millis(5);
 const QUIC_MAX_ACK_DELAY: Duration = Duration::from_millis(1);
 const QUIC_MINIMUM_MTU: u16 = 1_200;
@@ -303,6 +305,22 @@ impl Error for IdentityError {
             Self::InsecureWindowsPrivateKeyAcl { .. } | Self::WindowsAclCommandFailed { .. } => {
                 None
             }
+        }
+    }
+}
+
+impl IdentityError {
+    /// True only when another bounded attempt could recover from a path reset
+    /// or timeout. Local identity/certificate policy and exact-peer failures
+    /// are terminal and are never converted into blind authentication retries.
+    #[must_use]
+    pub fn is_retryable_connection_attempt(&self) -> bool {
+        match self {
+            Self::QuicTransport(error) => error.is_retryable_connection_attempt(),
+            Self::ConnectionCandidatesExhausted { last_error, .. } => {
+                last_error.is_retryable_connection_attempt()
+            }
+            _ => false,
         }
     }
 }
@@ -841,7 +859,8 @@ pub fn bounded_transport_config() -> quinn::TransportConfig {
         .max_concurrent_bidi_streams(quinn::VarInt::from_u32(MAX_QUIC_BIDIRECTIONAL_STREAMS))
         .max_concurrent_uni_streams(quinn::VarInt::from_u32(MAX_QUIC_UNIDIRECTIONAL_STREAMS))
         .max_idle_timeout(Some(
-            quinn::VarInt::from_u32(QUIC_IDLE_TIMEOUT_MILLIS).into(),
+            quinn::IdleTimeout::try_from(QUIC_IDLE_TIMEOUT)
+                .expect("two-second QUIC idle timeout fits a variable integer"),
         ))
         .stream_receive_window(quinn::VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW_BYTES))
         .receive_window(quinn::VarInt::from_u32(QUIC_RECEIVE_WINDOW_BYTES))
@@ -1050,6 +1069,31 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::time::timeout;
+
+    #[test]
+    fn only_transient_transport_candidate_failures_are_reconnectable() {
+        let timed_out = IdentityError::ConnectionCandidatesExhausted {
+            attempts: 2,
+            last_error: Box::new(IdentityError::QuicTransport(QuicTransportError::Io(
+                io::Error::new(io::ErrorKind::TimedOut, "candidate timed out"),
+            ))),
+        };
+        let reset = IdentityError::QuicTransport(QuicTransportError::Connection(
+            quinn::ConnectionError::Reset,
+        ));
+
+        assert!(timed_out.is_retryable_connection_attempt());
+        assert!(reset.is_retryable_connection_attempt());
+        assert!(!IdentityError::PeerCertificateMismatch.is_retryable_connection_attempt());
+        assert!(!IdentityError::ConnectionAttemptTaskFailed.is_retryable_connection_attempt());
+    }
+
+    #[test]
+    fn transport_liveness_policy_detects_dead_paths_without_keepalive_races() {
+        assert_eq!(QUIC_IDLE_TIMEOUT, Duration::from_secs(2));
+        assert_eq!(QUIC_KEEP_ALIVE_INTERVAL, Duration::from_millis(500));
+        assert!(QUIC_KEEP_ALIVE_INTERVAL.saturating_mul(3) < QUIC_IDLE_TIMEOUT);
+    }
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 

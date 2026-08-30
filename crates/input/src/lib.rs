@@ -328,16 +328,28 @@ pub enum ReconcileOutcome {
 }
 
 /// Receiver-side input state. Disconnecting or switching epochs produces
-/// explicit release actions for all held keys and buttons.
+/// explicit release actions for all held keys and buttons. A disconnected
+/// epoch remains retired so delayed records cannot reactivate it; only a
+/// strictly newer epoch may resume input on the same reconciler.
 #[derive(Debug, Default, Clone)]
 pub struct InputReconciler {
     epoch: Option<u32>,
+    epoch_retired: bool,
     last_sequence: Option<u64>,
     state: InputState,
 }
 
 impl InputReconciler {
     pub fn apply(&mut self, message: InputMessage) -> Result<ReconcileOutcome, InputError> {
+        if self.epoch_retired {
+            if self
+                .epoch
+                .is_some_and(|retired| message.session_epoch <= retired)
+            {
+                return Ok(ReconcileOutcome::IgnoredStaleEpoch);
+            }
+            self.epoch_retired = false;
+        }
         match self.epoch {
             Some(epoch) if message.session_epoch < epoch => {
                 return Ok(ReconcileOutcome::IgnoredStaleEpoch)
@@ -345,12 +357,16 @@ impl InputReconciler {
             Some(epoch) if message.session_epoch > epoch => {
                 let mut actions = self.release_all();
                 self.epoch = Some(message.session_epoch);
+                self.epoch_retired = false;
                 self.last_sequence = None;
                 actions.extend(self.apply_fresh(message.event)?);
                 self.last_sequence = Some(message.sequence);
                 return Ok(ReconcileOutcome::Applied(actions));
             }
-            None => self.epoch = Some(message.session_epoch),
+            None => {
+                self.epoch = Some(message.session_epoch);
+                self.epoch_retired = false;
+            }
             _ => {}
         }
         if self
@@ -364,13 +380,22 @@ impl InputReconciler {
         Ok(ReconcileOutcome::Applied(actions))
     }
 
-    /// Releases every active key/button. Call on disconnect, focus loss, portal
-    /// revocation, or before replacing a platform input backend.
+    /// Releases every active key/button and permanently retires the current
+    /// epoch. Call on disconnect, portal revocation, or before replacing a
+    /// platform input backend. Use an explicit `ReleaseAll` event for a
+    /// nonterminal focus loss within the same epoch.
     pub fn disconnect_release_plan(&mut self) -> Vec<AppliedInput> {
         let actions = self.release_all();
-        self.epoch = None;
+        self.epoch_retired = self.epoch.is_some();
         self.last_sequence = None;
         actions
+    }
+
+    /// Releases all held state without retiring the active epoch or resetting
+    /// its sequence. This is for a temporary focus loss where the same
+    /// authenticated session may resume with a later sequence number.
+    pub fn release_all_plan(&mut self) -> Vec<AppliedInput> {
+        self.release_all()
     }
 
     /// Backward-compatible alias for [`Self::disconnect_release_plan`].
@@ -522,8 +547,12 @@ mod tests {
     use super::*;
 
     fn message(sequence: u64, event: InputEvent) -> InputMessage {
+        epoch_message(3, sequence, event)
+    }
+
+    fn epoch_message(session_epoch: u32, sequence: u64, event: InputEvent) -> InputMessage {
         InputMessage {
-            session_epoch: 3,
+            session_epoch,
             sequence,
             event,
         }
@@ -621,6 +650,166 @@ mod tests {
             pressed: false
         }));
         assert!(reconciler.state().is_empty());
+    }
+
+    #[test]
+    fn disconnect_retires_the_epoch_and_cleanup_is_idempotent() {
+        let mut reconciler = InputReconciler::default();
+        for (sequence, event) in [
+            InputEvent::Key {
+                code: 4,
+                pressed: true,
+            },
+            InputEvent::Key {
+                code: 5,
+                pressed: true,
+            },
+            InputEvent::PointerButton {
+                button: 1,
+                pressed: true,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            reconciler
+                .apply(epoch_message(10, sequence as u64 + 1, event))
+                .expect("held input");
+        }
+
+        let releases = reconciler.disconnect_release_plan();
+        assert_eq!(releases.len(), 3);
+        assert!(releases.iter().all(|action| matches!(
+            action,
+            AppliedInput::Key { pressed: false, .. }
+                | AppliedInput::PointerButton { pressed: false, .. }
+        )));
+        assert!(reconciler.disconnect_release_plan().is_empty());
+
+        assert_eq!(
+            reconciler
+                .apply(epoch_message(
+                    10,
+                    99,
+                    InputEvent::Key {
+                        code: 4,
+                        pressed: true,
+                    },
+                ))
+                .expect("late retired input"),
+            ReconcileOutcome::IgnoredStaleEpoch
+        );
+        assert!(reconciler.state().is_empty());
+
+        assert!(matches!(
+            reconciler
+                .apply(epoch_message(
+                    11,
+                    1,
+                    InputEvent::Key {
+                        code: 6,
+                        pressed: true,
+                    },
+                ))
+                .expect("fresh successor input"),
+            ReconcileOutcome::Applied(_)
+        ));
+        assert!(reconciler.state().key_pressed(6));
+    }
+
+    #[test]
+    fn temporary_release_preserves_the_active_epoch_and_sequence_floor() {
+        let mut reconciler = InputReconciler::default();
+        reconciler
+            .apply(epoch_message(
+                10,
+                1,
+                InputEvent::Key {
+                    code: 4,
+                    pressed: true,
+                },
+            ))
+            .expect("key down");
+        assert_eq!(
+            reconciler.release_all_plan(),
+            vec![AppliedInput::Key {
+                code: 4,
+                pressed: false,
+            }]
+        );
+        assert_eq!(
+            reconciler
+                .apply(epoch_message(
+                    10,
+                    1,
+                    InputEvent::Key {
+                        code: 5,
+                        pressed: true,
+                    },
+                ))
+                .expect("old sequence"),
+            ReconcileOutcome::IgnoredStaleSequence
+        );
+        assert!(matches!(
+            reconciler
+                .apply(epoch_message(
+                    10,
+                    2,
+                    InputEvent::Key {
+                        code: 5,
+                        pressed: true,
+                    },
+                ))
+                .expect("same epoch resumes"),
+            ReconcileOutcome::Applied(_)
+        ));
+    }
+
+    #[test]
+    fn successor_epoch_rejects_every_delayed_old_state_event() {
+        let mut reconciler = InputReconciler::default();
+        reconciler
+            .apply(epoch_message(
+                10,
+                1,
+                InputEvent::Key {
+                    code: 4,
+                    pressed: true,
+                },
+            ))
+            .expect("old key down");
+        reconciler
+            .apply(epoch_message(
+                11,
+                1,
+                InputEvent::Snapshot(InputState::default()),
+            ))
+            .expect("successor snapshot");
+        assert!(reconciler.state().is_empty());
+
+        let mut stale_snapshot = InputState::default();
+        stale_snapshot.set_key(7, true).expect("stale key");
+        stale_snapshot.set_button(2, true).expect("stale button");
+        for event in [
+            InputEvent::Key {
+                code: 4,
+                pressed: true,
+            },
+            InputEvent::PointerButton {
+                button: 1,
+                pressed: true,
+            },
+            InputEvent::Snapshot(stale_snapshot),
+            InputEvent::ReleaseAll,
+        ] {
+            assert_eq!(
+                reconciler
+                    .apply(epoch_message(10, u64::MAX, event))
+                    .expect("stale input is nonfatal"),
+                ReconcileOutcome::IgnoredStaleEpoch
+            );
+            assert!(reconciler.state().is_empty());
+        }
     }
 
     #[test]
