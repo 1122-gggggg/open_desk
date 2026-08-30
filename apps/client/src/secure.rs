@@ -5,6 +5,7 @@ use latencydesk_input::{InputEvent, InputMessage};
 use latencydesk_protocol::quic::SessionStamp;
 use latencydesk_protocol::{InputAckStatus, InputAppliedAck};
 use latencydesk_session::lifecycle::ReconnectPolicy;
+use latencydesk_session::nat::{candidate_exchange_sha256, gather_candidate_exchange_v1};
 #[cfg(test)]
 use latencydesk_socket_transport::identity::connect_exact_peer;
 use latencydesk_socket_transport::identity::{
@@ -327,7 +328,7 @@ const fn platform_capability_flags() -> u16 {
 }
 
 fn stream_config_is_offered(config: latencydesk_protocol::VideoStreamConfig, flags: u16) -> bool {
-    match (config.codec, config.profile) {
+    let codec_offered = match (config.codec, config.profile) {
         (
             latencydesk_protocol::VideoCodec::H264,
             latencydesk_protocol::VideoProfile::H264High420,
@@ -337,7 +338,12 @@ fn stream_config_is_offered(config: latencydesk_protocol::VideoStreamConfig, fla
             latencydesk_protocol::VideoProfile::RawNv12,
         ) => flags & latencydesk_protocol::video_capability_flags::RAW_NV12 != 0,
         _ => false,
-    }
+    };
+    codec_offered
+        && (!config.supports_authenticated_candidate_exchange()
+            || flags
+                & latencydesk_protocol::video_capability_flags::AUTHENTICATED_CANDIDATE_EXCHANGE
+                != 0)
 }
 
 fn require_input_ack_capability(
@@ -353,12 +359,34 @@ pub(crate) async fn negotiate_video_stream(
     session: &ProductSession,
     timeout: Duration,
 ) -> Result<(latencydesk_protocol::VideoStreamConfig, ControlReceiver), Box<dyn Error>> {
+    let (config, receiver, candidate_exchange) =
+        negotiate_video_stream_with_candidates(session, timeout, None).await?;
+    debug_assert!(candidate_exchange.is_none());
+    Ok((config, receiver))
+}
+
+async fn negotiate_video_stream_with_candidates(
+    session: &ProductSession,
+    timeout: Duration,
+    local_candidate_exchange: Option<latencydesk_protocol::CandidateExchange>,
+) -> Result<
+    (
+        latencydesk_protocol::VideoStreamConfig,
+        ControlReceiver,
+        Option<latencydesk_protocol::CandidateExchange>,
+    ),
+    Box<dyn Error>,
+> {
     use latencydesk_protocol::{
-        ControlKind, VideoCodecCapabilities, VideoStreamConfig, VIDEO_CODEC_CONTRACT_VERSION,
+        video_capability_flags, ControlKind, VideoCodecCapabilities, VideoStreamConfig,
+        VIDEO_CODEC_CONTRACT_VERSION,
     };
 
     tokio::time::timeout(timeout, async {
-        let flags = platform_capability_flags();
+        let mut flags = platform_capability_flags();
+        if local_candidate_exchange.is_some() {
+            flags |= video_capability_flags::AUTHENTICATED_CANDIDATE_EXCHANGE;
+        }
         let capabilities = VideoCodecCapabilities {
             contract_version: VIDEO_CODEC_CONTRACT_VERSION,
             flags,
@@ -386,7 +414,18 @@ pub(crate) async fn negotiate_video_stream(
             )
             .into());
         }
-        Ok::<_, Box<dyn Error>>((config, receiver))
+        let peer_candidate_exchange = if config.supports_authenticated_candidate_exchange() {
+            let local = local_candidate_exchange
+                .ok_or("Host selected candidate advertisement without a Client candidate set")?;
+            session.send_candidate_exchange(local).await?;
+            Some(receiver.next_candidate_exchange().await?)
+        } else {
+            if local_candidate_exchange.is_some() {
+                return Err("Host did not negotiate authenticated candidate advertisement".into());
+            }
+            None
+        };
+        Ok::<_, Box<dyn Error>>((config, receiver, peer_candidate_exchange))
     })
     .await
     .map_err(|_| format!("codec negotiation timed out after {timeout:?}"))?
@@ -482,7 +521,22 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
     log_active_session(&session, selected_remote, attempts_started);
 
     let reconnect_policy = ReconnectPolicy::new(args.reconnect_attempts)?;
-    let result = if args.input_latency_probes > 0 {
+    let result = if args.candidate_exchange_probe {
+        let local_address = endpoint.local_addr()?;
+        let exchange = gather_candidate_exchange_v1(
+            local_address,
+            stun_report.map(|report| report.mapped_address),
+            session.stamp().session_id,
+            1,
+        )?;
+        run_candidate_exchange_probe(
+            &runtime,
+            &session,
+            exchange,
+            selected_remote,
+            operation_timeout,
+        )
+    } else if args.input_latency_probes > 0 {
         run_input_latency_probes(
             &runtime,
             &session,
@@ -541,6 +595,50 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
             })
     });
     merge_cleanup_result(result, cleanup_result)
+}
+
+fn run_candidate_exchange_probe(
+    runtime: &tokio::runtime::Runtime,
+    session: &ProductSession,
+    local_exchange: latencydesk_protocol::CandidateExchange,
+    selected_remote: SocketAddr,
+    timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let local_exchange_id = local_exchange.exchange_id;
+    let local_generation = local_exchange.generation;
+    let local_candidates = local_exchange.candidates.len();
+    let local_digest = candidate_exchange_sha256(&local_exchange)?;
+    let (config, _control_receiver, peer_exchange) = runtime.block_on(
+        negotiate_video_stream_with_candidates(session, timeout, Some(local_exchange)),
+    )?;
+    let peer_exchange = peer_exchange
+        .ok_or("Host completed codec negotiation without authenticated candidate advertisement")?;
+    let peer_digest = candidate_exchange_sha256(&peer_exchange)?;
+    let received = runtime.block_on(receive_frames_with_timeout(session, 1, timeout, config))?;
+    runtime.block_on(send_input_event(
+        session,
+        1,
+        InputEvent::ReleaseAll,
+        reliable_operation_timeout(timeout),
+    ))?;
+    println!(
+        "candidate-exchange: authenticated=true session_id={} local_exchange_id={local_exchange_id} local_generation={local_generation} local_candidates={local_candidates} local_sha256={} remote_exchange_id={} remote_generation={} remote_candidates={} remote_sha256={} transport_peer={} active_route={selected_remote} route_changed=false",
+        session.stamp().session_id,
+        encode_hex(&local_digest),
+        peer_exchange.exchange_id,
+        peer_exchange.generation,
+        peer_exchange.candidates.len(),
+        encode_hex(&peer_digest),
+        session.remote_address(),
+    );
+    println!(
+        "candidate-exchange-scope: advertisement-only connectivity_checks=false nomination=false ice_complete=false"
+    );
+    println!(
+        "received: session_id={} frames={received}",
+        session.stamp().session_id
+    );
+    Ok(())
 }
 
 fn run_input_latency_probes(

@@ -134,6 +134,7 @@ mod linux {
         VIDEO_CODEC_CONTRACT_VERSION,
     };
     use latencydesk_session::lifecycle::ProductStampAllocator;
+    use latencydesk_session::nat::{candidate_exchange_sha256, gather_candidate_exchange_v1};
     use latencydesk_socket_transport::identity::{
         accept_exact_peer_with_timeout, certificate_fingerprint, load_certificate_der,
         mtls_server_config, IdentityError, TlsIdentity,
@@ -143,6 +144,7 @@ mod linux {
     use latencydesk_transport::FragmentSpec;
     use std::borrow::Cow;
     use std::error::Error;
+    use std::net::SocketAddr;
     use std::num::NonZeroU64;
     use std::path::Path;
     use std::time::Duration;
@@ -341,6 +343,13 @@ mod linux {
             "mTLS: exact client certificate authenticated (rejected {rejected_connections} unauthenticated connection(s))"
         );
             println!("quic-peer: source={}", connection.remote_address());
+            let listener_address = endpoint.local_addr()?;
+            let authenticated_local_address = connection
+                .local_ip()
+                .or_else(|| {
+                    (!listener_address.ip().is_unspecified()).then_some(listener_address.ip())
+                })
+                .map(|ip| SocketAddr::new(ip, listener_address.port()));
 
             // X11 capture and XTEST input are intentionally opened only after the
             // remote certificate has passed exact-byte verification.
@@ -358,6 +367,9 @@ mod linux {
                     return Err(error.into());
                 }
             };
+            let local_candidate_exchange = authenticated_local_address
+                .map(|local| gather_candidate_exchange_v1(local, None, session_stamp.session_id, 1))
+                .transpose()?;
             let session = match ProductSession::host_with_stamp(connection, session_stamp).await {
                 Ok(session) => session,
                 Err(error) => {
@@ -394,6 +406,8 @@ mod linux {
                 .into());
             }
             let capabilities = VideoCodecCapabilities::decode(&capabilities_message.payload)?;
+            let advertise_candidates = capabilities.supports_authenticated_candidate_exchange()
+                && local_candidate_exchange.is_some();
             let (codec, profile) = select_host_codec(capabilities, true, true)?;
             let max_width = args.max_width.min(capabilities.max_width) & !1;
             let max_height = args.max_height.min(capabilities.max_height) & !1;
@@ -448,15 +462,48 @@ mod linux {
                 height: geometry.out_height,
                 fps,
                 target_bitrate_bps,
-                flags: if capabilities.supports_input_applied_ack() {
+                flags: (if capabilities.supports_input_applied_ack() {
                     latencydesk_protocol::video_stream_flags::INPUT_APPLIED_ACK
                 } else {
                     0
-                },
+                }) | (if advertise_candidates {
+                    latencydesk_protocol::video_stream_flags::AUTHENTICATED_CANDIDATE_EXCHANGE
+                } else {
+                    0
+                }),
             };
             session
                 .send_control(ControlKind::ConfigureStream, &config.encode()?)
                 .await?;
+            if advertise_candidates {
+                let peer_exchange = tokio::time::timeout(
+                    AUTHENTICATION_ATTEMPT_TIMEOUT,
+                    control_receiver.next_candidate_exchange(),
+                )
+                .await
+                .map_err(|_| "timed out waiting for authenticated Client candidates")??;
+                let local_exchange = local_candidate_exchange
+                    .expect("candidate flag requires a validated local exchange");
+                let local_digest = candidate_exchange_sha256(&local_exchange)?;
+                let peer_digest = candidate_exchange_sha256(&peer_exchange)?;
+                session.send_candidate_exchange(local_exchange.clone()).await?;
+                println!(
+                    "candidate-exchange: authenticated=true session_id={} local_exchange_id={} local_generation={} local_candidates={} local_sha256={} remote_exchange_id={} remote_generation={} remote_candidates={} remote_sha256={} transport_peer={} route_changed=false",
+                    session_stamp.session_id,
+                    local_exchange.exchange_id,
+                    local_exchange.generation,
+                    local_exchange.candidates.len(),
+                    hex(&local_digest),
+                    peer_exchange.exchange_id,
+                    peer_exchange.generation,
+                    peer_exchange.candidates.len(),
+                    hex(&peer_digest),
+                    session.remote_address(),
+                );
+                println!(
+                    "candidate-exchange-scope: advertisement-only connectivity_checks=false nomination=false ice_complete=false"
+                );
+            }
             println!(
                 "codec: negotiated contract v{VIDEO_CODEC_CONTRACT_VERSION} {:?}/{:?} {}x{}@{} target={target_bitrate_bps}bps",
                 config.codec, config.profile, config.width, config.height, config.fps

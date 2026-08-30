@@ -65,6 +65,7 @@ pub struct ClientArgs {
     pub session_count: u32,
     pub reconnect_attempts: u32,
     pub input_latency_probes: u32,
+    pub candidate_exchange_probe: bool,
     pub width: u32,
     pub height: u32,
     pub auto_approve: bool,
@@ -92,6 +93,7 @@ impl Default for ClientArgs {
             session_count: 1,
             reconnect_attempts: 0,
             input_latency_probes: 0,
+            candidate_exchange_probe: false,
             width: 1280,
             height: 720,
             auto_approve: false,
@@ -216,6 +218,10 @@ where
                 config.input_latency_probes = probes;
                 i += 2;
             }
+            "--candidate-exchange-probe" => {
+                config.candidate_exchange_probe = true;
+                i += 1;
+            }
             "--width" => {
                 if i + 1 >= args.len() {
                     return Err("missing value for --width".into());
@@ -308,6 +314,7 @@ where
                        --session-count <COUNT>   Run 1..=16 clean sequential headless sessions (default 1)\n  \
                        --reconnect-attempts <N>  Retry 0..=8 recoverable headless path losses (default 0)\n  \
                        --input-latency-probes <N> Measure 1..=1024 ACK RTTs per secure target (Linux Host)\n  \
+                       --candidate-exchange-probe Advertise bounded candidates after exact mTLS without changing route\n  \
                        --inject-probe            Send one pointer move and ReleaseAll, wait 3 frames, exit\n  \
                        --role client             Explicit role assertion\n  \
                        --version, -V             Show version information\n  \
@@ -460,6 +467,24 @@ where
     {
         return Err(
             "--input-latency-probes supports secure --connect/--peer-cert or secure --target entries and is incompatible with --frames, --session-count, --reconnect-attempts, --inject-probe, and --unsafe-udp-lab"
+                .into(),
+        );
+    }
+    let candidate_probe_bind_invalid = config.bind_addr.ip().is_unspecified()
+        || config.bind_addr.ip().is_multicast()
+        || matches!(config.bind_addr.ip(), std::net::IpAddr::V4(ip) if ip.is_broadcast());
+    if config.candidate_exchange_probe
+        && (candidate_probe_bind_invalid
+            || config.max_frames.is_some()
+            || config.session_count > 1
+            || config.reconnect_attempts > 0
+            || config.input_latency_probes > 0
+            || config.inject_probe
+            || config.unsafe_udp_lab
+            || !config.targets.is_empty())
+    {
+        return Err(
+            "--candidate-exchange-probe requires one secure --connect/--peer-cert target, an explicit unicast --bind address, and no other headless/probe/multi-target mode"
                 .into(),
         );
     }
@@ -1442,6 +1467,75 @@ mod tests {
                 "host.der",
                 "--stun-server",
                 "[::1]:3478",
+            ],
+        ] {
+            assert!(parse_client_args_from(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn client_parser_scopes_authenticated_candidate_exchange_probe() {
+        let args = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client.der",
+            "--identity-key",
+            "key.der",
+            "--peer-cert",
+            "host.der",
+            "--connect",
+            "127.0.0.1:9000",
+            "--bind",
+            "127.0.0.1:0",
+            "--candidate-exchange-probe",
+        ])
+        .expect("authenticated candidate advertisement probe");
+        assert!(args.candidate_exchange_probe);
+
+        for invalid in [
+            vec![
+                "latencydesk-client",
+                "--unsafe-udp-lab",
+                "--approve",
+                "--bind",
+                "127.0.0.1:0",
+                "--candidate-exchange-probe",
+            ],
+            vec![
+                "latencydesk-client",
+                "--identity-cert",
+                "client.der",
+                "--identity-key",
+                "key.der",
+                "--peer-cert",
+                "host.der",
+                "--bind",
+                "224.0.0.1:0",
+                "--candidate-exchange-probe",
+            ],
+            vec![
+                "latencydesk-client",
+                "--identity-cert",
+                "client.der",
+                "--identity-key",
+                "key.der",
+                "--peer-cert",
+                "host.der",
+                "--candidate-exchange-probe",
+            ],
+            vec![
+                "latencydesk-client",
+                "--identity-cert",
+                "client.der",
+                "--identity-key",
+                "key.der",
+                "--peer-cert",
+                "host.der",
+                "--bind",
+                "127.0.0.1:0",
+                "--frames",
+                "1",
+                "--candidate-exchange-probe",
             ],
         ] {
             assert!(parse_client_args_from(invalid).is_err());
