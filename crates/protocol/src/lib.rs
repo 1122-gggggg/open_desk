@@ -841,6 +841,112 @@ impl HandshakeCompletedMessage {
     }
 }
 
+/// Result of one ACK-requested input after reconciliation/platform injection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum InputAckStatus {
+    Applied = 1,
+    IgnoredStaleSequence = 2,
+    IgnoredStaleEpoch = 3,
+    ApplyFailed = 4,
+}
+
+impl TryFrom<u8> for InputAckStatus {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Applied),
+            2 => Ok(Self::IgnoredStaleSequence),
+            3 => Ok(Self::IgnoredStaleEpoch),
+            4 => Ok(Self::ApplyFailed),
+            other => Err(ProtocolError::UnknownInputAckStatus(other)),
+        }
+    }
+}
+
+/// Host report emitted only after an ACK-requested input has been reconciled
+/// and any resulting platform injections have returned. It intentionally
+/// contains no key codes, text, button identities, or state snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputAppliedAck {
+    pub stamp: quic::SessionStamp,
+    pub input_epoch: u32,
+    pub input_sequence: u64,
+    pub ack_sequence: u64,
+    pub status: InputAckStatus,
+    pub applied_action_count: u16,
+}
+
+impl InputAppliedAck {
+    pub const ENCODED_LEN: usize = 56;
+
+    pub fn encode(self) -> Result<[u8; Self::ENCODED_LEN], ProtocolError> {
+        self.validate()?;
+        let mut out = [0_u8; Self::ENCODED_LEN];
+        out[0] = WIRE_VERSION;
+        out[1] = self.status as u8;
+        // 2..4 reserved
+        out[4..12].copy_from_slice(&self.stamp.session_id.to_be_bytes());
+        out[12..20].copy_from_slice(&self.stamp.generation.to_be_bytes());
+        out[20..24].copy_from_slice(&self.stamp.authorization_epoch.to_be_bytes());
+        out[24..28].copy_from_slice(&self.stamp.display_epoch.to_be_bytes());
+        out[28..32].copy_from_slice(&self.stamp.codec_epoch.to_be_bytes());
+        out[32..36].copy_from_slice(&self.input_epoch.to_be_bytes());
+        out[36..44].copy_from_slice(&self.input_sequence.to_be_bytes());
+        out[44..52].copy_from_slice(&self.ack_sequence.to_be_bytes());
+        out[52..54].copy_from_slice(&self.applied_action_count.to_be_bytes());
+        // 54..56 reserved
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        if bytes.len() != Self::ENCODED_LEN {
+            return Err(ProtocolError::PayloadLength {
+                expected: Self::ENCODED_LEN,
+                actual: bytes.len(),
+            });
+        }
+        if bytes[0] != WIRE_VERSION {
+            return Err(ProtocolError::UnsupportedVersion(bytes[0]));
+        }
+        if bytes[2..4] != [0, 0] || bytes[54..56] != [0, 0] {
+            return Err(ProtocolError::ReservedBits);
+        }
+        let ack = Self {
+            stamp: quic::SessionStamp {
+                session_id: read_u64(bytes, 4),
+                generation: read_u64(bytes, 12),
+                authorization_epoch: read_u32(bytes, 20),
+                display_epoch: read_u32(bytes, 24),
+                codec_epoch: read_u32(bytes, 28),
+            },
+            input_epoch: read_u32(bytes, 32),
+            input_sequence: read_u64(bytes, 36),
+            ack_sequence: read_u64(bytes, 44),
+            status: InputAckStatus::try_from(bytes[1])?,
+            applied_action_count: read_u16(bytes, 52),
+        };
+        ack.validate()?;
+        Ok(ack)
+    }
+
+    fn validate(self) -> Result<(), ProtocolError> {
+        self.stamp.validate_pending()?;
+        if self.stamp.authorization_epoch == 0
+            || self.stamp.display_epoch == 0
+            || self.stamp.codec_epoch == 0
+            || self.input_epoch != self.stamp.authorization_epoch
+            || self.input_sequence == 0
+            || self.ack_sequence == 0
+            || (self.status != InputAckStatus::Applied && self.applied_action_count != 0)
+        {
+            return Err(ProtocolError::InvalidInputAck);
+        }
+        Ok(())
+    }
+}
+
 /// Codec rate and framerate reconfiguration signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateUpdateMessage {
@@ -1698,6 +1804,7 @@ pub enum ProtocolError {
     UnknownMediaKind(u8),
     UnknownStreamKind(u8),
     UnknownControlKind(u8),
+    UnknownInputAckStatus(u8),
     UnknownFlags(u16),
     UnknownControlFlags(u16),
     ReservedBits,
@@ -1741,6 +1848,7 @@ pub enum ProtocolError {
     InvalidVideoProfile,
     InvalidVideoGeometry,
     InvalidHandshake,
+    InvalidInputAck,
     ReplayedPacket(u64),
     StaleEpoch {
         packet_epoch: u32,
@@ -1775,6 +1883,52 @@ impl std::error::Error for ProtocolError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_applied_ack_round_trip_and_fail_closed_fields() {
+        let stamp = quic::SessionStamp {
+            session_id: 41,
+            generation: 2,
+            authorization_epoch: 3,
+            display_epoch: 4,
+            codec_epoch: 5,
+        };
+        let ack = InputAppliedAck {
+            stamp,
+            input_epoch: 3,
+            input_sequence: 9,
+            ack_sequence: 1,
+            status: InputAckStatus::Applied,
+            applied_action_count: 1,
+        };
+        let encoded = ack.encode().expect("ack encode");
+        assert_eq!(InputAppliedAck::decode(&encoded).expect("ack decode"), ack);
+
+        let mut malformed = encoded;
+        malformed[1] = 0xff;
+        assert_eq!(
+            InputAppliedAck::decode(&malformed),
+            Err(ProtocolError::UnknownInputAckStatus(0xff))
+        );
+        malformed = encoded;
+        malformed[2] = 1;
+        assert_eq!(
+            InputAppliedAck::decode(&malformed),
+            Err(ProtocolError::ReservedBits)
+        );
+
+        let invalid = InputAppliedAck {
+            input_epoch: 4,
+            ..ack
+        };
+        assert_eq!(invalid.encode(), Err(ProtocolError::InvalidInputAck));
+        let invalid = InputAppliedAck {
+            status: InputAckStatus::IgnoredStaleSequence,
+            applied_action_count: 1,
+            ..ack
+        };
+        assert_eq!(invalid.encode(), Err(ProtocolError::InvalidInputAck));
+    }
 
     fn valid_header() -> MediaHeader {
         MediaHeader {

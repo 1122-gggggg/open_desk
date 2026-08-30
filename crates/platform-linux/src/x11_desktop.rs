@@ -283,6 +283,19 @@ impl X11DesktopSession {
         Ok(())
     }
 
+    /// Completes one X11 request/reply round trip after queued XTEST requests.
+    /// This is used only by opt-in latency probes; normal input remains
+    /// asynchronous after `flush()` and does not pay this synchronization cost.
+    pub fn synchronize_input(&self) -> Result<(), X11DesktopError> {
+        self.conn.flush().map_err(protocol)?;
+        self.conn
+            .get_input_focus()
+            .map_err(protocol)?
+            .reply()
+            .map_err(protocol)?;
+        Ok(())
+    }
+
     fn warp(&self, x: i16, y: i16) -> Result<(), X11DesktopError> {
         self.conn
             .xtest_fake_input(X_MOTION_NOTIFY, 0, 0, self.root, x, y, 0)

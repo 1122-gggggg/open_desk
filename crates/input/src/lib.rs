@@ -8,14 +8,23 @@ const HEADER_LEN: usize = 24;
 const MAX_MESSAGE_BYTES: usize = 256;
 const MAX_KEY_CODE: u16 = 511;
 const KEY_WORDS: usize = 8;
+const INPUT_FLAG_ACK_REQUESTED: u32 = 1;
 
 /// Monotonic input envelope. `session_epoch` changes on reconnect so stale
-/// datagrams from an old transport cannot affect a new desktop session.
+/// records from an old transport cannot affect a new desktop session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputMessage {
     pub session_epoch: u32,
     pub sequence: u64,
     pub event: InputEvent,
+}
+
+/// Decoded input plus opt-in delivery metadata. Normal consumers use
+/// [`InputMessage::decode`], which continues to reject every nonzero flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedInputEnvelope {
+    pub message: InputMessage,
+    pub ack_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +144,16 @@ impl InputState {
 
 impl InputMessage {
     pub fn encode(&self) -> Result<Vec<u8>, InputError> {
+        self.encode_with_flags(0)
+    }
+
+    /// Encodes an opt-in latency/application acknowledgment request. The flag
+    /// never changes input authorization or reconciliation semantics.
+    pub fn encode_ack_requested(&self) -> Result<Vec<u8>, InputError> {
+        self.encode_with_flags(INPUT_FLAG_ACK_REQUESTED)
+    }
+
+    fn encode_with_flags(&self, flags: u32) -> Result<Vec<u8>, InputError> {
         let (kind, mut payload) = encode_event(&self.event)?;
         if payload.len() > MAX_MESSAGE_BYTES - HEADER_LEN {
             return Err(InputError::PayloadLength);
@@ -147,12 +166,23 @@ impl InputMessage {
         output.extend_from_slice(&payload_len.to_be_bytes());
         output.extend_from_slice(&self.session_epoch.to_be_bytes());
         output.extend_from_slice(&self.sequence.to_be_bytes());
-        output.extend_from_slice(&0_u32.to_be_bytes());
+        output.extend_from_slice(&flags.to_be_bytes());
         output.append(&mut payload);
         Ok(output)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, InputError> {
+        let envelope = Self::decode_envelope(bytes)?;
+        if envelope.ack_requested {
+            return Err(InputError::Reserved);
+        }
+        Ok(envelope.message)
+    }
+
+    /// Decodes the single version-1 ACK-request flag while rejecting every
+    /// unknown bit. Host input workers use this path; other consumers retain
+    /// the strict zero-flags behavior of [`Self::decode`].
+    pub fn decode_envelope(bytes: &[u8]) -> Result<DecodedInputEnvelope, InputError> {
         if bytes.len() < HEADER_LEN || bytes.len() > MAX_MESSAGE_BYTES {
             return Err(InputError::PayloadLength);
         }
@@ -164,16 +194,20 @@ impl InputMessage {
         }
         let kind = bytes[5];
         let payload_len = usize::from(read_u16(bytes, 6));
-        if bytes[20..24] != [0, 0, 0, 0] {
+        let flags = read_u32(bytes, 20);
+        if flags & !INPUT_FLAG_ACK_REQUESTED != 0 {
             return Err(InputError::Reserved);
         }
         if HEADER_LEN.checked_add(payload_len) != Some(bytes.len()) {
             return Err(InputError::PayloadLength);
         }
-        Ok(Self {
-            session_epoch: read_u32(bytes, 8),
-            sequence: read_u64(bytes, 12),
-            event: decode_event(kind, &bytes[HEADER_LEN..])?,
+        Ok(DecodedInputEnvelope {
+            message: Self {
+                session_epoch: read_u32(bytes, 8),
+                sequence: read_u64(bytes, 12),
+                event: decode_event(kind, &bytes[HEADER_LEN..])?,
+            },
+            ack_requested: flags & INPUT_FLAG_ACK_REQUESTED != 0,
         })
     }
 }
@@ -591,6 +625,28 @@ mod tests {
             let encoded = value.encode().expect("encode");
             assert_eq!(InputMessage::decode(&encoded).expect("decode"), value);
         }
+    }
+
+    #[test]
+    fn ack_request_flag_is_explicit_and_unknown_flags_fail_closed() {
+        let input = message(9, InputEvent::PointerMotionRelative { dx: 1, dy: -1 });
+        let normal = input.encode().expect("normal input");
+        let normal_envelope = InputMessage::decode_envelope(&normal).expect("normal envelope");
+        assert_eq!(normal_envelope.message, input);
+        assert!(!normal_envelope.ack_requested);
+
+        let requested = input.encode_ack_requested().expect("probe input");
+        let requested_envelope = InputMessage::decode_envelope(&requested).expect("probe envelope");
+        assert_eq!(requested_envelope.message, input);
+        assert!(requested_envelope.ack_requested);
+        assert_eq!(InputMessage::decode(&requested), Err(InputError::Reserved));
+
+        let mut unknown = normal;
+        unknown[23] = 0x02;
+        assert_eq!(
+            InputMessage::decode_envelope(&unknown),
+            Err(InputError::Reserved)
+        );
     }
 
     #[test]
