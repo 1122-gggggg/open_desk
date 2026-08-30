@@ -683,6 +683,7 @@ dependencies = [
 name = "latencydesk-stress"
 version = "0.1.0-alpha.2"
 dependencies = [
+ "latencydesk-scheduler",
  "latencydesk-testkit",
  "latencydesk-transport",
 ]

@@ -11,6 +11,7 @@ if command -v cargo >/dev/null 2>&1; then
   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
   cargo test --workspace --all-targets --locked
   cargo test --workspace --doc --locked
+  cargo run --locked -p latencydesk-stress
 else
   echo "cargo is unavailable; Rust gates were not executed" >&2
   exit 4

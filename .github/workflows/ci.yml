@@ -40,6 +40,12 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-targets --locked
       - run: cargo test --workspace --doc --locked
+      - name: Deterministic multi-session and input-priority stress gate
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p artifacts/ci
+          cargo run --quiet --locked -p latencydesk-stress > artifacts/ci/multisession-stress.json
+          python3 -c 'import json, pathlib; data = json.loads(pathlib.Path("artifacts/ci/multisession-stress.json").read_text()); assert data["schema"] == 1; assert data["concurrent_sessions"] == 8; assert data["profile_runs"] == data["unique_session_profile_runs"] == 32; assert data["submitted_frames"] == data["completed_frames"] + data["incomplete_frames"] + data["exact_mismatches"]; assert data["exact_mismatches"] == 0; assert data["max_input_service_pops"] == 1'
       - name: Build secure process-smoke binaries
         if: matrix.os == 'ubuntu-latest'
         run: cargo build --locked -p latencydesk-host -p latencydesk-client -p latencydesk-identity
@@ -60,6 +66,14 @@ jobs:
         with:
           name: secure-process-smoke-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/ci/secure-connect.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload deterministic multi-session evidence
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v7
+        with:
+          name: multisession-stress-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/ci/multisession-stress.json
           if-no-files-found: error
           retention-days: 30
       - name: Build Linux lab-preview package
