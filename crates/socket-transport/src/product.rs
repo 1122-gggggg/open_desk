@@ -10,8 +10,8 @@ use latencydesk_protocol::quic::{
     MediaDatagram, SessionStamp, StreamKind, StreamRecord, QUIC_MEDIA_HEADER_LEN,
 };
 use latencydesk_protocol::{
-    ControlHeader, ControlKind, ControlPacket, HandshakeCompletedMessage, ProtocolError,
-    MEDIA_HEADER_LEN,
+    CandidateExchange, ControlHeader, ControlKind, ControlPacket, HandshakeCompletedMessage,
+    ProtocolError, MEDIA_HEADER_LEN,
 };
 use latencydesk_transport::{
     frame_fragments_with_packet_budget, FragmentSpec, IngestOutcome, ReassembledFrame, Reassembler,
@@ -44,6 +44,7 @@ pub struct ProductSession {
     last_delivered_frame_id: Arc<Mutex<Option<u64>>>,
     clock_origin: Instant,
     inbound_control: Arc<Mutex<Option<QuicInboundStream>>>,
+    candidate_exchange: Arc<Mutex<CandidateExchangeTracker>>,
 }
 
 /// Receiver for the dedicated ordered input lane.
@@ -60,6 +61,67 @@ pub struct ControlReceiver {
     connection: QuicConnection,
     stream: QuicInboundStream,
     expected_stamp: SessionStamp,
+    candidate_exchange: CandidateExchangeTracker,
+}
+
+/// Enforces the ordered, per-peer candidate advertisement sequence.
+#[derive(Debug, Clone, Default)]
+pub struct CandidateExchangeTracker {
+    exchange_id: Option<u64>,
+    generation: u32,
+}
+
+impl CandidateExchangeTracker {
+    /// Validates a candidate exchange and advances the tracker atomically.
+    pub fn accept(
+        &mut self,
+        exchange: &CandidateExchange,
+    ) -> Result<(), CandidateExchangeViolation> {
+        if let Err(error) = exchange.encode() {
+            return Err(CandidateExchangeViolation::Malformed(error));
+        }
+        self.accept_validated(exchange)
+    }
+
+    fn accept_validated(
+        &mut self,
+        exchange: &CandidateExchange,
+    ) -> Result<(), CandidateExchangeViolation> {
+        if let Some(exchange_id) = self.exchange_id {
+            if exchange.exchange_id != exchange_id {
+                return Err(CandidateExchangeViolation::ExchangeId {
+                    expected: exchange_id,
+                    actual: exchange.exchange_id,
+                });
+            }
+            let expected = self
+                .generation
+                .checked_add(1)
+                .ok_or(CandidateExchangeViolation::GenerationExhausted)?;
+            if exchange.generation != expected {
+                return Err(CandidateExchangeViolation::Generation {
+                    expected,
+                    actual: exchange.generation,
+                });
+            }
+        } else if exchange.generation != 1 {
+            return Err(CandidateExchangeViolation::Generation {
+                expected: 1,
+                actual: exchange.generation,
+            });
+        }
+        self.exchange_id = Some(exchange.exchange_id);
+        self.generation = exchange.generation;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CandidateExchangeViolation {
+    Malformed(ProtocolError),
+    ExchangeId { expected: u64, actual: u64 },
+    Generation { expected: u32, actual: u32 },
+    GenerationExhausted,
 }
 
 /// Validated product control message with an owned payload.
@@ -117,6 +179,10 @@ pub enum ProductProtocolViolation {
     HandshakeAuthorizationMismatch { expected: u32, actual: u32 },
     /// The post-mTLS handshake used a non-canonical legacy nonce value.
     HandshakeNonceMismatch,
+    /// A control record was not a candidate advertisement.
+    UnexpectedCandidateKind { actual: ControlKind },
+    /// Candidate advertisement bytes or ordering were invalid.
+    CandidateExchange(CandidateExchangeViolation),
     /// A replacement connection reused its session identity or did not advance
     /// every lifecycle epoch beyond the prior authenticated session.
     NonMonotonicSuccessor {
@@ -132,6 +198,7 @@ pub enum ProductSessionError {
     Protocol(ProtocolError),
     Transport(TransportError),
     PeerProtocol(ProductProtocolViolation),
+    CandidateExchange(CandidateExchangeViolation),
     /// QUIC DATAGRAM support was not negotiated.
     DatagramsUnsupported,
     /// The path cannot fit an outer QUIC-media header, one inner media header,
@@ -172,6 +239,9 @@ impl fmt::Display for ProductSessionError {
                     formatter,
                     "peer violated the product session protocol: {error:?}"
                 )
+            }
+            Self::CandidateExchange(error) => {
+                write!(formatter, "local candidate exchange is invalid: {error:?}")
             }
             Self::DatagramsUnsupported => {
                 formatter.write_str("QUIC DATAGRAM support was not negotiated")
@@ -214,6 +284,7 @@ impl Error for ProductSessionError {
             Self::Protocol(error) => Some(error),
             Self::Transport(error) => Some(error),
             Self::PeerProtocol(_)
+            | Self::CandidateExchange(_)
             | Self::DatagramsUnsupported
             | Self::DatagramBudgetTooSmall { .. }
             | Self::InvalidMediaMaxAge
@@ -438,6 +509,7 @@ impl ProductSession {
                 last_delivered_frame_id: Arc::new(Mutex::new(None)),
                 clock_origin: Instant::now(),
                 inbound_control: Arc::new(Mutex::new(Some(stream))),
+                candidate_exchange: Arc::new(Mutex::new(CandidateExchangeTracker::default())),
             })
         };
         match tokio::time::timeout(timeout, operation).await {
@@ -478,6 +550,13 @@ impl ProductSession {
         }
     }
 
+    /// UDP peer address Quinn currently reports for this authenticated path.
+    /// Candidate advertisements cannot modify it.
+    #[must_use]
+    pub fn remote_address(&self) -> std::net::SocketAddr {
+        self.connection.remote_address()
+    }
+
     /// Writes one typed product message on the persistent reliable control lane.
     pub async fn send_control(
         &self,
@@ -496,6 +575,31 @@ impl ProductSession {
         )?;
         let record = StreamRecord::encode(StreamKind::Control, self.stamp, &control)?;
         self.connection.send_control(&record).await?;
+        Ok(())
+    }
+
+    /// Sends one validated, sequential ICE candidate advertisement.
+    pub async fn send_candidate_exchange(
+        &self,
+        exchange: CandidateExchange,
+    ) -> Result<(), ProductSessionError> {
+        let payload = exchange.encode()?;
+        if exchange.exchange_id != self.stamp.session_id {
+            return Err(ProductSessionError::CandidateExchange(
+                CandidateExchangeViolation::ExchangeId {
+                    expected: self.stamp.session_id,
+                    actual: exchange.exchange_id,
+                },
+            ));
+        }
+        let mut tracker = self.candidate_exchange.lock().await;
+        let mut next_tracker = tracker.clone();
+        next_tracker
+            .accept_validated(&exchange)
+            .map_err(ProductSessionError::CandidateExchange)?;
+        self.send_control(ControlKind::IceCandidate, &payload)
+            .await?;
+        *tracker = next_tracker;
         Ok(())
     }
 
@@ -525,6 +629,7 @@ impl ProductSession {
             connection: self.connection.clone(),
             stream,
             expected_stamp: self.stamp,
+            candidate_exchange: CandidateExchangeTracker::default(),
         })
     }
 
@@ -744,6 +849,7 @@ impl ProductSession {
             last_delivered_frame_id: Arc::new(Mutex::new(None)),
             clock_origin: Instant::now(),
             inbound_control: Arc::new(Mutex::new(None)),
+            candidate_exchange: Arc::new(Mutex::new(CandidateExchangeTracker::default())),
         })
     }
 
@@ -805,6 +911,51 @@ impl ControlReceiver {
             kind: packet.header.kind,
             payload: Bytes::copy_from_slice(packet.payload),
         })
+    }
+
+    /// Reads the next candidate advertisement and enforces its per-connection
+    /// exchange identity and strictly consecutive generation.
+    pub async fn next_candidate_exchange(
+        &mut self,
+    ) -> Result<CandidateExchange, ProductSessionError> {
+        let message = self.next_control().await?;
+        if message.kind != ControlKind::IceCandidate {
+            return fail_peer_protocol(
+                &self.connection,
+                ProductProtocolViolation::UnexpectedCandidateKind {
+                    actual: message.kind,
+                },
+            );
+        }
+        let exchange = match CandidateExchange::decode(&message.payload) {
+            Ok(exchange) => exchange,
+            Err(error) => {
+                return fail_peer_protocol(
+                    &self.connection,
+                    ProductProtocolViolation::CandidateExchange(
+                        CandidateExchangeViolation::Malformed(error),
+                    ),
+                )
+            }
+        };
+        if exchange.exchange_id != self.expected_stamp.session_id {
+            return fail_peer_protocol(
+                &self.connection,
+                ProductProtocolViolation::CandidateExchange(
+                    CandidateExchangeViolation::ExchangeId {
+                        expected: self.expected_stamp.session_id,
+                        actual: exchange.exchange_id,
+                    },
+                ),
+            );
+        }
+        if let Err(violation) = self.candidate_exchange.accept_validated(&exchange) {
+            return fail_peer_protocol(
+                &self.connection,
+                ProductProtocolViolation::CandidateExchange(violation),
+            );
+        }
+        Ok(exchange)
     }
 }
 
@@ -946,8 +1097,9 @@ mod tests {
     use super::*;
     use crate::quic::{bind_client, bind_server};
     use latencydesk_protocol::{
-        media_flags, video_capability_flags, MediaKind, MediaPacket, VideoCodec,
-        VideoCodecCapabilities, VideoProfile, VideoStreamConfig, VIDEO_CODEC_CONTRACT_VERSION,
+        media_flags, video_capability_flags, CandidateType, IceCandidate, MediaKind, MediaPacket,
+        RelayProvider, TransportProtocol, VideoCodec, VideoCodecCapabilities, VideoProfile,
+        VideoStreamConfig, WireIpAddr, VIDEO_CODEC_CONTRACT_VERSION,
     };
     use latencydesk_transport::{fragment_frame_with_packet_budget, FrameKey};
     use rcgen::generate_simple_self_signed;
@@ -967,6 +1119,75 @@ mod tests {
         assert!(timeout.is_retryable_connection_loss());
         assert!(reset.is_retryable_connection_loss());
         assert!(!protocol.is_retryable_connection_loss());
+    }
+
+    fn candidate_exchange(generation: u32, exchange_id: u64) -> CandidateExchange {
+        CandidateExchange {
+            version: CandidateExchange::VERSION,
+            exchange_id,
+            generation,
+            candidates: vec![IceCandidate {
+                foundation: *b"testcand",
+                component: 1,
+                transport: TransportProtocol::Udp,
+                priority: 1,
+                candidate_type: CandidateType::Host,
+                relay_provider: RelayProvider::None,
+                ip: WireIpAddr::V4([127, 0, 0, 1]),
+                port: 5000,
+                related_address: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn candidate_tracker_accepts_round_trip_and_sequential_updates() {
+        let first = candidate_exchange(1, 42);
+        let decoded = CandidateExchange::decode(&first.encode().unwrap()).unwrap();
+        let mut tracker = CandidateExchangeTracker::default();
+        assert_eq!(tracker.accept(&decoded), Ok(()));
+        assert_eq!(tracker.accept(&candidate_exchange(2, 42)), Ok(()));
+    }
+
+    #[test]
+    fn candidate_tracker_rejects_replay_gap_id_change_and_exhaustion() {
+        let mut tracker = CandidateExchangeTracker::default();
+        assert!(tracker.accept(&candidate_exchange(1, 42)).is_ok());
+        for generation in [1, 3] {
+            assert!(matches!(
+                tracker.accept(&candidate_exchange(generation, 42)),
+                Err(CandidateExchangeViolation::Generation { .. })
+            ));
+        }
+        assert!(matches!(
+            tracker.accept(&candidate_exchange(2, 43)),
+            Err(CandidateExchangeViolation::ExchangeId { .. })
+        ));
+        let mut exhausted = CandidateExchangeTracker {
+            exchange_id: Some(42),
+            generation: u32::MAX,
+        };
+        assert_eq!(
+            exhausted.accept(&candidate_exchange(u32::MAX, 42)),
+            Err(CandidateExchangeViolation::GenerationExhausted)
+        );
+    }
+
+    #[test]
+    fn candidate_tracker_rejects_malformed_payload() {
+        let malformed = CandidateExchange::decode(&[1, 2, 3]);
+        assert!(malformed.is_err());
+        let mut tracker = CandidateExchangeTracker::default();
+        let invalid = CandidateExchange {
+            version: 1,
+            exchange_id: 1,
+            generation: 1,
+            candidates: vec![],
+        };
+        assert!(matches!(
+            tracker.accept(&invalid),
+            Err(CandidateExchangeViolation::Malformed(_))
+        ));
     }
 
     struct TestIdentity {
@@ -1102,6 +1323,118 @@ mod tests {
             ProductSession::client(pair.client),
         );
         (host.expect("host session"), client.expect("client session"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_exchange_product_round_trip_and_sequence() {
+        let (host, client) = product_pair(1_450).await;
+        let first = candidate_exchange(1, 41);
+        let second = candidate_exchange(2, 41);
+        client.send_candidate_exchange(first.clone()).await.unwrap();
+        client
+            .send_candidate_exchange(second.clone())
+            .await
+            .unwrap();
+        let mut receiver = host.accept_control_receiver().await.unwrap();
+        assert_eq!(receiver.next_candidate_exchange().await.unwrap(), first);
+        assert_eq!(receiver.next_candidate_exchange().await.unwrap(), second);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_exchange_id_must_match_the_active_product_session() {
+        let (host, client) = product_pair(1_450).await;
+        let wrong_session = candidate_exchange(1, 42);
+        assert!(matches!(
+            client.send_candidate_exchange(wrong_session.clone()).await,
+            Err(ProductSessionError::CandidateExchange(
+                CandidateExchangeViolation::ExchangeId {
+                    expected: 41,
+                    actual: 42
+                }
+            ))
+        ));
+
+        client
+            .send_control(
+                ControlKind::IceCandidate,
+                &wrong_session.encode().expect("valid candidate payload"),
+            )
+            .await
+            .expect("raw mismatched advertisement");
+        let mut receiver = host.accept_control_receiver().await.expect("control lane");
+        assert!(matches!(
+            receiver.next_candidate_exchange().await,
+            Err(ProductSessionError::PeerProtocol(
+                ProductProtocolViolation::CandidateExchange(
+                    CandidateExchangeViolation::ExchangeId {
+                        expected: 41,
+                        actual: 42
+                    }
+                )
+            ))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_pre_handshake_candidate_is_rejected() {
+        let pair = connected_pair(1_450).await;
+        let stamp = active_stamp(NonZeroU64::new(41).unwrap());
+        let packet = ControlPacket::encode(
+            ControlHeader {
+                kind: ControlKind::IceCandidate,
+                flags: 0,
+                session_id: 41,
+                payload_len: 0,
+            },
+            &[],
+        )
+        .unwrap();
+        pair.server
+            .send_control(&StreamRecord::encode(StreamKind::Control, stamp, &packet).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            ProductSession::client(pair.client).await,
+            Err(ProductSessionError::PeerProtocol(
+                ProductProtocolViolation::UnexpectedHandshakeKind(ControlKind::IceCandidate)
+            ))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_candidate_closes_active_connection() {
+        let (host, client) = product_pair(1_450).await;
+        client
+            .send_control(ControlKind::IceCandidate, &[1, 2, 3])
+            .await
+            .unwrap();
+        let mut receiver = host.accept_control_receiver().await.unwrap();
+        assert!(matches!(
+            receiver.next_candidate_exchange().await,
+            Err(ProductSessionError::PeerProtocol(
+                ProductProtocolViolation::CandidateExchange(CandidateExchangeViolation::Malformed(
+                    _
+                ))
+            ))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wrong_candidate_kind_closes_active_connection() {
+        let (host, client) = product_pair(1_450).await;
+        client
+            .send_control(ControlKind::Capabilities, &[])
+            .await
+            .unwrap();
+        let mut receiver = host.accept_control_receiver().await.unwrap();
+        assert!(matches!(
+            receiver.next_candidate_exchange().await,
+            Err(ProductSessionError::PeerProtocol(
+                ProductProtocolViolation::UnexpectedCandidateKind {
+                    actual: ControlKind::Capabilities
+                }
+            ))
+        ));
     }
 
     fn video_spec(frame_id: u64) -> FragmentSpec {

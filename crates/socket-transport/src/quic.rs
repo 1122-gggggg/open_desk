@@ -283,6 +283,14 @@ impl QuicConnection {
         self.connection.remote_address()
     }
 
+    /// Destination IP observed for this authenticated connection. Quinn may
+    /// return `None` on client endpoints or platforms without destination-IP
+    /// metadata; callers must not substitute an unspecified bind address.
+    #[must_use]
+    pub fn local_ip(&self) -> Option<std::net::IpAddr> {
+        self.connection.local_ip()
+    }
+
     /// Waits for a full TLS 1.3 connection. It deliberately does not expose
     /// Quinn's 0-RTT API, so application records cannot enter early data.
     pub async fn connect(
@@ -910,6 +918,15 @@ mod tests {
         assert_eq!(
             pair.server.remote_address(),
             pair._client_endpoint.local_addr().expect("client address")
+        );
+        assert_eq!(
+            pair.server.local_ip(),
+            Some(
+                pair._server_endpoint
+                    .local_addr()
+                    .expect("server address")
+                    .ip()
+            )
         );
     }
 
