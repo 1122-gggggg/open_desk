@@ -434,6 +434,9 @@ pub mod video_capability_flags {
     /// The Client understands and may request full-stamp input application
     /// acknowledgments. A Host must intersect this with its platform support.
     pub const INPUT_APPLIED_ACK: u16 = 1 << 2;
+    /// Client accepts authenticated candidate advertisements only; this does
+    /// not select routes or claim ICE completion.
+    pub const AUTHENTICATED_CANDIDATE_EXCHANGE: u16 = 1 << 3;
 }
 
 /// Host capabilities attached to the selected secure stream configuration.
@@ -442,8 +445,11 @@ pub mod video_stream_flags {
     /// The Host can emit a full-stamp [`super::InputAppliedAck`] after platform
     /// input application. Linux X11 advertises this only when that path exists.
     pub const INPUT_APPLIED_ACK: u32 = 1 << 0;
+    /// Host may emit authenticated candidate advertisements only; this does
+    /// not select routes or claim ICE completion.
+    pub const AUTHENTICATED_CANDIDATE_EXCHANGE: u32 = 1 << 1;
 
-    pub(crate) const KNOWN: u32 = INPUT_APPLIED_ACK;
+    pub(crate) const KNOWN: u32 = INPUT_APPLIED_ACK | AUTHENTICATED_CANDIDATE_EXCHANGE;
 }
 
 /// Fixed-size receiver codec offer carried by [`ControlKind::Capabilities`].
@@ -491,7 +497,8 @@ impl VideoCodecCapabilities {
     fn validate(self) -> Result<(), ProtocolError> {
         let known = video_capability_flags::H264_HIGH_420
             | video_capability_flags::RAW_NV12
-            | video_capability_flags::INPUT_APPLIED_ACK;
+            | video_capability_flags::INPUT_APPLIED_ACK
+            | video_capability_flags::AUTHENTICATED_CANDIDATE_EXCHANGE;
         if self.contract_version != VIDEO_CODEC_CONTRACT_VERSION {
             return Err(ProtocolError::UnsupportedCodecContract(
                 self.contract_version,
@@ -524,6 +531,11 @@ impl VideoCodecCapabilities {
     #[must_use]
     pub const fn supports_input_applied_ack(self) -> bool {
         self.flags & video_capability_flags::INPUT_APPLIED_ACK != 0
+    }
+
+    #[must_use]
+    pub const fn supports_authenticated_candidate_exchange(self) -> bool {
+        self.flags & video_capability_flags::AUTHENTICATED_CANDIDATE_EXCHANGE != 0
     }
 }
 
@@ -640,6 +652,11 @@ impl VideoStreamConfig {
         };
         config.validate()?;
         Ok(config)
+    }
+
+    #[must_use]
+    pub const fn supports_authenticated_candidate_exchange(self) -> bool {
+        self.flags & video_stream_flags::AUTHENTICATED_CANDIDATE_EXCHANGE != 0
     }
 
     fn validate(self) -> Result<(), ProtocolError> {
@@ -1509,6 +1526,147 @@ impl IceCandidate {
     }
 }
 
+/// Version 1 candidate advertisement payload carried by `ControlKind::IceCandidate`.
+///
+/// The payload is deliberately an advertisement only: TCP and relayed candidates
+/// are rejected until a later version defines their connectivity semantics. A
+/// Duplicate detection uses a conservative endpoint key (component, transport,
+/// primary address, and port). This is stricter than full RFC 8445 redundancy
+/// until this descriptor grows an explicit base address, so changing foundation,
+/// priority, or type cannot bypass deduplication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateExchange {
+    pub version: u8,
+    pub exchange_id: u64,
+    pub generation: u32,
+    pub candidates: Vec<IceCandidate>,
+}
+
+impl CandidateExchange {
+    pub const VERSION: u8 = 1;
+    pub const MAX_CANDIDATES: usize = 8;
+    const HEADER_LEN: usize = 14;
+
+    pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+        self.validate()?;
+        let mut out = Vec::with_capacity(Self::HEADER_LEN + self.candidates.len() * 40);
+        out.push(self.version);
+        out.extend_from_slice(&self.exchange_id.to_be_bytes());
+        out.extend_from_slice(&self.generation.to_be_bytes());
+        out.push(self.candidates.len() as u8);
+        for candidate in &self.candidates {
+            let encoded = candidate.encode()?;
+            out.extend_from_slice(&(encoded.len() as u16).to_be_bytes());
+            out.extend_from_slice(&encoded);
+        }
+        if out.len() > MAX_CONTROL_BYTES as usize {
+            return Err(ProtocolError::CandidateExchangeLength(out.len()));
+        }
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        if bytes.len() < Self::HEADER_LEN {
+            return Err(ProtocolError::Truncated {
+                expected: Self::HEADER_LEN,
+                actual: bytes.len(),
+            });
+        }
+        if bytes.len() > MAX_CONTROL_BYTES as usize {
+            return Err(ProtocolError::CandidateExchangeLength(bytes.len()));
+        }
+        let version = bytes[0];
+        if version != Self::VERSION {
+            return Err(ProtocolError::UnsupportedVersion(version));
+        }
+        let exchange_id = read_u64(bytes, 1);
+        let generation = read_u32(bytes, 9);
+        let count = bytes[13] as usize;
+        if count == 0 || count > Self::MAX_CANDIDATES {
+            return Err(ProtocolError::CandidateExchangeCount(count));
+        }
+        let mut cursor = Self::HEADER_LEN;
+        let mut candidates = Vec::with_capacity(count);
+        for _ in 0..count {
+            if bytes.len() < cursor + 2 {
+                return Err(ProtocolError::Truncated {
+                    expected: cursor + 2,
+                    actual: bytes.len(),
+                });
+            }
+            let len = read_u16(bytes, cursor) as usize;
+            cursor += 2;
+            let end = cursor.checked_add(len).ok_or(ProtocolError::PacketLength)?;
+            if end > bytes.len() {
+                return Err(ProtocolError::Truncated {
+                    expected: end,
+                    actual: bytes.len(),
+                });
+            }
+            candidates.push(IceCandidate::decode(&bytes[cursor..end])?);
+            cursor = end;
+        }
+        if cursor != bytes.len() {
+            return Err(ProtocolError::PayloadLength {
+                expected: cursor,
+                actual: bytes.len(),
+            });
+        }
+        let exchange = Self {
+            version,
+            exchange_id,
+            generation,
+            candidates,
+        };
+        exchange.validate()?;
+        Ok(exchange)
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.version != Self::VERSION {
+            return Err(ProtocolError::UnsupportedVersion(self.version));
+        }
+        if self.exchange_id == 0 {
+            return Err(ProtocolError::InvalidCandidateExchangeId);
+        }
+        if self.generation == 0 {
+            return Err(ProtocolError::InvalidCandidateGeneration);
+        }
+        if self.candidates.is_empty() || self.candidates.len() > Self::MAX_CANDIDATES {
+            return Err(ProtocolError::CandidateExchangeCount(self.candidates.len()));
+        }
+        let family = |ip: WireIpAddr| matches!(ip, WireIpAddr::V4(_));
+        let first_family = family(self.candidates[0].ip);
+        for (index, candidate) in self.candidates.iter().enumerate() {
+            candidate.validate()?;
+            if candidate.transport == TransportProtocol::Tcp {
+                return Err(ProtocolError::UnsupportedCandidateTransport);
+            }
+            if candidate.candidate_type == CandidateType::Relayed {
+                return Err(ProtocolError::UnsupportedCandidateType);
+            }
+            if family(candidate.ip) != first_family {
+                return Err(ProtocolError::MixedCandidateAddressFamily);
+            }
+            if let Some((related, _)) = candidate.related_address {
+                if family(related) != first_family {
+                    return Err(ProtocolError::RelatedCandidateAddressFamily);
+                }
+            }
+            for prior in &self.candidates[..index] {
+                if prior.component == candidate.component
+                    && prior.transport == candidate.transport
+                    && prior.ip == candidate.ip
+                    && prior.port == candidate.port
+                {
+                    return Err(ProtocolError::DuplicateCandidate);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn is_usable_candidate_address(address: WireIpAddr) -> bool {
     match address {
         WireIpAddr::V4(octets) => {
@@ -1892,6 +2050,15 @@ pub enum ProtocolError {
     InvalidCandidatePort,
     InvalidCandidateComponent,
     InvalidCandidateAddress,
+    InvalidCandidateExchangeId,
+    InvalidCandidateGeneration,
+    CandidateExchangeCount(usize),
+    CandidateExchangeLength(usize),
+    DuplicateCandidate,
+    MixedCandidateAddressFamily,
+    UnsupportedCandidateTransport,
+    UnsupportedCandidateType,
+    RelatedCandidateAddressFamily,
     InvalidDisconnectReason(u8),
     InvalidDisconnectMessage,
     InvalidUnattendedToken,
@@ -2053,7 +2220,8 @@ mod tests {
         let capabilities = VideoCodecCapabilities {
             contract_version: VIDEO_CODEC_CONTRACT_VERSION,
             flags: video_capability_flags::H264_HIGH_420
-                | video_capability_flags::INPUT_APPLIED_ACK,
+                | video_capability_flags::INPUT_APPLIED_ACK
+                | video_capability_flags::AUTHENTICATED_CANDIDATE_EXCHANGE,
             max_width: 3_840,
             max_height: 2_160,
             max_fps: 120,
@@ -2063,6 +2231,7 @@ mod tests {
             Ok(capabilities)
         );
         assert!(capabilities.supports_input_applied_ack());
+        assert!(capabilities.supports_authenticated_candidate_exchange());
 
         let config = VideoStreamConfig {
             contract_version: VIDEO_CODEC_CONTRACT_VERSION,
@@ -2083,7 +2252,8 @@ mod tests {
         );
 
         let input_ack_capable = VideoStreamConfig {
-            flags: video_stream_flags::INPUT_APPLIED_ACK,
+            flags: video_stream_flags::INPUT_APPLIED_ACK
+                | video_stream_flags::AUTHENTICATED_CANDIDATE_EXCHANGE,
             ..config
         };
         assert_eq!(
@@ -2094,6 +2264,7 @@ mod tests {
             ),
             Ok(input_ack_capable)
         );
+        assert!(input_ack_capable.supports_authenticated_candidate_exchange());
         let unknown = VideoStreamConfig {
             flags: 1 << 31,
             ..config
@@ -2398,6 +2569,219 @@ mod tests {
         let pair_prio_direct = compute_pair_priority(host_prio, host_prio, true);
         let pair_prio_relay = compute_pair_priority(relay_prio, relay_prio, true);
         assert!(pair_prio_direct > pair_prio_relay);
+    }
+
+    fn exchange_candidate(ip: WireIpAddr, port: u16) -> IceCandidate {
+        IceCandidate {
+            foundation: [port as u8; 8],
+            component: 1,
+            transport: TransportProtocol::Udp,
+            priority: compute_candidate_priority(CandidateType::Host, 100, 1),
+            candidate_type: CandidateType::Host,
+            relay_provider: RelayProvider::None,
+            ip,
+            port,
+            related_address: None,
+        }
+    }
+
+    #[test]
+    fn candidate_exchange_round_trip_v4_and_v6() {
+        for candidate in [
+            exchange_candidate(WireIpAddr::V4([192, 0, 2, 1]), 4000),
+            exchange_candidate(
+                WireIpAddr::V6([0x20, 1, 0xdb, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+                4001,
+            ),
+        ] {
+            let exchange = CandidateExchange {
+                version: 1,
+                exchange_id: 7,
+                generation: 1,
+                candidates: vec![candidate],
+            };
+            assert_eq!(
+                CandidateExchange::decode(&exchange.encode().unwrap()).unwrap(),
+                exchange
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_exchange_rejects_bounds_duplicates_and_mixed_family() {
+        let c = exchange_candidate(WireIpAddr::V4([192, 0, 2, 1]), 4000);
+        let mut too_many = vec![c; 9];
+        for (i, item) in too_many.iter_mut().enumerate() {
+            item.port += i as u16;
+            item.foundation[0] = i as u8;
+        }
+        assert_eq!(
+            CandidateExchange {
+                version: 1,
+                exchange_id: 1,
+                generation: 1,
+                candidates: too_many
+            }
+            .encode(),
+            Err(ProtocolError::CandidateExchangeCount(9))
+        );
+        assert_eq!(
+            CandidateExchange {
+                version: 1,
+                exchange_id: 0,
+                generation: 1,
+                candidates: vec![c]
+            }
+            .encode(),
+            Err(ProtocolError::InvalidCandidateExchangeId)
+        );
+        assert_eq!(
+            CandidateExchange {
+                version: 1,
+                exchange_id: 1,
+                generation: 0,
+                candidates: vec![c]
+            }
+            .encode(),
+            Err(ProtocolError::InvalidCandidateGeneration)
+        );
+        assert_eq!(
+            CandidateExchange {
+                version: 1,
+                exchange_id: 1,
+                generation: 1,
+                candidates: vec![c, c]
+            }
+            .encode(),
+            Err(ProtocolError::DuplicateCandidate)
+        );
+        let mut same_endpoint = c;
+        same_endpoint.foundation = [99; 8];
+        assert_eq!(
+            CandidateExchange {
+                version: 1,
+                exchange_id: 1,
+                generation: 1,
+                candidates: vec![c, same_endpoint]
+            }
+            .encode(),
+            Err(ProtocolError::DuplicateCandidate)
+        );
+        let v6 = exchange_candidate(WireIpAddr::V6([1; 16]), 4001);
+        assert_eq!(
+            CandidateExchange {
+                version: 1,
+                exchange_id: 1,
+                generation: 1,
+                candidates: vec![c, v6]
+            }
+            .encode(),
+            Err(ProtocolError::MixedCandidateAddressFamily)
+        );
+    }
+
+    #[test]
+    fn candidate_exchange_rejects_unsupported_and_trailing() {
+        let mut c = exchange_candidate(WireIpAddr::V4([192, 0, 2, 1]), 4000);
+        c.transport = TransportProtocol::Tcp;
+        assert_eq!(
+            CandidateExchange {
+                version: 1,
+                exchange_id: 1,
+                generation: 1,
+                candidates: vec![c]
+            }
+            .encode(),
+            Err(ProtocolError::UnsupportedCandidateTransport)
+        );
+        let mut relayed = exchange_candidate(WireIpAddr::V4([192, 0, 2, 1]), 4000);
+        relayed.candidate_type = CandidateType::Relayed;
+        relayed.relay_provider = RelayProvider::Turn;
+        assert_eq!(
+            CandidateExchange {
+                version: 1,
+                exchange_id: 1,
+                generation: 1,
+                candidates: vec![relayed]
+            }
+            .encode(),
+            Err(ProtocolError::UnsupportedCandidateType)
+        );
+        let mut related_family = exchange_candidate(WireIpAddr::V4([192, 0, 2, 1]), 4000);
+        related_family.related_address = Some((WireIpAddr::V6([1; 16]), 4001));
+        assert_eq!(
+            CandidateExchange {
+                version: 1,
+                exchange_id: 1,
+                generation: 1,
+                candidates: vec![related_family]
+            }
+            .encode(),
+            Err(ProtocolError::RelatedCandidateAddressFamily)
+        );
+        let c = exchange_candidate(WireIpAddr::V4([192, 0, 2, 1]), 4000);
+        let mut bytes = CandidateExchange {
+            version: 1,
+            exchange_id: 1,
+            generation: 1,
+            candidates: vec![c],
+        }
+        .encode()
+        .unwrap();
+        bytes.push(0);
+        assert!(matches!(
+            CandidateExchange::decode(&bytes),
+            Err(ProtocolError::PayloadLength { .. })
+        ));
+        bytes[13] = 2;
+        assert!(matches!(
+            CandidateExchange::decode(&bytes[..15]),
+            Err(ProtocolError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn candidate_exchange_rejects_empty_wrong_version_and_count_nine() {
+        let c = exchange_candidate(WireIpAddr::V4([192, 0, 2, 1]), 4000);
+        assert_eq!(
+            CandidateExchange {
+                version: 1,
+                exchange_id: 1,
+                generation: 1,
+                candidates: vec![]
+            }
+            .encode(),
+            Err(ProtocolError::CandidateExchangeCount(0))
+        );
+        let eight = (0..8)
+            .map(|i| exchange_candidate(WireIpAddr::V4([192, 0, 2, i + 1]), 4000 + i as u16))
+            .collect();
+        assert!(CandidateExchange {
+            version: 1,
+            exchange_id: 1,
+            generation: 1,
+            candidates: eight
+        }
+        .encode()
+        .is_ok());
+        let mut bytes = CandidateExchange {
+            version: 1,
+            exchange_id: 1,
+            generation: 1,
+            candidates: vec![c],
+        }
+        .encode()
+        .unwrap();
+        bytes[13] = 9;
+        assert!(matches!(
+            CandidateExchange::decode(&bytes),
+            Err(ProtocolError::CandidateExchangeCount(9))
+        ));
+        bytes[0] = 2;
+        assert_eq!(
+            CandidateExchange::decode(&bytes),
+            Err(ProtocolError::UnsupportedVersion(2))
+        );
     }
 
     #[test]
