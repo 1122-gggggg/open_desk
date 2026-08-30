@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Fail-closed fake-STUN to same-socket exact-mTLS QUIC process evidence.
+"""Fail-closed fake-STUN and authenticated candidate-advertisement evidence.
 
 This proves only that one explicitly configured RFC 8489 Binding transaction
-and the following QUIC connection use the same local UDP socket. STUN remains
-untrusted candidate metadata; it is not ICE, peer identity, or authorization.
+and the following QUIC connection use the same local UDP socket, then exchange
+a bounded candidate set inside the exact-mTLS product session without changing
+the active route. It is not ICE, NAT traversal, nomination, or authorization.
 """
 from __future__ import annotations
 
@@ -51,8 +52,21 @@ CLIENT_LIFECYCLE_RE = re.compile(
     r"display_epoch=(\d+)\s+codec_epoch=(\d+)\s*$",
     re.I | re.M,
 )
+CANDIDATE_EXCHANGE_RE = re.compile(
+    r"^candidate-exchange:\s+authenticated=(true|false)\s+session_id=(\d+)\s+"
+    r"local_exchange_id=(\d+)\s+local_generation=(\d+)\s+local_candidates=(\d+)\s+"
+    r"local_sha256=([0-9a-f]{64})\s+remote_exchange_id=(\d+)\s+"
+    r"remote_generation=(\d+)\s+remote_candidates=(\d+)\s+"
+    r"remote_sha256=([0-9a-f]{64})\s+transport_peer=(\S+)"
+    r"(?:\s+active_route=(\S+))?\s+route_changed=(true|false)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 SCOPE_MARKER = (
     "stun-scope: candidate discovery only; exact-certificate mTLS remains mandatory"
+)
+CANDIDATE_SCOPE_MARKER = (
+    "candidate-exchange-scope: advertisement-only connectivity_checks=false "
+    "nomination=false ice_complete=false"
 )
 
 
@@ -139,6 +153,28 @@ def _render_address(address: tuple[str, int]) -> str:
     return f"{address[0]}:{address[1]}"
 
 
+def canonical_host_candidate_exchange_sha256(session_id: int, address: str) -> str:
+    host, raw_port = address.rsplit(":", 1)
+    port = int(raw_port)
+    packed_address = socket.inet_pton(socket.AF_INET, host)
+    if session_id <= 0 or not 1 <= port <= 65535:
+        raise ValueError("candidate evidence requires a nonzero session and IPv4 port")
+    priority = (126 << 24) | (65535 << 8) | 255
+    candidate = (
+        (1).to_bytes(8, "big")
+        + struct.pack(">BBBBIH", 1, 1, 1, 0, priority, port)
+        + b"\x04"
+        + packed_address
+        + b"\x00"
+    )
+    exchange = (
+        struct.pack(">BQIB", 1, session_id, 1, 1)
+        + struct.pack(">H", len(candidate))
+        + candidate
+    )
+    return hashlib.sha256(exchange).hexdigest()
+
+
 def parse_client_stun(output: str) -> dict[str, object]:
     matches = STUN_RE.findall(output)
     local_matches = LOCAL_RE.findall(output)
@@ -174,6 +210,48 @@ def parse_host_peer_source(output: str) -> str:
     if len(matches) != 1:
         raise ValueError("expected one authenticated QUIC peer source address")
     return matches[0]
+
+
+def parse_candidate_exchange(
+    output: str, *, require_active_route: bool
+) -> dict[str, object]:
+    matches = CANDIDATE_EXCHANGE_RE.findall(output)
+    if len(matches) != 1:
+        raise ValueError("expected one complete authenticated candidate exchange record")
+    (
+        authenticated,
+        session_id,
+        local_exchange_id,
+        local_generation,
+        local_candidates,
+        local_sha256,
+        remote_exchange_id,
+        remote_generation,
+        remote_candidates,
+        remote_sha256,
+        transport_peer,
+        active_route,
+        route_changed,
+    ) = matches[0]
+    if authenticated.lower() != "true" or route_changed.lower() != "false":
+        raise ValueError("candidate exchange must be authenticated and route preserving")
+    if require_active_route != bool(active_route):
+        raise ValueError("candidate exchange active-route field has the wrong role")
+    return {
+        "authenticated": True,
+        "session_id": int(session_id),
+        "local_exchange_id": int(local_exchange_id),
+        "local_generation": int(local_generation),
+        "local_candidates": int(local_candidates),
+        "local_sha256": local_sha256,
+        "remote_exchange_id": int(remote_exchange_id),
+        "remote_generation": int(remote_generation),
+        "remote_candidates": int(remote_candidates),
+        "remote_sha256": remote_sha256,
+        "transport_peer": transport_peer,
+        "active_route": active_route or None,
+        "route_changed": False,
+    }
 
 
 class FakeStunServer:
@@ -267,8 +345,7 @@ def build_commands(
         str(host_dir / secure.CERTIFICATE_FILE),
         "--pairing-timeout",
         "30",
-        "--frames",
-        str(frames),
+        "--candidate-exchange-probe",
     ]
     return host, client
 
@@ -292,10 +369,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "status": "pending",
         "ok": False,
         "executed": False,
-        "scope": "single-machine IPv4 loopback fake-STUN to same-socket exact-mTLS QUIC",
+        "scope": "single-machine IPv4 loopback fake-STUN to same-socket exact-mTLS QUIC and authenticated candidate advertisement",
         "honest_scope": (
-            "server-reflexive discovery/socket handoff only; not ICE nomination, NAT traversal, "
-            "peer authentication, relay, cross-machine connectivity, or AnyDesk comparison"
+            "server-reflexive discovery/socket handoff plus post-mTLS bounded candidate "
+            "advertisement only; not ICE checks/nomination, NAT traversal, relay, "
+            "cross-machine connectivity, or AnyDesk comparison"
         ),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source": {
@@ -400,11 +478,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         temporary.cleanup()
 
     parsed_stun: dict[str, object] = {}
+    client_candidate_exchange: dict[str, object] = {}
+    host_candidate_exchange: dict[str, object] = {}
     host_peer_source: str | None = None
     validation_errors: list[str] = []
     try:
         parsed_stun = parse_client_stun(client_output)
         host_peer_source = parse_host_peer_source(host_output)
+        client_candidate_exchange = parse_candidate_exchange(
+            client_output, require_active_route=True
+        )
+        host_candidate_exchange = parse_candidate_exchange(
+            host_output, require_active_route=False
+        )
     except ValueError as error:
         validation_errors.append(str(error))
     host_ids = secure.parse_host_session_ids(host_output)
@@ -422,6 +508,55 @@ def main(argv: Sequence[str] | None = None) -> int:
         == stun_observation.get("source")
         == host_peer_source
     )
+    session_bound_candidate_exchange = len(host_ids) == 1 and all(
+        value == host_ids[0]
+        for value in (
+            client_candidate_exchange.get("session_id"),
+            client_candidate_exchange.get("local_exchange_id"),
+            client_candidate_exchange.get("remote_exchange_id"),
+            host_candidate_exchange.get("session_id"),
+            host_candidate_exchange.get("local_exchange_id"),
+            host_candidate_exchange.get("remote_exchange_id"),
+        )
+    )
+    candidate_counts_match = (
+        client_candidate_exchange.get("local_candidates")
+        == host_candidate_exchange.get("remote_candidates")
+        and client_candidate_exchange.get("remote_candidates")
+        == host_candidate_exchange.get("local_candidates")
+        and isinstance(client_candidate_exchange.get("local_candidates"), int)
+        and client_candidate_exchange.get("local_candidates", 0) > 0
+        and isinstance(client_candidate_exchange.get("remote_candidates"), int)
+        and client_candidate_exchange.get("remote_candidates", 0) > 0
+    )
+    expected_client_digest = expected_host_digest = None
+    if len(host_ids) == 1 and host_address is not None and parsed_stun.get("local"):
+        try:
+            expected_client_digest = canonical_host_candidate_exchange_sha256(
+                host_ids[0], str(parsed_stun["local"])
+            )
+            expected_host_digest = canonical_host_candidate_exchange_sha256(
+                host_ids[0], host_address
+            )
+        except (OSError, ValueError) as error:
+            validation_errors.append(str(error))
+    candidate_after_mtls = all(
+        mtls_marker in output
+        and marker in output
+        and output.index(mtls_marker) < output.index(marker)
+        for output, mtls_marker, marker in (
+            (
+                client_output,
+                "mTLS: exact host certificate authenticated",
+                "candidate-exchange: authenticated=true",
+            ),
+            (
+                host_output,
+                "mTLS: exact client certificate authenticated",
+                "candidate-exchange: authenticated=true",
+            ),
+        )
+    )
     checks = {
         "identity_generation_ok": identity_generation_ok,
         "host_exit_zero": host_exit == 0 and not host_timed_out,
@@ -434,6 +569,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         and parsed_stun.get("ignored") == 0
         and parsed_stun.get("drained") == 0,
         "candidate_only_scope_logged": client_output.count(SCOPE_MARKER) == 1,
+        "candidate_exchange_scope_logged": client_output.count(CANDIDATE_SCOPE_MARKER)
+        == 1
+        and host_output.count(CANDIDATE_SCOPE_MARKER) == 1,
+        "candidate_exchange_after_exact_mtls": candidate_after_mtls,
+        "candidate_exchange_bound_to_active_session": session_bound_candidate_exchange,
+        "candidate_exchange_generation_one": client_candidate_exchange.get(
+            "local_generation"
+        )
+        == client_candidate_exchange.get("remote_generation")
+        == host_candidate_exchange.get("local_generation")
+        == host_candidate_exchange.get("remote_generation")
+        == 1,
+        "candidate_counts_match_both_directions": candidate_counts_match,
+        "candidate_payloads_match_observed_sockets": expected_client_digest is not None
+        and expected_host_digest is not None
+        and client_candidate_exchange.get("local_sha256")
+        == host_candidate_exchange.get("remote_sha256")
+        == expected_client_digest
+        and client_candidate_exchange.get("remote_sha256")
+        == host_candidate_exchange.get("local_sha256")
+        == expected_host_digest,
+        "redundant_same_socket_srflx_eliminated": same_socket
+        and client_candidate_exchange.get("local_candidates") == 1,
+        "candidate_exchange_did_not_change_route": host_address is not None
+        and client_candidate_exchange.get("active_route") == host_address
+        and client_candidate_exchange.get("transport_peer") == host_address
+        and host_candidate_exchange.get("transport_peer") == host_peer_source
+        and client_candidate_exchange.get("route_changed") is False
+        and host_candidate_exchange.get("route_changed") is False,
         "exact_mtls_both_sides": host_output.count(
             "mTLS: exact client certificate authenticated"
         )
@@ -449,7 +613,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "requested_frames_received": len(host_ids) == 1
         and len(received) == 1
         and received[0][0] == host_ids[0]
-        and received[0][1] >= args.frames,
+        and received[0][1] >= 1,
         "one_real_desktop_stream": secure.parse_host_desktop_streams(host_output) == 1,
         "release_all_completed": "input: ReleaseAll applied" in host_output,
         "binary_hashes_complete": len(binary_hashes) == 3
@@ -472,6 +636,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "client": parsed_stun,
             "server": stun_observation,
             "host_observed_quic_source": host_peer_source,
+        },
+        candidate_exchange={
+            "client": client_candidate_exchange,
+            "host": host_candidate_exchange,
         },
         results={
             "host_session_ids": host_ids,

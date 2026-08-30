@@ -85,7 +85,49 @@ class StunEvidenceParsingTests(unittest.TestCase):
         )
         self.assertEqual(client.count("--stun-server"), 1)
         self.assertEqual(client[client.index("--stun-server") + 1], "127.0.0.1:3478")
+        self.assertEqual(client.count("--candidate-exchange-probe"), 1)
+        self.assertNotIn("--frames", client)
         self.assertNotIn(module.secure.UNSAFE_FLAG, host + client)
+
+    def test_candidate_exchange_log_is_strict_session_bound_and_route_preserving(self):
+        client = (
+            "candidate-exchange: authenticated=true session_id=41 "
+            "local_exchange_id=41 local_generation=1 local_candidates=1 "
+            f"local_sha256={'a' * 64} remote_exchange_id=41 remote_generation=1 "
+            f"remote_candidates=1 remote_sha256={'b' * 64} transport_peer=127.0.0.1:9000 "
+            "active_route=127.0.0.1:9000 route_changed=false\n"
+        )
+        host = (
+            "candidate-exchange: authenticated=true session_id=41 "
+            "local_exchange_id=41 local_generation=1 local_candidates=1 "
+            f"local_sha256={'b' * 64} remote_exchange_id=41 remote_generation=1 "
+            f"remote_candidates=1 remote_sha256={'a' * 64} transport_peer=127.0.0.1:45678 "
+            "route_changed=false\n"
+        )
+
+        parsed_client = module.parse_candidate_exchange(client, require_active_route=True)
+        parsed_host = module.parse_candidate_exchange(host, require_active_route=False)
+        self.assertEqual(parsed_client["session_id"], 41)
+        self.assertEqual(parsed_client["active_route"], "127.0.0.1:9000")
+        self.assertEqual(parsed_client["transport_peer"], "127.0.0.1:9000")
+        self.assertIsNone(parsed_host["active_route"])
+
+        with self.assertRaises(ValueError):
+            module.parse_candidate_exchange(client + client, require_active_route=True)
+
+    def test_candidate_digest_covers_exact_session_type_address_port_and_foundation(self):
+        baseline = module.canonical_host_candidate_exchange_sha256(
+            41, "127.0.0.1:45678"
+        )
+        self.assertEqual(len(baseline), 64)
+        self.assertNotEqual(
+            baseline,
+            module.canonical_host_candidate_exchange_sha256(42, "127.0.0.1:45678"),
+        )
+        self.assertNotEqual(
+            baseline,
+            module.canonical_host_candidate_exchange_sha256(41, "127.0.0.1:45679"),
+        )
 
 
 if __name__ == "__main__":
