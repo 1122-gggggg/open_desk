@@ -85,6 +85,23 @@ jobs:
           path: artifacts/ci/secure-input-latency.json
           if-no-files-found: error
           retention-days: 30
+      - name: Concurrent two-target XTEST input application-ACK latency smoke
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          xvfb-run -a python3 scripts/multi_target_input_latency_test.py \
+            --host-bin target/debug/latencydesk-host \
+            --client-bin target/debug/latencydesk-client \
+            --identity-bin target/debug/latencydesk-identity \
+            --samples 256 --timeout 45 \
+            --output artifacts/ci/multi-target-input-latency.json
+      - name: Upload concurrent two-target input latency evidence
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v7
+        with:
+          name: multi-target-input-latency-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/ci/multi-target-input-latency.json
+          if-no-files-found: error
+          retention-days: 30
       - name: Abrupt QUIC path-loss recovery smoke
         if: matrix.os == 'ubuntu-latest'
         run: |
