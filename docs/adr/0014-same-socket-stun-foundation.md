@@ -43,8 +43,9 @@ evidence and weaken the existing exact-certificate trust boundary.
 
 ## Consequences
 
-- The code now has a real same-port srflx discovery/socket handoff seam on which
-  authenticated candidate signaling and ICE checks can be built.
+- The code has a real same-port srflx discovery/socket handoff seam. ADR 0015
+  now uses it for authenticated advertisement; ICE checks and nomination remain
+  later work.
 - FINGERPRINT detects framing corruption or protocol confusion; it is a CRC,
   not authentication or integrity against an attacker.
 - No claim is made for NAT traversal, connection success rate, public STUN

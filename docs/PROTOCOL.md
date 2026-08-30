@@ -67,6 +67,20 @@ socket is then transferred to Quinn without rebinding. The address is untrusted
 telemetry only: it is not a candidate route, identity, authorization, ICE
 nomination, or consent result, and exact-certificate mTLS remains mandatory.
 
+After exact-mTLS and the session-stamped product handshake, a Client may offer
+`AUTHENTICATED_CANDIDATE_EXCHANGE`. A supporting Host selects the matching
+stream flag before either side sends `ControlKind::IceCandidate`. The v1 body
+contains an explicit version, an exchange ID equal to the active random session
+ID, a consecutive generation beginning at 1, and 1–8 length-delimited
+candidate descriptors. It accepts one IP family and UDP host/server-reflexive
+candidates only; zero/unusable addresses, TCP, relayed types, mixed families,
+conservative endpoint duplicates, truncation, trailing bytes, replay, gaps, and
+ID changes fail closed. Candidate records remain untrusted even though their
+transport is authenticated: v1 records are observable advertisements only and
+cannot alter the existing QUIC route, certificate identity, authorization, or
+reconnect policy. Connectivity checks, pair nomination, consent freshness,
+rendezvous, and relay are not implemented by this message.
+
 ## 3. Capability negotiation
 
 Each peer advertises:

@@ -23,7 +23,7 @@ Client。
 | 其他 Client | 已有可攜式軟體 Viewer（OpenH264／raw NV12 顯示與輸入轉送），並保留 headless 收幀及 input probe | Alpha 實作；跨機器與原生 UX 證據仍待完成 |
 | Windows Host | 因真實 capture/input provider 尚未接線，安全 Host 會在開 socket 前拒絕執行 | 不支援 |
 | 媒體 | raw NV12 分片後以 QUIC DATAGRAM 傳輸；沒有正式 H.264／AV1 encode/decode 路徑 | 僅適合低解析 LAN preview |
-| WAN 連線 | Direct IP，並可為同一台 exact-pinned Host 競速最多 4 個已知位址；opt-in RFC 8489 Binding 會在之後交給 Quinn 的同一 UDP socket 發現一個 srflx 位址 | 已實作 same-socket STUN discovery 與有界 headless recovery；尚無 candidate signaling、ICE check／nomination／consent、rendezvous、TURN／relay、自動 Internet traversal、互動式 recovery 或 QUIC path migration |
+| WAN 連線 | Direct IP，並可為同一台 exact-pinned Host 競速最多 4 個已知位址；opt-in RFC 8489 Binding 會在之後交給 Quinn 的同一 UDP socket 發現一個 srflx 位址；診斷 probe 可在 exact-mTLS 與產品握手後交換有界 candidate advertisement | 已有 same-socket discovery 與 authenticated advertisement 證據；candidate 不會改變 active route。尚無 ICE check／nomination／consent、rendezvous、TURN／relay、自動 Internet traversal、互動式 recovery 或 QUIC path migration |
 | 發行 | 沒有受支援的簽章安裝程式、更新器或正式服務 | 未實作 |
 | 舊傳輸 | 明文自製 UDP，必須明確加入 `--unsafe-udp-lab` | 僅限本機相容性測試 |
 
@@ -83,7 +83,7 @@ xvfb-run -a python3 scripts/secure_connect_test.py \
 
 same-socket STUN 程序 gate 會啟動嚴格的本機 fake RFC 8489 Binding server，發現
 Client reflexive address，把該 UDP socket 原封不動交給 Quinn，接著完成
-exact-mTLS 與真實 X11 stream：
+exact-mTLS、雙向 opt-in 有界 candidate advertisement 與一個真實 X11 frame：
 
 ```bash
 xvfb-run -a python3 scripts/stun_same_socket_test.py \
@@ -95,9 +95,11 @@ xvfb-run -a python3 scripts/stun_same_socket_test.py \
 ```
 
 artifact 要求 fake server 觀察到的 STUN source、Client local／reflexive address，
-以及 Host 觀察到的 authenticated QUIC source 完全一致。這只是 socket／candidate
-基礎；沒有 signaling、connectivity check、nomination、consent、TURN，也不能宣稱
-已穿透 NAT。
+以及 Host 觀察到的 authenticated QUIC source 完全一致；兩端 candidate record
+還必須在 exact-mTLS 後出現、exchange ID 等於 active random session ID、generation
+從 1 開始、candidate 數量互相吻合，且 authenticated Host route 完全不變。這是
+authenticated advertisement，不是可用的 ICE checklist；沒有 connectivity check、
+nomination、consent、TURN，也不能宣稱已穿透 NAT。
 
 同時多目標輸入 gate 會由一個 supervisor 啟動 2、4、8 或 16 個 exact-pinned
 child，要求所有已 flush 的 start marker 都先於任一 stop marker，再分別保留每台
@@ -212,7 +214,9 @@ cargo run --locked -p latencydesk-client -- \
 certificate；Client 會同時競速，只採用第一條完成 exact-pinned TLS 驗證的路徑。
 這是已知位址 failover，不是 ICE／TURN，也不是未驗證的 proxy。選用的
 `--stun-server <IP:PORT>` 只會在同一 socket 發現／記錄一個 srflx 位址；在後續
-authenticated ICE／signaling 層完成前，不會把它加入 route。
+加上 `--candidate-exchange-probe` 可在已驗證的產品 session 中傳送該有界集合，
+但接收端只把它視為不受信任的 connectivity metadata，不會新增或切換 route。
+ICE check、nomination、consent 與 relay 仍是後續 gate。
 
 ### 4. 同時開啟多台 exact-pinned Host
 

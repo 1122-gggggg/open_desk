@@ -58,6 +58,13 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
 - STUN/rendezvous candidates remain untrusted metadata; source/transaction
   validation and fingerprints do not replace authenticated ICE signaling,
   consent, exact-peer mTLS, or authorization;
+- candidate advertisements are accepted only after exact-mTLS and the product
+  handshake, are capped at eight, bind their exchange ID to the active random
+  session ID, and use consecutive generations; malformed, replayed,
+  cross-session, mixed-family, TCP, and relay claims close that connection;
+- receiving an authenticated candidate never changes the current route. A
+  future connectivity-check/nomination layer must independently authenticate
+  checks, limit amplification, prove consent, and retain exact-peer identity;
 - rate limits before expensive parsing/decompression;
 - connection and incomplete-frame quotas.
 

@@ -24,7 +24,7 @@ Windows client on a trusted, low-latency LAN.
 | Other clients | Portable software viewer with OpenH264/raw-NV12 presentation and input forwarding; headless receive and input probe remain available | Alpha implementation; cross-machine and native-UX evidence pending |
 | Windows host | Secure hosting is rejected before opening a socket because real capture/input providers are not connected | Unsupported |
 | Media | Raw NV12 fragmented across QUIC DATAGRAMs; no production H.264/AV1 encode/decode path | Low-resolution LAN preview only |
-| WAN connectivity | Direct IP plus a bounded race across four known exact-pinned addresses; opt-in RFC 8489 Binding discovers one srflx address on the exact UDP socket later handed to Quinn | Same-socket STUN discovery and bounded headless recovery implemented; no candidate signaling, ICE checks/nomination/consent, rendezvous, TURN/relay, automatic Internet traversal, interactive recovery, or QUIC path migration |
+| WAN connectivity | Direct IP plus a bounded race across four known exact-pinned addresses; opt-in RFC 8489 Binding discovers one srflx address on the exact UDP socket later handed to Quinn; a diagnostic probe can exchange a bounded candidate advertisement only after exact-mTLS and the product handshake | Same-socket discovery and authenticated advertisement evidence implemented; candidates do not change the active route. No ICE checks/nomination/consent, rendezvous, TURN/relay, automatic Internet traversal, interactive recovery, or QUIC path migration |
 | Distribution | No supported signed installer, updater, or production service | Not implemented |
 | Legacy transport | Plaintext custom UDP, available only with explicit `--unsafe-udp-lab` | Local compatibility test only |
 
@@ -89,7 +89,8 @@ long-running network reliability. Those gates remain Pending in
 
 The same-socket STUN process gate starts a strict local fake RFC 8489 Binding
 server, discovers the Client's reflexive address, transfers that exact UDP
-socket into Quinn, and then completes exact-mTLS plus a real X11 stream:
+socket into Quinn, completes exact-mTLS, negotiates an opt-in bounded candidate
+advertisement in both directions, and receives a real X11 frame:
 
 ```bash
 xvfb-run -a python3 scripts/stun_same_socket_test.py \
@@ -102,8 +103,11 @@ xvfb-run -a python3 scripts/stun_same_socket_test.py \
 
 The artifact requires the fake server's observed STUN source, Client
 local/reflexive address, and Host-observed authenticated QUIC source to match.
-This is a socket/candidate foundation only: it performs no signaling,
-connectivity checks, nomination, consent, TURN, or NAT traversal claim.
+It also requires both candidate records to follow exact-mTLS, bind their
+exchange IDs to the active random session ID, start at generation 1, mirror the
+bounded candidate counts, and leave the authenticated Host route unchanged.
+This is authenticated advertisement, not a working ICE checklist: it performs
+no connectivity checks, nomination, consent, TURN, or NAT traversal.
 
 The multi-target process gate starts two distinct-certificate Hosts, proves
 both are authenticated and streaming at the same time, then runs a second
@@ -263,7 +267,10 @@ must identify the same Host certificate; the Client races them concurrently and
 uses only the first path that completes exact-pinned TLS authentication. This is
 known-address failover, not ICE/TURN or an unauthenticated proxy. Optional
 `--stun-server <IP:PORT>` only discovers/logs one srflx address on that same
-socket; it does not add a route until a later authenticated ICE/signaling layer.
+socket. `--candidate-exchange-probe` can advertise the resulting bounded set
+inside the already authenticated product session, but the receiver stores it as
+untrusted connectivity metadata and does not add or switch a route. ICE checks,
+nomination, consent, and relay remain later gates.
 
 ### 4. Open several exact-pinned Hosts concurrently
 
