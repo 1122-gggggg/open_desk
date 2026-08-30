@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Fail-closed two-Host concurrent input application-ACK latency evidence.
+"""Fail-closed multi-Host concurrent input application-ACK latency evidence.
 
-One Client supervisor launches two exact-pinned children. Both probe intervals
-must overlap, and every raw sample remains bound to its target and full product
-lifecycle. This is single-machine application-ACK RTT, not input-to-photon or a
-competitor comparison.
+One Client supervisor launches 2, 4, 8, or 16 exact-pinned children. Every
+probe interval must overlap, and every raw sample remains bound to its target
+and full product lifecycle. This is single-machine application-ACK RTT, not
+input-to-photon or a competitor comparison.
 """
 from __future__ import annotations
 
@@ -45,6 +45,9 @@ STOP_RE = re.compile(
 )
 HOST_CERTIFICATE_RE = re.compile(
     r"^Host certificate:\s*([0-9a-f]{64})\s*$", re.MULTILINE | re.IGNORECASE
+)
+HOST_LISTEN_RE = re.compile(
+    r"^Listening securely on\s+(\S+)\s*$", re.MULTILINE | re.IGNORECASE
 )
 
 
@@ -132,6 +135,236 @@ def parse_probe_stops(output: str) -> list[dict[str, object]]:
     return _parse_probe_boundaries(output, STOP_RE, STOP_PREFIX_RE, "stop")
 
 
+def parse_host_listen_address(output: str) -> str:
+    matches = HOST_LISTEN_RE.findall(output)
+    if len(matches) != 1:
+        raise ValueError("expected exactly one Host listen address")
+    address = matches[0]
+    host, separator, raw_port = address.rpartition(":")
+    try:
+        port = int(raw_port)
+    except ValueError as error:
+        raise ValueError("Host listen address has an invalid port") from error
+    if separator != ":" or host != "127.0.0.1" or not 1 <= port <= 65_535:
+        raise ValueError("Host did not bind a real IPv4 loopback port")
+    return address
+
+
+def parse_proc_stat(text: str) -> dict[str, int | str]:
+    open_paren = text.find("(")
+    close_paren = text.rfind(")")
+    if open_paren <= 0 or close_paren <= open_paren:
+        raise ValueError("malformed /proc stat record")
+    try:
+        pid = int(text[:open_paren].strip())
+        remainder = text[close_paren + 1 :].split()
+        if len(remainder) < 20:
+            raise ValueError("truncated /proc stat record")
+        return {
+            "pid": pid,
+            "comm": text[open_paren + 1 : close_paren],
+            "state": remainder[0],
+            "ppid": int(remainder[1]),
+            "pgrp": int(remainder[2]),
+            "utime_ticks": int(remainder[11]),
+            "stime_ticks": int(remainder[12]),
+            "starttime_ticks": int(remainder[19]),
+        }
+    except (IndexError, ValueError) as error:
+        raise ValueError("malformed /proc stat fields") from error
+
+
+def _status_value(status: str, name: str, *, kilobytes: bool = False) -> int:
+    prefix = f"{name}:"
+    for line in status.splitlines():
+        if line.startswith(prefix):
+            parts = line[len(prefix) :].split()
+            if not parts:
+                break
+            value = int(parts[0])
+            if kilobytes and (len(parts) != 2 or parts[1] != "kB"):
+                raise ValueError(f"unexpected {name} unit")
+            return value
+    raise ValueError(f"missing {name} in /proc status")
+
+
+def read_process_sample(pid: int, proc_root: Path = Path("/proc")) -> dict[str, object]:
+    process_dir = proc_root / str(pid)
+    stat_before = parse_proc_stat((process_dir / "stat").read_text(encoding="utf-8"))
+    if stat_before["pid"] != pid:
+        raise ValueError("/proc PID identity mismatch")
+    status = (process_dir / "status").read_text(encoding="utf-8")
+    executable = (process_dir / "exe").resolve(strict=True)
+    executable_stat = executable.stat()
+    fd_count = sum(1 for _ in (process_dir / "fd").iterdir())
+    stat_after = parse_proc_stat((process_dir / "stat").read_text(encoding="utf-8"))
+    identity_before = tuple(
+        stat_before[name] for name in ("pid", "pgrp", "starttime_ticks")
+    )
+    identity_after = tuple(
+        stat_after[name] for name in ("pid", "pgrp", "starttime_ticks")
+    )
+    if identity_before != identity_after:
+        raise ValueError("/proc PID identity changed during resource sampling")
+    return {
+        **stat_after,
+        "exe_name": executable.name,
+        "exe_device": executable_stat.st_dev,
+        "exe_inode": executable_stat.st_ino,
+        "rss_kib": _status_value(status, "VmRSS", kilobytes=True),
+        "peak_rss_kib": _status_value(status, "VmHWM", kilobytes=True),
+        "threads": _status_value(status, "Threads"),
+        "fd_count": fd_count,
+    }
+
+
+def _group_identity(snapshot: dict[str, object]) -> list[tuple[int, int, int, int, int]]:
+    return [
+        (
+            int(member["pid"]),
+            int(member["starttime_ticks"]),
+            int(member["pgrp"]),
+            int(member["exe_device"]),
+            int(member["exe_inode"]),
+        )
+        for member in snapshot["members"]
+    ]
+
+
+def _discover_group_members(
+    process_groups: set[int], proc_root: Path = Path("/proc")
+) -> dict[int, list[int]]:
+    members = {process_group: [] for process_group in process_groups}
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = parse_proc_stat((entry / "stat").read_text(encoding="utf-8"))
+        except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
+            continue
+        process_group = int(stat["pgrp"])
+        if process_group in members:
+            members[process_group].append(int(stat["pid"]))
+    for group_members in members.values():
+        group_members.sort()
+    return members
+
+
+def _snapshot_known_group(
+    leader_pid: int,
+    process_group: int,
+    member_pids: Sequence[int],
+    expected_executable: Path,
+) -> dict[str, object]:
+    if leader_pid not in member_pids:
+        raise ValueError("process-group discovery lost its leader")
+    members = [read_process_sample(pid) for pid in member_pids]
+    expected_stat = expected_executable.resolve(strict=True).stat()
+    return {
+        "leader_pid": leader_pid,
+        "process_group": process_group,
+        "members": members,
+        "all_expected_executable": all(
+            member["exe_device"] == expected_stat.st_dev
+            and member["exe_inode"] == expected_stat.st_ino
+            for member in members
+        ),
+        "all_expected_process_group": all(
+            int(member["pgrp"]) == process_group for member in members
+        ),
+        "totals": {
+            "member_count": len(members),
+            "rss_kib": sum(int(member["rss_kib"]) for member in members),
+            "peak_rss_kib": sum(int(member["peak_rss_kib"]) for member in members),
+            "cpu_ticks": sum(
+                int(member["utime_ticks"]) + int(member["stime_ticks"])
+                for member in members
+            ),
+            "fd_count": sum(int(member["fd_count"]) for member in members),
+            "threads": sum(int(member["threads"]) for member in members),
+        },
+    }
+
+
+def _capture_resource_topology_once(
+    parent: secure.TrackedProcess,
+    hosts: Sequence[secure.TrackedProcess],
+    client_bin: Path,
+    host_bin: Path,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    parent_pid = parent.proc.pid
+    host_pids = [host.proc.pid for host in hosts]
+    parent_group = os.getpgid(parent_pid)
+    host_groups = [os.getpgid(pid) for pid in host_pids]
+    all_groups = {parent_group, *host_groups}
+    if len(all_groups) != len(host_groups) + 1:
+        raise ValueError("supervisor and Hosts must have distinct process groups")
+    members = _discover_group_members(all_groups)
+    client_snapshot = _snapshot_known_group(
+        parent_pid, parent_group, members[parent_group], client_bin
+    )
+    host_snapshots = [
+        _snapshot_known_group(pid, group, members[group], host_bin)
+        for pid, group in zip(host_pids, host_groups)
+    ]
+    return client_snapshot, host_snapshots
+
+
+def capture_resource_topology(
+    parent: secure.TrackedProcess,
+    hosts: Sequence[secure.TrackedProcess],
+    client_bin: Path,
+    host_bin: Path,
+    target_count: int,
+) -> tuple[dict[str, object], dict[str, bool]]:
+    first_client, first_hosts = _capture_resource_topology_once(
+        parent, hosts, client_bin, host_bin
+    )
+    time.sleep(0.002)
+    second_client, second_hosts = _capture_resource_topology_once(
+        parent, hosts, client_bin, host_bin
+    )
+    checks = {
+        "client_process_group_exact": second_client["totals"]["member_count"]
+        == target_count + 1
+        and second_client["all_expected_executable"] is True
+        and second_client["all_expected_process_group"] is True,
+        "host_process_groups_exact": len(second_hosts) == target_count
+        and all(
+            snapshot["totals"]["member_count"] == 1
+            and snapshot["all_expected_executable"] is True
+            and snapshot["all_expected_process_group"] is True
+            for snapshot in second_hosts
+        ),
+        "process_identities_stable": _group_identity(first_client)
+        == _group_identity(second_client)
+        and len(first_hosts) == len(second_hosts)
+        and all(
+            _group_identity(before) == _group_identity(after)
+            for before, after in zip(first_hosts, second_hosts)
+        ),
+        "runtime_threads_bounded": int(second_client["totals"]["threads"])
+        <= 1 + target_count * 6
+        and sum(int(snapshot["totals"]["threads"]) for snapshot in second_hosts)
+        <= target_count * 4,
+    }
+    return (
+        {
+            "available": True,
+            "observed_at_monotonic_ns": time.monotonic_ns(),
+            "clock_ticks_per_second": os.sysconf("SC_CLK_TCK"),
+            "note": (
+                "RSS sums may double-count shared pages; CPU/FD/thread/RSS values are "
+                "observational; process topology, identity, and the bounded two-worker "
+                "runtime plus output-forwarder thread budget are hard gates"
+            ),
+            "client_group": second_client,
+            "host_groups": second_hosts,
+        },
+        checks,
+    )
+
+
 def concurrent_probe_overlap(
     output: str,
     expected_targets: set[str],
@@ -158,21 +391,19 @@ def target_value(address: str, certificate: Path) -> str:
     return f"{address},{certificate}"
 
 
-def build_commands(
+def build_host_commands(
     host_bin: Path,
-    client_bin: Path,
-    ports: tuple[int, int],
+    listen_addresses: Sequence[str],
     dirs: dict[str, Path],
-    samples: int,
-) -> tuple[list[list[str]], list[str]]:
+) -> list[list[str]]:
     hosts: list[list[str]] = []
-    for index, port in enumerate(ports, 1):
+    for index, listen_address in enumerate(listen_addresses, 1):
         host_dir = dirs[f"host{index}"]
         hosts.append(
             [
                 str(host_bin),
                 "--listen",
-                f"127.0.0.1:{port}",
+                listen_address,
                 "--identity-cert",
                 str(host_dir / secure.CERTIFICATE_FILE),
                 "--identity-key",
@@ -191,6 +422,15 @@ def build_commands(
                 "1",
             ]
         )
+    return hosts
+
+
+def build_parent_command(
+    client_bin: Path,
+    target_addresses: Sequence[str],
+    dirs: dict[str, Path],
+    samples: int,
+) -> list[str]:
     parent = [
         str(client_bin),
         "--bind",
@@ -204,17 +444,17 @@ def build_commands(
         "--input-latency-probes",
         str(samples),
     ]
-    for index, port in enumerate(ports, 1):
+    for index, address in enumerate(target_addresses, 1):
         parent.extend(
             [
                 "--target",
                 target_value(
-                    f"127.0.0.1:{port}",
+                    address,
                     dirs[f"host{index}"] / secure.CERTIFICATE_FILE,
                 ),
             ]
         )
-    return hosts, parent
+    return parent
 
 
 def validate_target_evidence(
@@ -342,6 +582,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--client-bin", type=Path)
     parser.add_argument("--identity-bin", type=Path)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--target-count", type=int, choices=(2, 4, 8, 16), default=2)
     parser.add_argument(
         "--samples", type=secure.bounded_int("samples", 100, 1024), default=256
     )
@@ -355,16 +596,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     revision, dirty = secure.repository_state()
     report: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "pending",
         "ok": False,
         "executed": False,
-        "scope": (
-            "one supervisor, two concurrent Linux X11 exact-mTLS Hosts, "
-            "single-machine IPv4 loopback application-ACK RTT"
-        ),
+        "target_count": args.target_count,
+        "scope": {
+            "topology": "single_machine",
+            "transport": "ipv4_loopback",
+            "measurement": "client_to_host_application_ack_rtt",
+            "not_proven": [
+                "cross_machine",
+                "input_to_photon",
+                "AnyDesk_or_RustDesk_comparison",
+            ],
+        },
         "honest_scope": (
-            "two overlapping Client send to post-XTEST/X11-sync ACK intervals; "
+            f"{args.target_count} overlapping Client send to post-XTEST/X11-sync ACK intervals; "
             "not physical input-to-photon, cross-machine scale, or AnyDesk comparison"
         ),
         "requested_samples_per_target": args.samples,
@@ -388,22 +636,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     report["executed"] = True
     temporary = tempfile.TemporaryDirectory(prefix="open-desk-multi-input-latency-")
     temporary_root = Path(temporary.name)
-    dirs = {name: temporary_root / name for name in ("client", "host1", "host2")}
+    dirs = {"client": temporary_root / "client"}
+    dirs.update(
+        {
+            f"host{index}": temporary_root / f"host{index}"
+            for index in range(1, args.target_count + 1)
+        }
+    )
     processes: list[secure.TrackedProcess] = []
     hosts: list[secure.TrackedProcess] = []
     parent: secure.TrackedProcess | None = None
-    host_outputs = ["", ""]
-    host_exits: list[int | None] = [None, None]
-    host_timeouts = [False, False]
+    host_outputs = [""] * args.target_count
+    host_exits: list[int | None] = [None] * args.target_count
+    host_timeouts = [False] * args.target_count
     parent_output = ""
     parent_exit: int | None = None
     parent_timed_out = False
     commands: list[Sequence[str]] = []
-    target_plan: list[dict[str, str]] = []
+    target_plan: list[dict[str, object]] = []
     binary_hashes: dict[str, str] = {}
     identity_generation_ok = False
     overlap_proven = False
     overlap_observed_at_monotonic_ns: int | None = None
+    resource_evidence: dict[str, object] = {}
+    resource_checks: dict[str, bool] = {}
     runtime_error: str | None = None
 
     try:
@@ -418,20 +674,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         for name, directory in dirs.items():
             secure.generate_identity(identity_bin, name, directory, 10)
         identity_generation_ok = True
-        ports = secure.pick_distinct_free_udp_ports()
-        target_plan = [
-            {
-                "address": f"127.0.0.1:{port}",
-                "peer_certificate_sha256": secure.file_sha256(
-                    dirs[f"host{index}"] / secure.CERTIFICATE_FILE
-                ),
-            }
-            for index, port in enumerate(ports, 1)
-        ]
-        host_commands, parent_command = build_commands(
-            host_bin, client_bin, ports, dirs, args.samples
+        host_commands = build_host_commands(
+            host_bin,
+            ["127.0.0.1:0"] * args.target_count,
+            dirs,
         )
-        commands = [*host_commands, parent_command]
+        commands = [*host_commands]
         if secure.commands_contain_unsafe_flag(commands):
             raise RuntimeError("unsafe transport flag present")
 
@@ -440,11 +688,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             hosts.append(host)
             processes.append(host)
         if not all(host.wait_for_text(secure.HOST_READY_MARKER, 15) for host in hosts):
-            raise RuntimeError("both Hosts did not become ready")
+            raise RuntimeError("not every Host became ready")
+
+        actual_addresses = [parse_host_listen_address(host.output()) for host in hosts]
+        if len(actual_addresses) != args.target_count or len(set(actual_addresses)) != args.target_count:
+            raise RuntimeError("Hosts did not bind distinct loopback addresses")
+        target_plan = [
+            {
+                "index": index,
+                "address": address,
+                "actual_listen_address": address,
+                "peer_certificate_sha256": secure.file_sha256(
+                    dirs[f"host{index}"] / secure.CERTIFICATE_FILE
+                ),
+            }
+            for index, address in enumerate(actual_addresses, 1)
+        ]
+        parent_command = build_parent_command(
+            client_bin, actual_addresses, dirs, args.samples
+        )
+        commands.append(parent_command)
+        if secure.commands_contain_unsafe_flag(commands):
+            raise RuntimeError("unsafe transport flag present")
 
         parent = secure.TrackedProcess(parent_command, ROOT)
         processes.append(parent)
-        expected_targets = {item["address"] for item in target_plan}
+        expected_targets = {str(item["address"]) for item in target_plan}
         overlap_deadline = time.monotonic() + min(args.timeout, 30)
         while time.monotonic() < overlap_deadline:
             parent_output = parent.output()
@@ -457,6 +726,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             if overlap_proven:
                 overlap_observed_at_monotonic_ns = time.monotonic_ns()
+                resource_evidence, resource_checks = capture_resource_topology(
+                    parent,
+                    hosts,
+                    client_bin,
+                    host_bin,
+                    args.target_count,
+                )
                 break
             if parent.poll() is not None:
                 break
@@ -491,7 +767,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         records = parse_probe_records(parent_output)
         starts = parse_probe_starts(parent_output)
         stops = parse_probe_stops(parent_output)
-        expected_targets = {item["address"] for item in target_plan}
+        expected_targets = {str(item["address"]) for item in target_plan}
         global_checks, global_errors = validate_global_evidence(
             parent_output,
             records,
@@ -511,7 +787,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         start_by_target = {str(start["target"]): start for start in starts}
         stop_by_target = {str(stop["target"]): stop for stop in stops}
         for index, item in enumerate(target_plan, 1):
-            address = item["address"]
+            address = str(item["address"])
             if (
                 address not in record_by_target
                 or address not in start_by_target
@@ -521,7 +797,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 continue
             checks, errors = validate_target_evidence(
                 address,
-                item["peer_certificate_sha256"],
+                str(item["peer_certificate_sha256"]),
                 host_outputs[index - 1],
                 record_by_target[address],
                 start_by_target[address],
@@ -540,22 +816,43 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     cleanup_checks = {
         "identity_generation_ok": identity_generation_ok,
-        "two_distinct_certificates": len(target_plan) == 2
-        and len({item["peer_certificate_sha256"] for item in target_plan}) == 2,
-        "one_supervisor_two_targets": len(commands) == 3
-        and commands[-1].count("--target") == 2,
+        "all_certificates_distinct": len(target_plan) == args.target_count
+        and len({item["peer_certificate_sha256"] for item in target_plan})
+        == args.target_count,
+        "one_supervisor_exact_target_count": len(commands) == args.target_count + 1
+        and commands[-1].count("--target") == args.target_count,
         "binary_hashes_complete": len(binary_hashes) == 3
         and all(len(value) == 64 for value in binary_hashes.values()),
+        "resource_topology_captured": bool(resource_checks),
         "no_unsafe_transport_flag": not secure.commands_contain_unsafe_flag(commands),
         "temporary_credentials_removed": not temporary_root.exists(),
         "no_runtime_error": runtime_error is None,
     }
-    checks = {**phase_checks, **cleanup_checks}
+    checks = {**phase_checks, **resource_checks, **cleanup_checks}
     errors = [name for name, passed in checks.items() if not passed]
     errors.extend(validation_errors)
     if runtime_error:
         errors.insert(0, runtime_error)
     passed = bool(phase_checks) and all(checks.values()) and not errors
+
+    p95_values = [
+        int(record["summary"]["p95_us"])
+        for record in records
+        if isinstance(record.get("summary"), dict)
+        and "p95_us" in record["summary"]
+    ]
+    aggregate = {
+        "target_count": len(records),
+        "total_raw_samples": sum(
+            len(record.get("samples", [])) for record in records
+        ),
+        "p95_min_us": min(p95_values) if p95_values else None,
+        "p95_max_us": max(p95_values) if p95_values else None,
+        "note": "p95 range preserves per-target distributions; samples are not pooled",
+    }
+    target_indexes = {
+        str(item["address"]): int(item["index"]) for item in target_plan
+    }
 
     report.update(
         status="passed" if passed else "failed",
@@ -564,9 +861,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         errors=errors,
         concurrent_probe_overlap=overlap_proven,
         overlap_observed_at_monotonic_ns=overlap_observed_at_monotonic_ns,
+        resource_evidence=resource_evidence,
         target_plan=target_plan,
+        aggregate=aggregate,
         results=[
             {
+                "index": target_indexes.get(str(record.get("target", ""))),
                 "target": record.get("target"),
                 "stamp": record.get("stamp"),
                 "summary": record.get("summary"),
