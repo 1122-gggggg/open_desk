@@ -16,16 +16,16 @@ use latencydesk_transport::{IngestOutcome, ReassemblyConfig};
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(windows, test))]
 use std::sync::mpsc;
-#[cfg(windows)]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod secure;
@@ -48,6 +48,7 @@ struct TargetChildPlan {
 struct TargetChild {
     target: SocketAddr,
     process: Child,
+    output_threads: Vec<JoinHandle<io::Result<()>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -854,21 +855,101 @@ fn terminate_and_reap(children: &mut [TargetChild]) {
     }
     for child in children.iter_mut() {
         let _ = child.process.wait();
+        join_output_forwarders(child);
     }
+}
+
+fn spawn_output_forwarder<R, W>(reader: R, output: Arc<Mutex<W>>) -> JoinHandle<io::Result<()>>
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                return Ok(());
+            }
+            let mut output = output
+                .lock()
+                .map_err(|_| io::Error::other("child output forwarding lock was poisoned"))?;
+            output.write_all(&line)?;
+            output.flush()?;
+        }
+    })
+}
+
+fn attach_output_forwarders<W>(
+    process: &mut Child,
+    output: Arc<Mutex<W>>,
+) -> io::Result<Vec<JoinHandle<io::Result<()>>>>
+where
+    W: Write + Send + 'static,
+{
+    let stdout = process
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("captured child stdout is unavailable"))?;
+    let stderr = process
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("captured child stderr is unavailable"))?;
+    Ok(vec![
+        spawn_output_forwarder(stdout, Arc::clone(&output)),
+        spawn_output_forwarder(stderr, output),
+    ])
+}
+
+fn join_output_forwarders(child: &mut TargetChild) -> Vec<String> {
+    std::mem::take(&mut child.output_threads)
+        .into_iter()
+        .filter_map(|thread| match thread.join() {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("output forwarding failed: {error}")),
+            Err(_) => Some("output forwarding thread panicked".to_owned()),
+        })
+        .collect()
 }
 
 fn run_multi_target(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
     let plans = plan_target_child_args(args)?;
     let exe = env::current_exe()?;
+    let capture_output = args.input_latency_probes > 0;
+    let forwarded_output = Arc::new(Mutex::new(io::stdout()));
     let mut children = Vec::<TargetChild>::with_capacity(plans.len());
     for plan in plans {
         let mut command = Command::new(&exe);
         command.args(&plan.args);
+        if capture_output {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
         match command.spawn() {
-            Ok(process) => children.push(TargetChild {
-                target: plan.target,
-                process,
-            }),
+            Ok(mut process) => {
+                let output_threads = if capture_output {
+                    match attach_output_forwarders(&mut process, Arc::clone(&forwarded_output)) {
+                        Ok(threads) => threads,
+                        Err(error) => {
+                            let _ = process.kill();
+                            let _ = process.wait();
+                            terminate_and_reap(&mut children);
+                            return Err(format!(
+                                "failed to capture isolated client output for {}: {error}",
+                                plan.target
+                            )
+                            .into());
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+                children.push(TargetChild {
+                    target: plan.target,
+                    process,
+                    output_threads,
+                });
+            }
             Err(error) => {
                 terminate_and_reap(&mut children);
                 return Err(format!(
@@ -885,8 +966,17 @@ fn run_multi_target(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
         match child.process.wait() {
             Ok(status) if status.success() => {}
             Ok(status) => failures.push(format!("{} exited with {status}", child.target)),
-            Err(error) => failures.push(format!("{} could not be waited: {error}", child.target)),
+            Err(error) => {
+                failures.push(format!("{} could not be waited: {error}", child.target));
+                let _ = child.process.kill();
+                let _ = child.process.wait();
+            }
         }
+        failures.extend(
+            join_output_forwarders(child)
+                .into_iter()
+                .map(|error| format!("{} {error}", child.target)),
+        );
     }
     if failures.is_empty() {
         Ok(())
@@ -1412,6 +1502,36 @@ mod tests {
                 .any(|pair| pair == ["--input-latency-probes", "128"]));
             assert!(!child_args.iter().any(|arg| arg == "--target"));
         }
+    }
+
+    #[test]
+    fn child_output_forwarding_preserves_complete_lines_under_concurrency() {
+        use std::io::Cursor;
+        use std::sync::{Arc, Mutex};
+
+        let first_line = format!("first:{}\n", "a".repeat(8_192));
+        let second_line = format!("second:{}\n", "b".repeat(8_192));
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let first = spawn_output_forwarder(
+            Cursor::new(first_line.clone().into_bytes()),
+            Arc::clone(&output),
+        );
+        let second = spawn_output_forwarder(
+            Cursor::new(second_line.clone().into_bytes()),
+            Arc::clone(&output),
+        );
+        first.join().expect("first forwarder").expect("first copy");
+        second
+            .join()
+            .expect("second forwarder")
+            .expect("second copy");
+
+        let forwarded =
+            String::from_utf8(output.lock().expect("output").clone()).expect("UTF-8 output");
+        let lines = forwarded.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.contains(&first_line.trim_end()));
+        assert!(lines.contains(&second_line.trim_end()));
     }
 
     #[test]

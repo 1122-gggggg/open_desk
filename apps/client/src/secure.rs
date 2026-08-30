@@ -24,6 +24,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 const CLIENT_RELIABLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+const SECURE_RUNTIME_WORKER_THREADS: usize = 2;
 const CLIENT_CANDIDATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_RECONNECT_TOTAL_BUDGET: Duration = Duration::from_secs(15);
@@ -407,6 +408,7 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
     let operation_timeout = Duration::from_secs(args.pairing_timeout_secs);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(SECURE_RUNTIME_WORKER_THREADS)
         .enable_all()
         .thread_name("latencydesk-client-quic")
         .build()?;
@@ -2204,6 +2206,11 @@ mod tests {
         assert!(require_input_ack_capability(config).is_err());
         config.flags = latencydesk_protocol::video_stream_flags::INPUT_APPLIED_ACK;
         assert!(require_input_ack_capability(config).is_ok());
+    }
+
+    #[test]
+    fn isolated_client_runtime_uses_two_workers() {
+        assert_eq!(SECURE_RUNTIME_WORKER_THREADS, 2);
     }
 
     #[test]

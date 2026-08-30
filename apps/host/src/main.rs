@@ -712,7 +712,9 @@ fn send_video_frame(
     Ok(())
 }
 
-#[tokio::main]
+// Two workers keep blocking media/provider work isolated from the input/network
+// path without multiplying one worker per machine CPU in every Host process.
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_host_args()?;
     if args.show_version {
