@@ -766,7 +766,7 @@ fn run_windows_nv12_viewer(
     config: latencydesk_protocol::VideoStreamConfig,
 ) -> Result<(), Box<dyn Error>> {
     use latencydesk_platform_windows::D3D11WindowRenderer;
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::{Arc, Mutex};
 
     let first = runtime
         .block_on(async { tokio::time::timeout(timeout, session.receive_media_frame()).await })
@@ -787,7 +787,7 @@ fn run_windows_nv12_viewer(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let network_session = session.clone();
     let reliable_timeout = reliable_operation_timeout(timeout);
-    let mut network_task = runtime.spawn(async move {
+    let network_task = runtime.spawn(async move {
         let mut sequence = 0_u64;
         loop {
             tokio::select! {

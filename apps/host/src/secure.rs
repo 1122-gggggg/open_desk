@@ -113,6 +113,13 @@ mod linux {
     const LOG_FRAME_INTERVAL: u64 = 60;
     const AUTHENTICATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 
+    #[derive(Debug, Clone, Copy)]
+    struct CapturePlan {
+        stream: VideoStreamConfig,
+        max_width: u32,
+        max_height: u32,
+    }
+
     fn frame_period(fps: u32) -> Option<Duration> {
         let fps = NonZeroU64::new(u64::from(fps))?;
         Some(Duration::from_nanos(1_000_000_000_u64.div_ceil(fps.get())))
@@ -370,10 +377,15 @@ mod linux {
                 "codec: negotiated contract v{VIDEO_CODEC_CONTRACT_VERSION} {:?}/{:?} {}x{}@{} target={target_bitrate_bps}bps",
                 config.codec, config.profile, config.width, config.height, config.fps
             );
-            Ok::<_, Box<dyn Error>>((control_receiver, config, encoder))
+            let capture_plan = CapturePlan {
+                stream: config,
+                max_width,
+                max_height,
+            };
+            Ok::<_, Box<dyn Error>>((control_receiver, capture_plan, encoder))
         }
         .await;
-        let (_control_receiver, stream_config, mut encoder) = match negotiation_result {
+        let (_control_receiver, capture_plan, mut encoder) = match negotiation_result {
             Ok(negotiated) => negotiated,
             Err(error) => {
                 close_endpoint!(endpoint, false, b"codec negotiation failed");
@@ -432,7 +444,7 @@ mod linux {
             &mut input_rx,
             &mut reconciler,
             &mut desktop,
-            stream_config,
+            capture_plan,
             encoder.as_mut(),
         )
         .await;
@@ -472,9 +484,10 @@ mod linux {
         input_rx: &mut mpsc::Receiver<InputLaneEvent>,
         reconciler: &mut InputReconciler,
         desktop: &mut X11DesktopSession,
-        stream_config: VideoStreamConfig,
+        capture_plan: CapturePlan,
         mut encoder: Option<&mut SoftwareH264Encoder>,
     ) -> Result<(), Box<dyn Error>> {
+        let stream_config = capture_plan.stream;
         let frame_period =
             frame_period(stream_config.fps).ok_or("fps must be positive and nonzero")?;
         let mut ticker = tokio::time::interval(frame_period);
@@ -540,8 +553,11 @@ mod linux {
                     return Err("reliable input lane task terminated unexpectedly".into());
                 }
                 ScheduledWork::Media => {
+                    // Preserve the constraints used during negotiation. Feeding
+                    // the even-rounded output dimensions back in as new bounds
+                    // can round a second time (for example 224x180 -> 224x178).
                     let (width, height, nv12) =
-                        desktop.capture_nv12(stream_config.width, stream_config.height)?;
+                        desktop.capture_nv12(capture_plan.max_width, capture_plan.max_height)?;
                     if (width, height) != (stream_config.width, stream_config.height) {
                         return Err(format!(
                             "capture geometry changed from negotiated {}x{} to {width}x{height}",
