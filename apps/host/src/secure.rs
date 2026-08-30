@@ -129,8 +129,9 @@ mod linux {
         letterbox_geom, nv12_len, pack_nv12_access_unit_into, X11DesktopSession,
     };
     use latencydesk_protocol::{
-        media_flags, select_host_codec, ControlKind, MediaKind, VideoCodec, VideoCodecCapabilities,
-        VideoProfile, VideoStreamConfig, VIDEO_CODEC_CONTRACT_VERSION,
+        media_flags, select_host_codec, ControlKind, InputAckStatus, InputAppliedAck, MediaKind,
+        VideoCodec, VideoCodecCapabilities, VideoProfile, VideoStreamConfig,
+        VIDEO_CODEC_CONTRACT_VERSION,
     };
     use latencydesk_session::lifecycle::ProductStampAllocator;
     use latencydesk_socket_transport::identity::{
@@ -156,6 +157,15 @@ mod linux {
         stream: VideoStreamConfig,
         max_width: u32,
         max_height: u32,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct InputApplyReport {
+        sequence: u64,
+        ack_requested: bool,
+        status: InputAckStatus,
+        applied_action_count: u16,
+        failure: Option<String>,
     }
 
     fn frame_period(fps: u32) -> Option<Duration> {
@@ -499,6 +509,7 @@ mod linux {
                             )))
                         }
                     };
+                    let mut ack_sequence = 0_u64;
 
                     loop {
                         let next = tokio::select! {
@@ -507,13 +518,56 @@ mod linux {
                             result = receiver.next_input() => result,
                         };
                         match next {
-                            Ok(payload) => apply_input(
-                                &payload,
-                                input_epoch,
-                                &mut reconciler,
-                                &mut input_desktop,
-                            )
-                            .map_err(|error| super::InputLaneFailure::new(error.to_string()))?,
+                            Ok(payload) => {
+                                let report = apply_input(
+                                    &payload,
+                                    input_epoch,
+                                    &mut reconciler,
+                                    &mut input_desktop,
+                                )
+                                .map_err(|error| {
+                                    super::InputLaneFailure::new(error.to_string())
+                                })?;
+                                if report.ack_requested {
+                                    ack_sequence = ack_sequence.checked_add(1).ok_or_else(|| {
+                                        super::InputLaneFailure::new(
+                                            "input ACK sequence exhausted".into(),
+                                        )
+                                    })?;
+                                    let ack = InputAppliedAck {
+                                        stamp: input_session.stamp(),
+                                        input_epoch,
+                                        input_sequence: report.sequence,
+                                        ack_sequence,
+                                        status: report.status,
+                                        applied_action_count: report.applied_action_count,
+                                    }
+                                    .encode()
+                                    .map_err(|error| {
+                                        super::InputLaneFailure::new(error.to_string())
+                                    })?;
+                                    if let Err(error) = input_session
+                                        .send_control(ControlKind::InputAck, &ack)
+                                        .await
+                                    {
+                                        if error.is_retryable_connection_loss() {
+                                            return Err(
+                                                super::InputLaneFailure::peer_connection_lost(
+                                                    format!(
+                                                        "input ACK lost its authenticated peer: {error}"
+                                                    ),
+                                                ),
+                                            );
+                                        }
+                                        return Err(super::InputLaneFailure::new(format!(
+                                            "failed to send input ACK: {error}"
+                                        )));
+                                    }
+                                }
+                                if let Some(failure) = report.failure {
+                                    return Err(super::InputLaneFailure::new(failure));
+                                }
+                            }
                             Err(error) if is_clean_session_close(&error) => return Ok(()),
                             Err(error) if error.is_retryable_connection_loss() => {
                                 return Err(super::InputLaneFailure::peer_connection_lost(format!(
@@ -786,8 +840,30 @@ mod linux {
         expected_input_epoch: u32,
         reconciler: &mut InputReconciler,
         desktop: &mut X11DesktopSession,
-    ) -> Result<(), Box<dyn Error>> {
-        let message = InputMessage::decode(payload)?;
+    ) -> Result<InputApplyReport, Box<dyn Error>> {
+        let mut report = reconcile_input(payload, expected_input_epoch, reconciler, |action| {
+            desktop.inject(action)
+        })?;
+        if report.ack_requested && report.status == InputAckStatus::Applied {
+            if let Err(error) = desktop.synchronize_input() {
+                report.status = InputAckStatus::ApplyFailed;
+                report.applied_action_count = 0;
+                report.failure = Some(format!(
+                    "input was submitted but the X11 synchronization reply failed: {error}"
+                ));
+            }
+        }
+        Ok(report)
+    }
+
+    fn reconcile_input<E: ToString>(
+        payload: &[u8],
+        expected_input_epoch: u32,
+        reconciler: &mut InputReconciler,
+        inject: impl FnMut(latencydesk_input::AppliedInput) -> Result<(), E>,
+    ) -> Result<InputApplyReport, Box<dyn Error>> {
+        let envelope = InputMessage::decode_envelope(payload)?;
+        let message = envelope.message;
         if message.session_epoch != expected_input_epoch {
             return Err(format!(
                 "input epoch {} does not match authenticated session epoch {expected_input_epoch}",
@@ -796,20 +872,34 @@ mod linux {
             .into());
         }
 
-        match reconciler.apply(message)? {
+        let sequence = message.sequence;
+        let (status, applied_action_count, failure) = match reconciler.apply(message)? {
             ReconcileOutcome::Applied(actions) => {
-                if let Err((failed_actions, first_error)) =
-                    attempt_all_injections(actions, |action| desktop.inject(action))
-                {
-                    return Err(format!(
-                        "input attempted every action but {failed_actions} injections failed; first error: {first_error}"
-                    )
-                    .into());
+                let applied_action_count = u16::try_from(actions.len())
+                    .map_err(|_| "input action count exceeds ACK wire range")?;
+                match attempt_all_injections(actions, inject) {
+                    Ok(()) => (InputAckStatus::Applied, applied_action_count, None),
+                    Err((failed_actions, first_error)) => (
+                        InputAckStatus::ApplyFailed,
+                        0,
+                        Some(format!(
+                            "input attempted every action but {failed_actions} injections failed; first error: {first_error}"
+                        )),
+                    ),
                 }
             }
-            ReconcileOutcome::IgnoredStaleSequence | ReconcileOutcome::IgnoredStaleEpoch => {}
-        }
-        Ok(())
+            ReconcileOutcome::IgnoredStaleSequence => {
+                (InputAckStatus::IgnoredStaleSequence, 0, None)
+            }
+            ReconcileOutcome::IgnoredStaleEpoch => (InputAckStatus::IgnoredStaleEpoch, 0, None),
+        };
+        Ok(InputApplyReport {
+            sequence,
+            ack_requested: envelope.ack_requested,
+            status,
+            applied_action_count,
+            failure,
+        })
     }
 
     fn release_all(
@@ -1154,6 +1244,68 @@ mod linux {
             });
             assert_eq!(attempted, vec![10, 20, 30]);
             assert_eq!(result, Err((1, "lost".to_owned())));
+        }
+
+        #[test]
+        fn ack_requested_report_follows_reconciliation_and_injection() {
+            let payload = InputMessage {
+                session_epoch: 3,
+                sequence: 9,
+                event: latencydesk_input::InputEvent::PointerMotionRelative { dx: 1, dy: -1 },
+            }
+            .encode_ack_requested()
+            .expect("probe input");
+            let mut reconciler = InputReconciler::default();
+            let mut injected = Vec::new();
+            let report = reconcile_input(&payload, 3, &mut reconciler, |action| {
+                injected.push(action);
+                Ok::<_, &'static str>(())
+            })
+            .expect("input applied");
+            assert_eq!(injected.len(), 1);
+            assert!(report.ack_requested);
+            assert_eq!(report.sequence, 9);
+            assert_eq!(report.status, InputAckStatus::Applied);
+            assert_eq!(report.applied_action_count, 1);
+            assert!(report.failure.is_none());
+
+            let duplicate = reconcile_input(
+                &payload,
+                3,
+                &mut reconciler,
+                |_| -> Result<(), &'static str> {
+                    panic!("duplicate must not reach platform injection")
+                },
+            )
+            .expect("duplicate is nonfatal");
+            assert_eq!(duplicate.status, InputAckStatus::IgnoredStaleSequence);
+            assert_eq!(duplicate.applied_action_count, 0);
+            assert!(duplicate.failure.is_none());
+
+            let failed_payload = InputMessage {
+                session_epoch: 3,
+                sequence: 10,
+                event: latencydesk_input::InputEvent::PointerMotionRelative { dx: -1, dy: 1 },
+            }
+            .encode_ack_requested()
+            .expect("failed probe input");
+            let mut attempted = 0;
+            let failed = reconcile_input(
+                &failed_payload,
+                3,
+                &mut reconciler,
+                |_| -> Result<(), &'static str> {
+                    attempted += 1;
+                    Err("injection failed")
+                },
+            )
+            .expect("platform failure produces an ACK report");
+            assert_eq!(attempted, 1);
+            assert_eq!(failed.status, InputAckStatus::ApplyFailed);
+            assert_eq!(failed.applied_action_count, 0);
+            assert!(failed.failure.as_deref().is_some_and(|message| {
+                message.contains("1 injections failed") && message.contains("injection failed")
+            }));
         }
 
         #[test]

@@ -36,6 +36,7 @@ const MAX_PAIRING_TIMEOUT_SECS: u64 = 3_600;
 const MAX_CONCURRENT_TARGETS: usize = 16;
 const MAX_FALLBACK_ADDRESS_ARGUMENTS: usize = 16;
 const MAX_CLIENT_SESSIONS: u32 = 16;
+const MAX_INPUT_LATENCY_PROBES: u32 = 1_024;
 
 #[derive(Debug)]
 struct TargetChildPlan {
@@ -61,6 +62,7 @@ pub struct ClientArgs {
     pub max_frames: Option<u64>,
     pub session_count: u32,
     pub reconnect_attempts: u32,
+    pub input_latency_probes: u32,
     pub width: u32,
     pub height: u32,
     pub auto_approve: bool,
@@ -86,6 +88,7 @@ impl Default for ClientArgs {
             max_frames: None,
             session_count: 1,
             reconnect_attempts: 0,
+            input_latency_probes: 0,
             width: 1280,
             height: 720,
             auto_approve: false,
@@ -189,6 +192,20 @@ where
                 config.reconnect_attempts = args[i + 1].parse()?;
                 i += 2;
             }
+            "--input-latency-probes" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --input-latency-probes".into());
+                }
+                let probes = args[i + 1].parse()?;
+                if !(1..=MAX_INPUT_LATENCY_PROBES).contains(&probes) {
+                    return Err(format!(
+                        "--input-latency-probes must be between 1 and {MAX_INPUT_LATENCY_PROBES}"
+                    )
+                    .into());
+                }
+                config.input_latency_probes = probes;
+                i += 2;
+            }
             "--width" => {
                 if i + 1 >= args.len() {
                     return Err("missing value for --width".into());
@@ -279,6 +296,7 @@ where
                        --frames <COUNT>          Receive N completed frames then exit (headless)\n  \
                        --session-count <COUNT>   Run 1..=16 clean sequential headless sessions (default 1)\n  \
                        --reconnect-attempts <N>  Retry 0..=8 recoverable headless path losses (default 0)\n  \
+                       --input-latency-probes <N> Measure 1..=1024 Linux Host-applied input ACK RTTs\n  \
                        --inject-probe            Send one pointer move and ReleaseAll, wait 3 frames, exit\n  \
                        --role client             Explicit role assertion\n  \
                        --version, -V             Show version information\n  \
@@ -400,6 +418,19 @@ where
                     .into(),
             );
         }
+    }
+    if config.input_latency_probes > 0
+        && (config.max_frames.is_some()
+            || config.session_count > 1
+            || config.reconnect_attempts > 0
+            || config.unsafe_udp_lab
+            || config.inject_probe
+            || !config.targets.is_empty())
+    {
+        return Err(
+            "--input-latency-probes requires one secure target and is incompatible with --frames, --session-count, --reconnect-attempts, --target, --inject-probe, and --unsafe-udp-lab"
+                .into(),
+        );
     }
     if config.show_version {
         return Ok(config);
@@ -1505,6 +1536,45 @@ mod tests {
                 "1",
                 "--reconnect-attempts",
                 "1",
+            ],
+        ] {
+            assert!(parse_client_args_from(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn client_parser_bounds_secure_input_latency_probes() {
+        let args = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client.der",
+            "--identity-key",
+            "key.der",
+            "--peer-cert",
+            "host.der",
+            "--input-latency-probes",
+            "128",
+        ])
+        .expect("bounded secure input probe");
+        assert_eq!(args.input_latency_probes, 128);
+        assert_eq!(ClientArgs::default().input_latency_probes, 0);
+
+        for arguments in [
+            vec!["latencydesk-client", "--input-latency-probes", "0"],
+            vec!["latencydesk-client", "--input-latency-probes", "1025"],
+            vec![
+                "latencydesk-client",
+                "--input-latency-probes",
+                "2",
+                "--frames",
+                "1",
+            ],
+            vec![
+                "latencydesk-client",
+                "--unsafe-udp-lab",
+                "--approve",
+                "--input-latency-probes",
+                "2",
             ],
         ] {
             assert!(parse_client_args_from(arguments).is_err());

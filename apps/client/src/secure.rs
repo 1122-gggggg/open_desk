@@ -3,6 +3,7 @@
 use super::ClientArgs;
 use latencydesk_input::{InputEvent, InputMessage};
 use latencydesk_protocol::quic::SessionStamp;
+use latencydesk_protocol::{InputAckStatus, InputAppliedAck};
 use latencydesk_session::lifecycle::ReconnectPolicy;
 #[cfg(test)]
 use latencydesk_socket_transport::identity::connect_exact_peer;
@@ -25,6 +26,7 @@ const CLIENT_RELIABLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_CANDIDATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_RECONNECT_TOTAL_BUDGET: Duration = Duration::from_secs(15);
+const CLIENT_INPUT_PROBE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(any(windows, test))]
 const CLIENT_CLEANUP_SCHEDULER_ALLOWANCE: Duration = Duration::from_millis(250);
 #[cfg(any(windows, test))]
@@ -41,6 +43,73 @@ enum SessionEstablishError {
     Candidate(IdentityError),
     Handshake(ProductSessionError),
     Deadline(Duration),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputLatencyProbeReport {
+    samples: Vec<(u64, u64)>,
+    minimum_us: u64,
+    p50_us: u64,
+    p95_us: u64,
+    p99_us: u64,
+    maximum_us: u64,
+    mean_us: u64,
+}
+
+impl InputLatencyProbeReport {
+    fn from_samples(samples: Vec<(u64, u64)>) -> Result<Self, &'static str> {
+        if samples.is_empty()
+            || samples
+                .iter()
+                .enumerate()
+                .any(|(index, (sequence, _))| *sequence != index as u64 + 1)
+        {
+            return Err("input latency samples must be nonempty and contiguous from sequence 1");
+        }
+        let mut sorted = samples
+            .iter()
+            .map(|(_, latency_us)| *latency_us)
+            .collect::<Vec<_>>();
+        sorted.sort_unstable();
+        let sum = sorted.iter().fold(0_u128, |total, value| {
+            total.saturating_add(u128::from(*value))
+        });
+        let mean_us = u64::try_from(sum / sorted.len() as u128).unwrap_or(u64::MAX);
+        Ok(Self {
+            minimum_us: sorted[0],
+            p50_us: nearest_rank(&sorted, 50),
+            p95_us: nearest_rank(&sorted, 95),
+            p99_us: nearest_rank(&sorted, 99),
+            maximum_us: *sorted.last().expect("nonempty"),
+            mean_us,
+            samples,
+        })
+    }
+}
+
+fn nearest_rank(sorted: &[u64], percentile: usize) -> u64 {
+    let rank = percentile.saturating_mul(sorted.len()).saturating_add(99) / 100;
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+fn validate_input_ack(
+    ack: InputAppliedAck,
+    expected_stamp: SessionStamp,
+    expected_input_sequence: u64,
+    expected_ack_sequence: u64,
+) -> Result<(), String> {
+    if ack.stamp != expected_stamp
+        || ack.input_epoch != expected_stamp.authorization_epoch
+        || ack.input_sequence != expected_input_sequence
+        || ack.ack_sequence != expected_ack_sequence
+        || ack.status != InputAckStatus::Applied
+        || ack.applied_action_count != 1
+    {
+        return Err(format!(
+            "input ACK does not match active stamp/sequence or successful single-action probe: {ack:?}"
+        ));
+    }
+    Ok(())
 }
 
 impl SessionEstablishError {
@@ -301,7 +370,14 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
     log_active_session(&session, selected_remote, attempts_started);
 
     let reconnect_policy = ReconnectPolicy::new(args.reconnect_attempts)?;
-    let result = if args.session_count > 1 || args.reconnect_attempts > 0 {
+    let result = if args.input_latency_probes > 0 {
+        run_input_latency_probes(
+            &runtime,
+            &session,
+            args.input_latency_probes,
+            operation_timeout,
+        )
+    } else if args.session_count > 1 || args.reconnect_attempts > 0 {
         run_headless_successor_sequence(
             SuccessorSequenceContext {
                 runtime: &runtime,
@@ -352,6 +428,103 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
             })
     });
     merge_cleanup_result(result, cleanup_result)
+}
+
+fn run_input_latency_probes(
+    runtime: &tokio::runtime::Runtime,
+    session: &ProductSession,
+    probe_count: u32,
+    operation_timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    use latencydesk_protocol::ControlKind;
+
+    let total_timeout = operation_timeout.min(CLIENT_INPUT_PROBE_TOTAL_TIMEOUT);
+    let report = runtime.block_on(async {
+        tokio::time::timeout(total_timeout, async {
+            let (_config, mut control) = negotiate_video_stream(session, operation_timeout).await?;
+            let reliable_timeout = reliable_operation_timeout(operation_timeout);
+            let stamp = session.stamp();
+            tokio::time::timeout(reliable_timeout, session.receive_media_frame())
+                .await
+                .map_err(|_| "input latency probe timed out waiting for the first media frame")??;
+            let mut samples = Vec::with_capacity(probe_count as usize);
+            for sequence in 1..=u64::from(probe_count) {
+                let payload = InputMessage {
+                    session_epoch: stamp.authorization_epoch,
+                    sequence,
+                    event: InputEvent::PointerMotionRelative {
+                        dx: if sequence % 2 == 0 { -1 } else { 1 },
+                        dy: 0,
+                    },
+                }
+                .encode_ack_requested()?;
+                let sent_at = Instant::now();
+                session
+                    .send_input_with_timeout(&payload, reliable_timeout)
+                    .await?;
+                let ack_deadline = tokio::time::Instant::now() + reliable_timeout;
+                let ack = loop {
+                    let remaining = ack_deadline
+                        .saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(format!("input ACK {sequence} timed out").into());
+                    }
+                    let control_message = tokio::time::timeout(
+                        remaining,
+                        control.next_control(),
+                    )
+                    .await
+                    .map_err(|_| format!("input ACK {sequence} timed out"))??;
+                    match control_message.kind {
+                        ControlKind::InputAck => {
+                            break InputAppliedAck::decode(&control_message.payload)?;
+                        }
+                        ControlKind::RateUpdate | ControlKind::CongestionFeedback => continue,
+                        unexpected => {
+                            return Err(format!(
+                                "expected InputAck for input sequence {sequence}, received {unexpected:?}"
+                            )
+                            .into());
+                        }
+                    }
+                };
+                validate_input_ack(ack, stamp, sequence, sequence)?;
+                let latency_us = u64::try_from(sent_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+                samples.push((sequence, latency_us));
+            }
+            send_input_event(
+                session,
+                u64::from(probe_count).saturating_add(1),
+                InputEvent::ReleaseAll,
+                reliable_timeout,
+            )
+            .await?;
+            let report = InputLatencyProbeReport::from_samples(samples)?;
+            Ok::<InputLatencyProbeReport, Box<dyn Error>>(report)
+        })
+        .await
+        .map_err(|_| format!("input latency probe exceeded its {total_timeout:?} total timeout"))?
+    })?;
+
+    let raw = report
+        .samples
+        .iter()
+        .map(|(sequence, latency_us)| format!("{sequence}:{latency_us}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "input-latency: session_id={} authorization_epoch={} samples={} min_us={} p50_us={} p95_us={} p99_us={} max_us={} mean_us={} raw_us={raw}",
+        session.stamp().session_id,
+        session.stamp().authorization_epoch,
+        report.samples.len(),
+        report.minimum_us,
+        report.p50_us,
+        report.p95_us,
+        report.p99_us,
+        report.maximum_us,
+        report.mean_us,
+    );
+    Ok(())
 }
 
 struct SuccessorSequenceContext<'a> {
@@ -1861,6 +2034,59 @@ mod tests {
             .build()
             .expect("runtime");
         wait_for_reconnect_delay(&runtime, Duration::ZERO);
+    }
+
+    #[test]
+    fn input_ack_validation_binds_full_stamp_and_both_sequences() {
+        let stamp = SessionStamp {
+            session_id: 41,
+            generation: 2,
+            authorization_epoch: 3,
+            display_epoch: 4,
+            codec_epoch: 5,
+        };
+        let ack = InputAppliedAck {
+            stamp,
+            input_epoch: 3,
+            input_sequence: 9,
+            ack_sequence: 1,
+            status: InputAckStatus::Applied,
+            applied_action_count: 1,
+        };
+        assert!(validate_input_ack(ack, stamp, 9, 1).is_ok());
+        assert!(validate_input_ack(
+            InputAppliedAck {
+                stamp: SessionStamp {
+                    generation: 1,
+                    ..stamp
+                },
+                ..ack
+            },
+            stamp,
+            9,
+            1
+        )
+        .is_err());
+        assert!(validate_input_ack(ack, stamp, 8, 1).is_err());
+        assert!(validate_input_ack(ack, stamp, 9, 2).is_err());
+    }
+
+    #[test]
+    fn input_latency_summary_uses_nearest_rank_percentiles() {
+        let report = InputLatencyProbeReport::from_samples(vec![
+            (1, 10),
+            (2, 20),
+            (3, 30),
+            (4, 40),
+            (5, 50),
+        ])
+        .expect("summary");
+        assert_eq!(report.minimum_us, 10);
+        assert_eq!(report.p50_us, 30);
+        assert_eq!(report.p95_us, 50);
+        assert_eq!(report.p99_us, 50);
+        assert_eq!(report.maximum_us, 50);
+        assert_eq!(report.mean_us, 30);
     }
 
     #[test]
