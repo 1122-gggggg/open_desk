@@ -27,11 +27,12 @@ struct InputLaneFailure(std::sync::Arc<InputLaneFailureState>);
 #[derive(Debug)]
 struct InputLaneFailureState {
     message: String,
+    #[cfg(target_os = "linux")]
     disposition: InputLaneFailureDisposition,
     observed_by_stream: std::sync::atomic::AtomicBool,
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputLaneFailureDisposition {
     Fatal,
@@ -41,13 +42,20 @@ enum InputLaneFailureDisposition {
 #[cfg(any(target_os = "linux", windows))]
 impl InputLaneFailure {
     fn new(message: String) -> Self {
-        Self::with_disposition(message, InputLaneFailureDisposition::Fatal)
+        Self(std::sync::Arc::new(InputLaneFailureState {
+            message,
+            #[cfg(target_os = "linux")]
+            disposition: InputLaneFailureDisposition::Fatal,
+            observed_by_stream: std::sync::atomic::AtomicBool::new(false),
+        }))
     }
 
+    #[cfg(target_os = "linux")]
     fn peer_connection_lost(message: String) -> Self {
         Self::with_disposition(message, InputLaneFailureDisposition::RetryablePeerLoss)
     }
 
+    #[cfg(target_os = "linux")]
     fn with_disposition(message: String, disposition: InputLaneFailureDisposition) -> Self {
         Self(std::sync::Arc::new(InputLaneFailureState {
             message,
@@ -56,6 +64,7 @@ impl InputLaneFailure {
         }))
     }
 
+    #[cfg(target_os = "linux")]
     fn is_retryable_connection_loss(&self) -> bool {
         self.0.disposition == InputLaneFailureDisposition::RetryablePeerLoss
     }
@@ -93,6 +102,7 @@ mod close_code_tests {
         assert_eq!(host_application_close_code(false), 1);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn input_lane_failure_preserves_retryable_peer_loss_disposition() {
         let fatal = InputLaneFailure::new("provider failed".into());
