@@ -10,11 +10,11 @@ use latencydesk_protocol::quic::{
     MediaDatagram, SessionStamp, StreamKind, StreamRecord, QUIC_MEDIA_HEADER_LEN,
 };
 use latencydesk_protocol::{
-    ControlHeader, ControlKind, ControlPacket, HandshakeCompletedMessage, MediaPacket,
-    ProtocolError, MEDIA_HEADER_LEN,
+    ControlHeader, ControlKind, ControlPacket, HandshakeCompletedMessage, ProtocolError,
+    MEDIA_HEADER_LEN,
 };
 use latencydesk_transport::{
-    fragment_frame_with_packet_budget, FragmentSpec, IngestOutcome, ReassembledFrame, Reassembler,
+    frame_fragments_with_packet_budget, FragmentSpec, IngestOutcome, ReassembledFrame, Reassembler,
     ReassemblyConfig, TransportError, MAX_DATAGRAM_MTU,
 };
 use std::error::Error;
@@ -506,13 +506,17 @@ impl ProductSession {
             .max_datagram_size()
             .ok_or(ProductSessionError::DatagramsUnsupported)?;
         let inner_datagram_bytes = media_packet_budget(path_max_datagram_bytes)?;
-        let packets = fragment_frame_with_packet_budget(spec, frame, inner_datagram_bytes)?;
+        let fragments = frame_fragments_with_packet_budget(spec, frame, inner_datagram_bytes)?;
 
         // Preflight every final length before sending the first fragment. This
         // prevents a static MTU mistake from producing a partial frame.
-        let largest_datagram_bytes = packets
-            .iter()
-            .map(|packet| QUIC_MEDIA_HEADER_LEN.saturating_add(packet.len()))
+        let largest_datagram_bytes = fragments
+            .clone()
+            .map(|fragment| {
+                QUIC_MEDIA_HEADER_LEN
+                    .saturating_add(MEDIA_HEADER_LEN)
+                    .saturating_add(fragment.payload.len())
+            })
             .max()
             .unwrap_or(0);
         if largest_datagram_bytes > path_max_datagram_bytes {
@@ -527,12 +531,15 @@ impl ProductSession {
         let expires_at_ns = now_ns
             .checked_add(max_age_ns)
             .ok_or(ProductSessionError::MediaDeadlineOverflow)?;
-        let fragments_total = packets.len();
+        let fragments_total = fragments.len();
         let mut fragments_sent = 0;
-        for (index, packet) in packets.iter().enumerate() {
-            let inner = MediaPacket::decode(packet)?;
-            let datagram =
-                MediaDatagram::encode(self.stamp, expires_at_ns, inner.header, inner.payload)?;
+        for (index, fragment) in fragments.enumerate() {
+            let datagram = MediaDatagram::encode(
+                self.stamp,
+                expires_at_ns,
+                fragment.header,
+                fragment.payload,
+            )?;
             debug_assert!(datagram.len() <= path_max_datagram_bytes);
             match self.connection.send_media(
                 Bytes::from(datagram),
@@ -838,7 +845,7 @@ mod tests {
         media_flags, video_capability_flags, MediaKind, MediaPacket, VideoCodec,
         VideoCodecCapabilities, VideoProfile, VideoStreamConfig, VIDEO_CODEC_CONTRACT_VERSION,
     };
-    use latencydesk_transport::FrameKey;
+    use latencydesk_transport::{fragment_frame_with_packet_budget, FrameKey};
     use rcgen::generate_simple_self_signed;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::net::{Ipv4Addr, SocketAddr};

@@ -71,11 +71,88 @@ pub fn fragment_frame_with_packet_budget(
     fragment_frame_impl(spec, frame, max_media_packet_bytes)
 }
 
+/// One validated media fragment whose payload borrows the source access unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameFragment<'a> {
+    pub header: MediaHeader,
+    pub payload: &'a [u8],
+}
+
+/// Allocation-free iterator over the validated fragments of one access unit.
+///
+/// The constructor performs all size, arithmetic, and header validation before
+/// yielding the first fragment. This lets transport adapters encode and submit
+/// fragments incrementally without materializing a second owned copy of the
+/// complete frame.
+#[derive(Debug, Clone)]
+pub struct FrameFragments<'a> {
+    spec: FragmentSpec,
+    frame: &'a [u8],
+    frame_len: u32,
+    payload_cap: usize,
+    next_offset: usize,
+    remaining: usize,
+}
+
+impl<'a> Iterator for FrameFragments<'a> {
+    type Item = FrameFragment<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let start = self.next_offset;
+        let end = start.saturating_add(self.payload_cap).min(self.frame.len());
+        let payload = &self.frame[start..end];
+        let header = fragment_header(self.spec, self.frame_len, start, payload.len())
+            .expect("validated fragment iterator cannot overflow");
+        self.next_offset = end;
+        self.remaining -= 1;
+        Some(FrameFragment { header, payload })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for FrameFragments<'_> {}
+impl std::iter::FusedIterator for FrameFragments<'_> {}
+
+/// Validates an access unit and exposes allocation-free borrowed fragments for
+/// a packet budget that already excludes outer transport framing.
+pub fn frame_fragments_with_packet_budget<'a>(
+    spec: FragmentSpec,
+    frame: &'a [u8],
+    max_media_packet_bytes: usize,
+) -> Result<FrameFragments<'a>, TransportError> {
+    if !(MEDIA_HEADER_LEN + 1..=MAX_DATAGRAM_MTU).contains(&max_media_packet_bytes) {
+        return Err(TransportError::DatagramMtu(max_media_packet_bytes));
+    }
+    frame_fragments_impl(spec, frame, max_media_packet_bytes)
+}
+
 fn fragment_frame_impl(
     spec: FragmentSpec,
     frame: &[u8],
     max_media_packet_bytes: usize,
 ) -> Result<Vec<Vec<u8>>, TransportError> {
+    let fragments = frame_fragments_impl(spec, frame, max_media_packet_bytes)?;
+    let mut packets = Vec::with_capacity(fragments.len());
+    for fragment in fragments {
+        packets.push(
+            MediaPacket::encode(fragment.header, fragment.payload)
+                .map_err(TransportError::Protocol)?,
+        );
+    }
+    Ok(packets)
+}
+
+fn frame_fragments_impl<'a>(
+    spec: FragmentSpec,
+    frame: &'a [u8],
+    max_media_packet_bytes: usize,
+) -> Result<FrameFragments<'a>, TransportError> {
     if frame.is_empty() || frame.len() > MAX_FRAME_BYTES as usize {
         return Err(TransportError::FrameLength(frame.len()));
     }
@@ -89,27 +166,47 @@ fn fragment_frame_impl(
     let frame_len =
         u32::try_from(frame.len()).map_err(|_| TransportError::FrameLength(frame.len()))?;
     let count = frame.len().div_ceil(payload_cap);
-    let mut packets = Vec::with_capacity(count);
-    for (index, payload) in frame.chunks(payload_cap).enumerate() {
-        let offset = index
-            .checked_mul(payload_cap)
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or(TransportError::Arithmetic)?;
-        let fragment_len = u16::try_from(payload.len()).map_err(|_| TransportError::Arithmetic)?;
-        let header = MediaHeader {
-            kind: spec.kind,
-            flags: spec.flags,
-            stream_id: spec.stream_id,
-            codec_epoch: spec.codec_epoch,
-            frame_id: spec.frame_id,
-            dependency_frame_id: spec.dependency_wire(),
-            frame_len,
-            fragment_offset: offset,
-            fragment_len,
-        };
-        packets.push(MediaPacket::encode(header, payload).map_err(TransportError::Protocol)?);
-    }
-    Ok(packets)
+    let last_offset = (count - 1)
+        .checked_mul(payload_cap)
+        .ok_or(TransportError::Arithmetic)?;
+    let last_len = frame.len() - last_offset;
+    fragment_header(spec, frame_len, 0, payload_cap.min(frame.len()))
+        .and_then(validate_fragment_header)?;
+    fragment_header(spec, frame_len, last_offset, last_len).and_then(validate_fragment_header)?;
+    Ok(FrameFragments {
+        spec,
+        frame,
+        frame_len,
+        payload_cap,
+        next_offset: 0,
+        remaining: count,
+    })
+}
+
+fn fragment_header(
+    spec: FragmentSpec,
+    frame_len: u32,
+    offset: usize,
+    payload_len: usize,
+) -> Result<MediaHeader, TransportError> {
+    let fragment_offset = u32::try_from(offset).map_err(|_| TransportError::Arithmetic)?;
+    let fragment_len = u16::try_from(payload_len).map_err(|_| TransportError::Arithmetic)?;
+    Ok(MediaHeader {
+        kind: spec.kind,
+        flags: spec.flags,
+        stream_id: spec.stream_id,
+        codec_epoch: spec.codec_epoch,
+        frame_id: spec.frame_id,
+        dependency_frame_id: spec.dependency_wire(),
+        frame_len,
+        fragment_offset,
+        fragment_len,
+    })
+}
+
+fn validate_fragment_header(header: MediaHeader) -> Result<MediaHeader, TransportError> {
+    header.validate().map_err(TransportError::Protocol)?;
+    Ok(header)
 }
 
 /// Unique identity of a frame under construction.
@@ -1350,6 +1447,26 @@ mod tests {
         }
 
         assert_eq!(completed, Some(frame));
+    }
+
+    #[test]
+    fn borrowed_fragments_match_the_owned_packet_interface() {
+        let frame: Vec<u8> = (0..5_000).map(|index| (index % 251) as u8).collect();
+        let owned =
+            fragment_frame_with_packet_budget(spec(11), &frame, 1_156).expect("owned fragments");
+        let borrowed = frame_fragments_with_packet_budget(spec(11), &frame, 1_156)
+            .expect("borrowed fragments");
+        assert_eq!(borrowed.len(), owned.len());
+        let first = borrowed.clone().next().expect("first fragment");
+        assert_eq!(first.payload.as_ptr(), frame.as_ptr());
+
+        let encoded = borrowed
+            .map(|fragment| {
+                MediaPacket::encode(fragment.header, fragment.payload).expect("encode fragment")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(encoded, owned);
     }
 
     #[test]
