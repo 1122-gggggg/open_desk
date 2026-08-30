@@ -55,6 +55,9 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
 - certificate/device-key pinning after pairing;
 - anti-replay/session nonces;
 - relay forwards E2E ciphertext only;
+- STUN/rendezvous candidates remain untrusted metadata; source/transaction
+  validation and fingerprints do not replace authenticated ICE signaling,
+  consent, exact-peer mTLS, or authorization;
 - rate limits before expensive parsing/decompression;
 - connection and incomplete-frame quotas.
 

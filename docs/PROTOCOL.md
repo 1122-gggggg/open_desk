@@ -58,6 +58,15 @@ immediately after stream negotiation, before sending input; unknown capability
 or stream flags are protocol errors. Linux X11 currently intersects the bit and
 Windows Host does not.
 
+An optional pre-QUIC RFC 8489 Binding transaction may discover one
+server-reflexive address. It uses a CSPRNG 96-bit transaction ID, exact response
+source/transaction matching, bounded retransmission/deadline/ignored-datagram
+counts, XOR-MAPPED-ADDRESS, and a required final FINGERPRINT. Malformed, stale,
+spoofed, or unusable responses are discarded within those bounds. The exact UDP
+socket is then transferred to Quinn without rebinding. The address is untrusted
+telemetry only: it is not a candidate route, identity, authorization, ICE
+nomination, or consent result, and exact-certificate mTLS remains mandatory.
+
 ## 3. Capability negotiation
 
 Each peer advertises:

@@ -24,7 +24,7 @@ Windows client on a trusted, low-latency LAN.
 | Other clients | Portable software viewer with OpenH264/raw-NV12 presentation and input forwarding; headless receive and input probe remain available | Alpha implementation; cross-machine and native-UX evidence pending |
 | Windows host | Secure hosting is rejected before opening a socket because real capture/input providers are not connected | Unsupported |
 | Media | Raw NV12 fragmented across QUIC DATAGRAMs; no production H.264/AV1 encode/decode path | Low-resolution LAN preview only |
-| WAN connectivity | Direct IP plus a bounded race across up to four known exact-pinned addresses for the same Host; opt-in headless recovery reruns the authenticated race | Alternate-address and bounded headless recovery implemented; no rendezvous, NAT traversal, relay, discovery, interactive recovery, or QUIC path migration |
+| WAN connectivity | Direct IP plus a bounded race across four known exact-pinned addresses; opt-in RFC 8489 Binding discovers one srflx address on the exact UDP socket later handed to Quinn | Same-socket STUN discovery and bounded headless recovery implemented; no candidate signaling, ICE checks/nomination/consent, rendezvous, TURN/relay, automatic Internet traversal, interactive recovery, or QUIC path migration |
 | Distribution | No supported signed installer, updater, or production service | Not implemented |
 | Legacy transport | Plaintext custom UDP, available only with explicit `--unsafe-udp-lab` | Local compatibility test only |
 
@@ -86,6 +86,24 @@ loopback. It does **not** prove Linux-to-Windows rendering, visible XTEST input
 effects, packet-capture confidentiality, cross-machine operation, or
 long-running network reliability. Those gates remain Pending in
 [Product readiness](docs/PRODUCT_READINESS.md).
+
+The same-socket STUN process gate starts a strict local fake RFC 8489 Binding
+server, discovers the Client's reflexive address, transfers that exact UDP
+socket into Quinn, and then completes exact-mTLS plus a real X11 stream:
+
+```bash
+xvfb-run -a python3 scripts/stun_same_socket_test.py \
+  --host-bin target/debug/latencydesk-host \
+  --client-bin target/debug/latencydesk-client \
+  --identity-bin target/debug/latencydesk-identity \
+  --frames 3 --timeout 45 \
+  --output artifacts/stun-same-socket.json
+```
+
+The artifact requires the fake server's observed STUN source, Client
+local/reflexive address, and Host-observed authenticated QUIC source to match.
+This is a socket/candidate foundation only: it performs no signaling,
+connectivity checks, nomination, consent, TURN, or NAT traversal claim.
 
 The multi-target process gate starts two distinct-certificate Hosts, proves
 both are authenticated and streaming at the same time, then runs a second
@@ -241,7 +259,9 @@ product-readiness gates rather than verified support claims.
 `--fallback-address` is optional and repeatable up to three times. Every address
 must identify the same Host certificate; the Client races them concurrently and
 uses only the first path that completes exact-pinned TLS authentication. This is
-known-address failover, not ICE/STUN/TURN or an unauthenticated proxy.
+known-address failover, not ICE/TURN or an unauthenticated proxy. Optional
+`--stun-server <IP:PORT>` only discovers/logs one srflx address on that same
+socket; it does not add a route until a later authenticated ICE/signaling layer.
 
 ### 4. Open several exact-pinned Hosts concurrently
 
