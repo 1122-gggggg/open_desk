@@ -38,6 +38,9 @@ class ProxyTests(unittest.TestCase):
             client.sendto(b"again", proxy.address)
             self.assertEqual(target.recvfrom(32)[0], b"again")
             self.assertTrue(proxy.resumed)
+            deadline = time.monotonic() + 1
+            while proxy.forwarded_after_resume == 0 and time.monotonic() < deadline:
+                time.sleep(0.005)
             self.assertGreater(proxy.forwarded_after_resume, 0)
         finally:
             client.close()
