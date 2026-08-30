@@ -59,7 +59,7 @@ any native or network gate below.
 | Pending | Secure XTEST input E2E | Keyboard, pointer, buttons, wheel, absolute coordinates, focus loss, disconnect, and `ReleaseAll` are verified on a disposable X11 session with no stuck inputs |
 | Pending | Windows Viewer correctness and recovery | Strict NV12 decode/presentation is content-checked; resize/DPI, multi-monitor geometry, cursor, renderer reset, corrupt frame, and window-close cleanup pass |
 | Pending | Windows secure Host | Real DDA/WGC capture, encode, input consent/privilege gate, display epoch changes, protected-content policy, lock/UAC behavior, and GPU reset are connected and tested |
-| Pending | Linux interactive Client | Real viewer/input implementation passes the same content, lifecycle, and recovery matrix as Windows |
+| Pending | Linux interactive Client validation | Existing software viewer/input path passes the same content, lifecycle, resize/DPI, and recovery matrix as Windows on supported target systems |
 | Pending | Wayland Host | Portal/PipeWire capture and libei input pass GNOME/KDE consent, restore/revoke, format fallback, and session cleanup tests |
 | Pending | Production video codec | At least H.264 or AV1 has interoperable hardware/software paths, bounded encode/decode queues, rate control, IDR recovery, corruption handling, and objective quality tests |
 

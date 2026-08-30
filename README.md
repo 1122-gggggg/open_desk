@@ -19,7 +19,7 @@ Windows client on a trusted, low-latency LAN.
 | Control and input | Authenticated product handshake and session-stamped reliable QUIC lanes | Implemented and tested in process |
 | Linux host | Real X11 root capture, CPU BGRA-to-NV12 conversion, and reconciled XTEST input | Secure alpha path; X11-to-headless process loopback is verified, while cross-machine rendering and visible input effects remain pending |
 | Windows client | Strict raw-NV12 validation, Direct3D 11 viewer, bounded latest-frame presentation, and native input forwarding; `--frames` provides headless mode | Secure alpha path; Windows viewer cross-machine E2E evidence is still pending |
-| Other clients | Headless frame receive and input probe are available; no interactive Linux viewer | Partial |
+| Other clients | Portable software viewer with OpenH264/raw-NV12 presentation and input forwarding; headless receive and input probe remain available | Alpha implementation; cross-machine and native-UX evidence pending |
 | Windows host | Secure hosting is rejected before opening a socket because real capture/input providers are not connected | Unsupported |
 | Media | Raw NV12 fragmented across QUIC DATAGRAMs; no production H.264/AV1 encode/decode path | Low-resolution LAN preview only |
 | WAN connectivity | Direct IP only; no rendezvous, NAT traversal, relay, discovery, or seamless reconnect | Not implemented |
@@ -76,10 +76,10 @@ long-running network reliability. Those gates remain Pending in
 
 ## Secure LAN preview quick start
 
-This workflow requires a Linux X11 host and either a Windows interactive client
-or a headless client. Use the same source revision on both machines and a
-trusted wired LAN. Replace `192.168.1.20` with the Linux host's address and allow
-inbound UDP port 9000 only on the trusted LAN.
+This workflow requires a Linux X11 host and either a Windows interactive client,
+a portable software client, or a headless client. Use the same source revision
+on both machines and a trusted wired LAN. Replace `192.168.1.20` with the Linux
+host's address and allow inbound UDP port 9000 only on the trusted LAN.
 
 ### 1. Generate one persistent identity on each machine
 
@@ -126,7 +126,7 @@ cargo run --locked -p latencydesk-host -- \
 The host accepts only the exact pinned client certificate. Capture and XTEST
 open only after peer authentication succeeds.
 
-### 3. Start the Windows viewer
+### 3. Start an interactive viewer
 
 ```powershell
 cargo run --locked -p latencydesk-client -- `
@@ -136,9 +136,21 @@ cargo run --locked -p latencydesk-client -- `
   --peer-cert "$env:LOCALAPPDATA\LatencyDesk\peers\linux-host.cert.der"
 ```
 
+On Linux or macOS, run the same client without `--frames` to open the portable
+software viewer (replace the identity paths as appropriate):
+
+```bash
+cargo run --locked -p latencydesk-client -- \
+  --connect 192.168.1.20:9000 \
+  --identity-cert "$HOME/.local/share/latencydesk/client/identity.cert.der" \
+  --identity-key "$HOME/.local/share/latencydesk/client/identity.key.der" \
+  --peer-cert "$HOME/.local/share/latencydesk/peers/linux-host.cert.der"
+```
+
 For a bounded headless receive check on any supported client platform, add
-`--frames 60`. A non-Windows client without `--frames` or `--inject-probe`
-fails closed because an interactive viewer is not implemented.
+`--frames 60`. The portable viewer is an alpha software path; cross-machine
+rendering, input effects, resize/DPI behavior, and long-duration recovery remain
+product-readiness gates rather than verified support claims.
 
 This is the intended secure workflow. The repository retains a successful
 single-machine X11-to-headless process result, but not a cross-machine Windows

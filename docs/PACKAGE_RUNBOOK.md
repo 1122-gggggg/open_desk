@@ -170,27 +170,37 @@ Replace `192.168.1.20` with the Linux Host address.
 The Windows Client is a strict raw-NV12 D3D11 viewer. There is no H.264/AV1
 decoder path in this package.
 
-## 6. Optional Linux headless Client
+## 6. Optional Linux software or headless Client
 
-Linux has no interactive viewer. It can perform a bounded headless receive
-using a separate Client identity that the Host pins instead of the Windows
-certificate. Generate that separate identity first:
+Linux includes an alpha software viewer and can also perform a bounded headless
+receive. Use a separate Client identity that the Host pins instead of the
+Windows certificate. Generate that separate identity first:
 
 ```bash
 ./latencydesk-identity generate \
-  --name "Linux headless client" \
+  --name "Linux client" \
   --out-dir "$HOME/.local/share/latencydesk/client"
 ```
 
-Exchange and fingerprint this Client's certificate just as above. Store it on
-the Host as
-`$HOME/.local/share/latencydesk/peers/linux-headless-client.cert.der`, store the
-Host certificate on the Client as
+Exchange and fingerprint this Client's certificate just as above. Copy its
+fixed-name `identity.cert.der` file to the Host as
+`$HOME/.local/share/latencydesk/peers/linux-client.cert.der`, then configure the
+Host's `--peer-cert` with that exact path. Store the Host certificate on the Client as
 `$HOME/.local/share/latencydesk/peers/linux-host.cert.der`, then restart the
-Host with `--peer-cert` pointing at `linux-headless-client.cert.der`. A Host
+Host with `--peer-cert` pointing at `linux-client.cert.der`. A Host
 process currently pins exactly one peer certificate.
 
-Run the bounded Client:
+Run the interactive software viewer by omitting `--frames`:
+
+```bash
+./latencydesk-client \
+  --connect 192.168.1.20:9000 \
+  --identity-cert "$HOME/.local/share/latencydesk/client/identity.cert.der" \
+  --identity-key "$HOME/.local/share/latencydesk/client/identity.key.der" \
+  --peer-cert "$HOME/.local/share/latencydesk/peers/linux-host.cert.der"
+```
+
+For a bounded headless check, add `--frames 60`:
 
 ```bash
 ./latencydesk-client \

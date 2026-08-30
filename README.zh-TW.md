@@ -18,7 +18,7 @@ Client。
 | 控制與輸入 | 已驗證的產品握手、帶 session stamp 的可靠 QUIC lane | 已實作並通過 in-process 測試 |
 | Linux Host | 真實 X11 root 擷取、CPU BGRA-to-NV12 轉換、經狀態協調的 XTEST 輸入 | 安全 Alpha 路徑；X11 到 headless 的 process loopback 已驗證，跨機器呈現與可見輸入效果仍待完成 |
 | Windows Client | 嚴格 raw-NV12 驗證、Direct3D 11 Viewer、有界 latest-frame 呈現及原生輸入轉送；`--frames` 可 headless 執行 | 安全 Alpha 路徑；Windows Viewer 跨機器 E2E 證據仍待完成 |
-| 其他 Client | 可 headless 收幀與執行 input probe；Linux 尚無互動式 Viewer | 部分完成 |
+| 其他 Client | 已有可攜式軟體 Viewer（OpenH264／raw NV12 顯示與輸入轉送），並保留 headless 收幀及 input probe | Alpha 實作；跨機器與原生 UX 證據仍待完成 |
 | Windows Host | 因真實 capture/input provider 尚未接線，安全 Host 會在開 socket 前拒絕執行 | 不支援 |
 | 媒體 | raw NV12 分片後以 QUIC DATAGRAM 傳輸；沒有正式 H.264／AV1 encode/decode 路徑 | 僅適合低解析 LAN preview |
 | WAN 連線 | 只能 direct IP；沒有 rendezvous、NAT traversal、relay、discovery 或無縫 reconnect | 未實作 |
@@ -119,7 +119,7 @@ cargo run --locked -p latencydesk-host -- \
 Host 只接受完全相符的 pinned Client certificate；驗證對端成功後才會開啟
 capture 與 XTEST。
 
-### 3. 啟動 Windows Viewer
+### 3. 啟動互動式 Viewer
 
 ```powershell
 cargo run --locked -p latencydesk-client -- `
@@ -129,9 +129,20 @@ cargo run --locked -p latencydesk-client -- `
   --peer-cert "$env:LOCALAPPDATA\LatencyDesk\peers\linux-host.cert.der"
 ```
 
+Linux 或 macOS 可用同一個 Client 命令且不加 `--frames`，開啟可攜式軟體
+Viewer（請依環境調整 identity 路徑）：
+
+```bash
+cargo run --locked -p latencydesk-client -- \
+  --connect 192.168.1.20:9000 \
+  --identity-cert "$HOME/.local/share/latencydesk/client/identity.cert.der" \
+  --identity-key "$HOME/.local/share/latencydesk/client/identity.key.der" \
+  --peer-cert "$HOME/.local/share/latencydesk/peers/linux-host.cert.der"
+```
+
 若要在支援的 Client 平台做有限次數 headless 收幀檢查，可加入
-`--frames 60`。非 Windows Client 若沒有 `--frames` 或 `--inject-probe`，會因
-互動式 Viewer 尚未實作而 fail closed。
+`--frames 60`。可攜式 Viewer 仍是 Alpha 軟體路徑；跨機器呈現、可見輸入
+效果、resize／DPI 與長時間復原仍是產品就緒度 gate，不能視為已驗證支援。
 
 這是預期的安全操作流程。倉庫已保留成功的單機 X11 到 headless process
 結果，但尚未有跨機器 Windows Viewer 結果。請把失敗視為 Alpha 缺陷，
