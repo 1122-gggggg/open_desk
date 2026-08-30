@@ -296,7 +296,7 @@ where
                        --frames <COUNT>          Receive N completed frames then exit (headless)\n  \
                        --session-count <COUNT>   Run 1..=16 clean sequential headless sessions (default 1)\n  \
                        --reconnect-attempts <N>  Retry 0..=8 recoverable headless path losses (default 0)\n  \
-                       --input-latency-probes <N> Measure 1..=1024 Linux Host-applied input ACK RTTs\n  \
+                       --input-latency-probes <N> Measure 1..=1024 ACK RTTs per secure target (Linux Host)\n  \
                        --inject-probe            Send one pointer move and ReleaseAll, wait 3 frames, exit\n  \
                        --role client             Explicit role assertion\n  \
                        --version, -V             Show version information\n  \
@@ -424,11 +424,10 @@ where
             || config.session_count > 1
             || config.reconnect_attempts > 0
             || config.unsafe_udp_lab
-            || config.inject_probe
-            || !config.targets.is_empty())
+            || config.inject_probe)
     {
         return Err(
-            "--input-latency-probes requires one secure target and is incompatible with --frames, --session-count, --reconnect-attempts, --target, --inject-probe, and --unsafe-udp-lab"
+            "--input-latency-probes supports secure --connect/--peer-cert or secure --target entries and is incompatible with --frames, --session-count, --reconnect-attempts, --inject-probe, and --unsafe-udp-lab"
                 .into(),
         );
     }
@@ -836,6 +835,10 @@ fn plan_target_child_args(args: &ClientArgs) -> Result<Vec<TargetChildPlan>, Box
             if let Some(frames) = args.max_frames {
                 child_args.push(OsString::from("--frames"));
                 child_args.push(OsString::from(frames.to_string()));
+            }
+            if args.input_latency_probes > 0 {
+                child_args.push(OsString::from("--input-latency-probes"));
+                child_args.push(OsString::from(args.input_latency_probes.to_string()));
             }
             TargetChildPlan {
                 target: *addr,
@@ -1377,6 +1380,38 @@ mod tests {
             ]
         );
         assert!(!first.iter().any(|arg| arg == "--target"));
+    }
+
+    #[test]
+    fn client_parser_forwards_bounded_input_probes_to_every_target() {
+        let args = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client.der",
+            "--identity-key",
+            "key.der",
+            "--target",
+            "127.0.0.1:9001,host-a.der",
+            "--target",
+            "127.0.0.1:9002,host-b.der",
+            "--input-latency-probes",
+            "128",
+        ])
+        .expect("bounded probes are valid for isolated target children");
+
+        let plans = plan_target_child_args(&args).expect("multi-target probe plan");
+        assert_eq!(plans.len(), 2);
+        for plan in plans {
+            let child_args = plan
+                .args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert!(child_args
+                .windows(2)
+                .any(|pair| pair == ["--input-latency-probes", "128"]));
+            assert!(!child_args.iter().any(|arg| arg == "--target"));
+        }
     }
 
     #[test]

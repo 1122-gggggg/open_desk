@@ -19,6 +19,7 @@ use std::collections::VecDeque;
 use std::error::Error;
 #[cfg(any(windows, test))]
 use std::future::Future;
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -90,6 +91,63 @@ impl InputLatencyProbeReport {
 fn nearest_rank(sorted: &[u64], percentile: usize) -> u64 {
     let rank = percentile.saturating_mul(sorted.len()).saturating_add(99) / 100;
     sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+fn format_input_latency_start(stamp: SessionStamp, target: SocketAddr, probe_count: u32) -> String {
+    format!(
+        "input-latency-start: target={target} session_id={} generation={} authorization_epoch={} display_epoch={} codec_epoch={} samples={probe_count}",
+        stamp.session_id,
+        stamp.generation,
+        stamp.authorization_epoch,
+        stamp.display_epoch,
+        stamp.codec_epoch,
+    )
+}
+
+fn format_input_latency_stop(stamp: SessionStamp, target: SocketAddr, probe_count: u32) -> String {
+    format!(
+        "input-latency-stop: target={target} session_id={} generation={} authorization_epoch={} display_epoch={} codec_epoch={} samples={probe_count}",
+        stamp.session_id,
+        stamp.generation,
+        stamp.authorization_epoch,
+        stamp.display_epoch,
+        stamp.codec_epoch,
+    )
+}
+
+fn emit_input_latency_line(line: &str) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    writeln!(output, "{line}")?;
+    output.flush()
+}
+
+fn format_input_latency_report(
+    stamp: SessionStamp,
+    target: SocketAddr,
+    report: &InputLatencyProbeReport,
+) -> String {
+    let raw = report
+        .samples
+        .iter()
+        .map(|(sequence, latency_us)| format!("{sequence}:{latency_us}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "input-latency: target={target} session_id={} generation={} authorization_epoch={} display_epoch={} codec_epoch={} samples={} min_us={} p50_us={} p95_us={} p99_us={} max_us={} mean_us={} raw_us={raw}",
+        stamp.session_id,
+        stamp.generation,
+        stamp.authorization_epoch,
+        stamp.display_epoch,
+        stamp.codec_epoch,
+        report.samples.len(),
+        report.minimum_us,
+        report.p50_us,
+        report.p95_us,
+        report.p99_us,
+        report.maximum_us,
+        report.mean_us,
+    )
 }
 
 fn validate_input_ack(
@@ -258,6 +316,7 @@ impl VideoCodecPreference {
 const fn platform_capability_flags() -> u16 {
     latencydesk_protocol::video_capability_flags::H264_HIGH_420
         | latencydesk_protocol::video_capability_flags::RAW_NV12
+        | latencydesk_protocol::video_capability_flags::INPUT_APPLIED_ACK
 }
 
 fn stream_config_is_offered(config: latencydesk_protocol::VideoStreamConfig, flags: u16) -> bool {
@@ -271,6 +330,16 @@ fn stream_config_is_offered(config: latencydesk_protocol::VideoStreamConfig, fla
             latencydesk_protocol::VideoProfile::RawNv12,
         ) => flags & latencydesk_protocol::video_capability_flags::RAW_NV12 != 0,
         _ => false,
+    }
+}
+
+fn require_input_ack_capability(
+    config: latencydesk_protocol::VideoStreamConfig,
+) -> Result<(), &'static str> {
+    if config.flags & latencydesk_protocol::video_stream_flags::INPUT_APPLIED_ACK != 0 {
+        Ok(())
+    } else {
+        Err("Host does not advertise input application acknowledgments; probes require a supported Linux Host")
     }
 }
 pub(crate) async fn negotiate_video_stream(
@@ -374,6 +443,7 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
         run_input_latency_probes(
             &runtime,
             &session,
+            selected_remote,
             args.input_latency_probes,
             operation_timeout,
         )
@@ -433,6 +503,7 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
 fn run_input_latency_probes(
     runtime: &tokio::runtime::Runtime,
     session: &ProductSession,
+    selected_remote: SocketAddr,
     probe_count: u32,
     operation_timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
@@ -441,12 +512,18 @@ fn run_input_latency_probes(
     let total_timeout = operation_timeout.min(CLIENT_INPUT_PROBE_TOTAL_TIMEOUT);
     let report = runtime.block_on(async {
         tokio::time::timeout(total_timeout, async {
-            let (_config, mut control) = negotiate_video_stream(session, operation_timeout).await?;
+            let (config, mut control) = negotiate_video_stream(session, operation_timeout).await?;
+            require_input_ack_capability(config)?;
             let reliable_timeout = reliable_operation_timeout(operation_timeout);
             let stamp = session.stamp();
             tokio::time::timeout(reliable_timeout, session.receive_media_frame())
                 .await
                 .map_err(|_| "input latency probe timed out waiting for the first media frame")??;
+            emit_input_latency_line(&format_input_latency_start(
+                stamp,
+                selected_remote,
+                probe_count,
+            ))?;
             let mut samples = Vec::with_capacity(probe_count as usize);
             for sequence in 1..=u64::from(probe_count) {
                 let payload = InputMessage {
@@ -492,6 +569,11 @@ fn run_input_latency_probes(
                 let latency_us = u64::try_from(sent_at.elapsed().as_micros()).unwrap_or(u64::MAX);
                 samples.push((sequence, latency_us));
             }
+            emit_input_latency_line(&format_input_latency_stop(
+                stamp,
+                selected_remote,
+                probe_count,
+            ))?;
             send_input_event(
                 session,
                 u64::from(probe_count).saturating_add(1),
@@ -506,24 +588,11 @@ fn run_input_latency_probes(
         .map_err(|_| format!("input latency probe exceeded its {total_timeout:?} total timeout"))?
     })?;
 
-    let raw = report
-        .samples
-        .iter()
-        .map(|(sequence, latency_us)| format!("{sequence}:{latency_us}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    println!(
-        "input-latency: session_id={} authorization_epoch={} samples={} min_us={} p50_us={} p95_us={} p99_us={} max_us={} mean_us={} raw_us={raw}",
-        session.stamp().session_id,
-        session.stamp().authorization_epoch,
-        report.samples.len(),
-        report.minimum_us,
-        report.p50_us,
-        report.p95_us,
-        report.p99_us,
-        report.maximum_us,
-        report.mean_us,
-    );
+    emit_input_latency_line(&format_input_latency_report(
+        session.stamp(),
+        selected_remote,
+        &report,
+    ))?;
     Ok(())
 }
 
@@ -2087,6 +2156,54 @@ mod tests {
         assert_eq!(report.p99_us, 50);
         assert_eq!(report.maximum_us, 50);
         assert_eq!(report.mean_us, 30);
+    }
+
+    #[test]
+    fn input_latency_lines_bind_the_exact_target_and_session() {
+        let stamp = SessionStamp {
+            session_id: 41,
+            generation: 2,
+            authorization_epoch: 3,
+            display_epoch: 4,
+            codec_epoch: 5,
+        };
+        let target = "127.0.0.1:9001".parse().expect("target");
+        let report =
+            InputLatencyProbeReport::from_samples(vec![(1, 10), (2, 20)]).expect("latency report");
+
+        assert_eq!(
+            format_input_latency_start(stamp, target, 2),
+            "input-latency-start: target=127.0.0.1:9001 session_id=41 generation=2 authorization_epoch=3 display_epoch=4 codec_epoch=5 samples=2"
+        );
+        assert_eq!(
+            format_input_latency_stop(stamp, target, 2),
+            "input-latency-stop: target=127.0.0.1:9001 session_id=41 generation=2 authorization_epoch=3 display_epoch=4 codec_epoch=5 samples=2"
+        );
+        let rendered = format_input_latency_report(stamp, target, &report);
+        assert!(rendered.starts_with(
+            "input-latency: target=127.0.0.1:9001 session_id=41 generation=2 authorization_epoch=3 display_epoch=4 codec_epoch=5 samples=2"
+        ));
+        assert!(rendered.ends_with("raw_us=1:10,2:20"));
+    }
+
+    #[test]
+    fn input_probe_requires_an_explicit_host_capability() {
+        let mut config = latencydesk_protocol::VideoStreamConfig {
+            contract_version: latencydesk_protocol::VIDEO_CODEC_CONTRACT_VERSION,
+            codec: latencydesk_protocol::VideoCodec::RawNv12,
+            profile: latencydesk_protocol::VideoProfile::RawNv12,
+            pixel_format: u32::from_le_bytes(*b"NV12"),
+            stream_id: 1,
+            codec_epoch: 1,
+            width: 320,
+            height: 180,
+            fps: 10,
+            target_bitrate_bps: 6_912_000,
+            flags: 0,
+        };
+        assert!(require_input_ack_capability(config).is_err());
+        config.flags = latencydesk_protocol::video_stream_flags::INPUT_APPLIED_ACK;
+        assert!(require_input_ack_capability(config).is_ok());
     }
 
     #[test]

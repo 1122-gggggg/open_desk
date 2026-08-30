@@ -430,6 +430,19 @@ pub mod video_capability_flags {
     pub const H264_HIGH_420: u16 = 1 << 0;
     /// Packed raw NV12 compatibility. Product peers must never infer this bit.
     pub const RAW_NV12: u16 = 1 << 1;
+    /// The Client understands and may request full-stamp input application
+    /// acknowledgments. A Host must intersect this with its platform support.
+    pub const INPUT_APPLIED_ACK: u16 = 1 << 2;
+}
+
+/// Host capabilities attached to the selected secure stream configuration.
+/// Unknown bits are protocol errors so a Client never infers support.
+pub mod video_stream_flags {
+    /// The Host can emit a full-stamp [`super::InputAppliedAck`] after platform
+    /// input application. Linux X11 advertises this only when that path exists.
+    pub const INPUT_APPLIED_ACK: u32 = 1 << 0;
+
+    pub(crate) const KNOWN: u32 = INPUT_APPLIED_ACK;
 }
 
 /// Fixed-size receiver codec offer carried by [`ControlKind::Capabilities`].
@@ -475,7 +488,9 @@ impl VideoCodecCapabilities {
     }
 
     fn validate(self) -> Result<(), ProtocolError> {
-        let known = video_capability_flags::H264_HIGH_420 | video_capability_flags::RAW_NV12;
+        let known = video_capability_flags::H264_HIGH_420
+            | video_capability_flags::RAW_NV12
+            | video_capability_flags::INPUT_APPLIED_ACK;
         if self.contract_version != VIDEO_CODEC_CONTRACT_VERSION {
             return Err(ProtocolError::UnsupportedCodecContract(
                 self.contract_version,
@@ -503,6 +518,11 @@ impl VideoCodecCapabilities {
     #[must_use]
     pub const fn offers_nv12(self) -> bool {
         self.flags & video_capability_flags::RAW_NV12 != 0
+    }
+
+    #[must_use]
+    pub const fn supports_input_applied_ack(self) -> bool {
+        self.flags & video_capability_flags::INPUT_APPLIED_ACK != 0
     }
 }
 
@@ -635,6 +655,10 @@ impl VideoStreamConfig {
         if !valid_pair || self.pixel_format != u32::from_le_bytes(*b"NV12") {
             return Err(ProtocolError::InvalidVideoProfile);
         }
+        let unknown_flags = self.flags & !video_stream_flags::KNOWN;
+        if unknown_flags != 0 {
+            return Err(ProtocolError::UnknownVideoStreamFlags(unknown_flags));
+        }
         if self.stream_id == 0
             || self.codec_epoch == 0
             || self.width == 0
@@ -643,7 +667,6 @@ impl VideoStreamConfig {
             || self.height % 2 != 0
             || self.fps == 0
             || self.target_bitrate_bps == 0
-            || self.flags != 0
         {
             return Err(ProtocolError::InvalidVideoGeometry);
         }
@@ -1805,6 +1828,7 @@ pub enum ProtocolError {
     UnknownStreamKind(u8),
     UnknownControlKind(u8),
     UnknownInputAckStatus(u8),
+    UnknownVideoStreamFlags(u32),
     UnknownFlags(u16),
     UnknownControlFlags(u16),
     ReservedBits,
@@ -2027,7 +2051,8 @@ mod tests {
     fn video_codec_contract_round_trip_is_explicit() {
         let capabilities = VideoCodecCapabilities {
             contract_version: VIDEO_CODEC_CONTRACT_VERSION,
-            flags: video_capability_flags::H264_HIGH_420,
+            flags: video_capability_flags::H264_HIGH_420
+                | video_capability_flags::INPUT_APPLIED_ACK,
             max_width: 3_840,
             max_height: 2_160,
             max_fps: 120,
@@ -2036,6 +2061,7 @@ mod tests {
             VideoCodecCapabilities::decode(&capabilities.encode().expect("capabilities")),
             Ok(capabilities)
         );
+        assert!(capabilities.supports_input_applied_ack());
 
         let config = VideoStreamConfig {
             contract_version: VIDEO_CODEC_CONTRACT_VERSION,
@@ -2053,6 +2079,27 @@ mod tests {
         assert_eq!(
             VideoStreamConfig::decode(&config.encode().expect("config")),
             Ok(config)
+        );
+
+        let input_ack_capable = VideoStreamConfig {
+            flags: video_stream_flags::INPUT_APPLIED_ACK,
+            ..config
+        };
+        assert_eq!(
+            VideoStreamConfig::decode(
+                &input_ack_capable
+                    .encode()
+                    .expect("input ACK capability config")
+            ),
+            Ok(input_ack_capable)
+        );
+        let unknown = VideoStreamConfig {
+            flags: 1 << 31,
+            ..config
+        };
+        assert_eq!(
+            unknown.encode(),
+            Err(ProtocolError::UnknownVideoStreamFlags(1 << 31))
         );
     }
 

@@ -447,7 +447,11 @@ mod linux {
                 height: geometry.out_height,
                 fps,
                 target_bitrate_bps,
-                flags: 0,
+                flags: if capabilities.supports_input_applied_ack() {
+                    latencydesk_protocol::video_stream_flags::INPUT_APPLIED_ACK
+                } else {
+                    0
+                },
             };
             session
                 .send_control(ControlKind::ConfigureStream, &config.encode()?)
