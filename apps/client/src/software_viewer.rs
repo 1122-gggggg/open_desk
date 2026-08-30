@@ -3,19 +3,111 @@
 //! Decodes negotiated H.264 with OpenH264 or presents packed NV12, then shows
 //! RGB through minifb so Linux and macOS can drive a real window and input.
 
-use crate::secure::{negotiate_video_stream, send_input_event};
+use crate::secure::{is_clean_peer_close, negotiate_video_stream, send_input_event};
 use latencydesk_h264::SoftwareH264Decoder;
 use latencydesk_input::{InputEvent, InputState};
 use latencydesk_platform_linux::nv12_to_argb_u32;
 use latencydesk_protocol::VideoCodec;
 use latencydesk_socket_transport::product::ProductSession;
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::error::Error;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 const SNAPSHOT_CADENCE: Duration = Duration::from_millis(500);
+const MAX_VIEWER_FPS: u32 = 120;
+const MAX_PENDING_RELIABLE_INPUT: usize = 256;
+
+fn viewer_fps(negotiated: u32) -> usize {
+    negotiated.clamp(1, MAX_VIEWER_FPS) as usize
+}
+
+#[derive(Default)]
+struct PointerPosition(Option<(u32, u32)>);
+
+impl PointerPosition {
+    fn changed(&mut self, position: (u32, u32)) -> bool {
+        if self.0 == Some(position) {
+            false
+        } else {
+            self.0 = Some(position);
+            true
+        }
+    }
+}
+
+fn flush_pending_motion(
+    input_tx: &tokio::sync::mpsc::Sender<InputEvent>,
+    pending: &mut Option<InputEvent>,
+) -> Result<(), &'static str> {
+    let Some(event) = pending.take() else {
+        return Ok(());
+    };
+    match input_tx.try_send(event) {
+        Ok(()) => Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+            *pending = Some(event);
+            Ok(())
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err("input lane closed"),
+    }
+}
+
+struct PendingReliableInput {
+    events: VecDeque<InputEvent>,
+    max_events: usize,
+}
+
+impl PendingReliableInput {
+    fn new(max_events: usize) -> Self {
+        Self {
+            events: VecDeque::with_capacity(max_events.max(1)),
+            max_events: max_events.max(1),
+        }
+    }
+
+    /// Returns true when discrete events had to be coalesced into the latest
+    /// complete input state to preserve a hard memory bound.
+    fn push(&mut self, event: InputEvent, held: &InputState) -> bool {
+        if self.events.len() < self.max_events {
+            self.events.push_back(event);
+            return false;
+        }
+        self.events.clear();
+        self.events.push_back(InputEvent::Snapshot(held.clone()));
+        true
+    }
+
+    fn flush(
+        &mut self,
+        input_tx: &tokio::sync::mpsc::Sender<InputEvent>,
+    ) -> Result<(), &'static str> {
+        while let Some(event) = self.events.pop_front() {
+            match input_tx.try_send(event) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                    self.events.push_front(event);
+                    break;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err("input lane closed")
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    #[cfg(test)]
+    fn front(&self) -> Option<&InputEvent> {
+        self.events.front()
+    }
+}
 
 pub fn run(
     runtime: &tokio::runtime::Runtime,
@@ -38,7 +130,7 @@ pub fn run(
     {
         return Err("first media frame does not match negotiated stream".into());
     }
-    let mut pixels = Vec::new();
+    let mut pixels = Vec::with_capacity(width.saturating_mul(height));
     present_payload(
         config.codec,
         config.width,
@@ -57,7 +149,7 @@ pub fn run(
             ..WindowOptions::default()
         },
     )?;
-    window.set_target_fps(0);
+    window.set_target_fps(viewer_fps(config.fps));
     window.update_with_buffer(&pixels, width, height)?;
 
     println!(
@@ -97,8 +189,11 @@ pub fn run(
     let mut held = InputState::default();
     let mut prev_keys = HashSet::<Key>::new();
     let mut prev_buttons = [false; 3];
+    let mut pointer_position = PointerPosition::default();
+    let mut pending_motion = None;
+    let mut pending_reliable = PendingReliableInput::new(MAX_PENDING_RELIABLE_INPUT);
     let mut ui_error = None;
-    while window.is_open() && !window.is_key_down(Key::Escape) {
+    'viewer: while window.is_open() && !window.is_key_down(Key::Escape) {
         match done_rx.try_recv() {
             Ok(Err(error)) => {
                 ui_error = Some(error);
@@ -108,7 +203,14 @@ pub fn run(
             Err(mpsc::TryRecvError::Empty) => {}
         }
 
-        if let Some(bytes) = latest.lock().ok().and_then(|mut slot| slot.take()) {
+        let latest_bytes = match latest.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => {
+                ui_error = Some("latest-frame slot lock was poisoned".to_owned());
+                break;
+            }
+        };
+        if let Some(bytes) = latest_bytes {
             if let Err(error) = present_payload(
                 config.codec,
                 config.width,
@@ -120,23 +222,38 @@ pub fn run(
                 ui_error = Some(error.to_string());
                 break;
             }
-            if window.update_with_buffer(&pixels, width, height).is_err() {
+            if let Err(error) = window.update_with_buffer(&pixels, width, height) {
+                ui_error = Some(format!("window presentation failed: {error}"));
                 break;
             }
         } else {
             window.update();
         }
 
+        if let Err(error) = pending_reliable.flush(&input_tx) {
+            ui_error = Some(error.to_owned());
+            break;
+        }
+        if let Err(error) = flush_pending_motion(&input_tx, &mut pending_motion) {
+            ui_error = Some(error.to_owned());
+            break;
+        }
+
         if let Some((x, y)) = window.get_mouse_pos(MouseMode::Clamp) {
-            let event = InputEvent::PointerMotionAbsolute {
-                x: x as u32,
-                y: y as u32,
-                width: config.width,
-                height: config.height,
-            };
-            apply_held(&mut held, &event);
-            if input_tx.try_send(event).is_err() {
-                break;
+            let position = (x as u32, y as u32);
+            if pointer_position.changed(position) {
+                let event = InputEvent::PointerMotionAbsolute {
+                    x: position.0,
+                    y: position.1,
+                    width: config.width,
+                    height: config.height,
+                };
+                apply_held(&mut held, &event);
+                pending_motion = Some(event);
+                if let Err(error) = flush_pending_motion(&input_tx, &mut pending_motion) {
+                    ui_error = Some(error.to_owned());
+                    break 'viewer;
+                }
             }
         }
         for (index, button) in [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
@@ -151,9 +268,14 @@ pub fn run(
                     pressed,
                 };
                 apply_held(&mut held, &event);
-                if input_tx.try_send(event).is_err() {
-                    ui_error = Some("input lane closed".to_owned());
-                    break;
+                if pending_reliable.push(event, &held) {
+                    eprintln!(
+                        "input: reliable queue saturated; coalesced to the latest state snapshot"
+                    );
+                }
+                if let Err(error) = pending_reliable.flush(&input_tx) {
+                    ui_error = Some(error.to_owned());
+                    break 'viewer;
                 }
             }
         }
@@ -165,7 +287,15 @@ pub fn run(
                     pressed: true,
                 };
                 apply_held(&mut held, &event);
-                let _ = input_tx.try_send(event);
+                if pending_reliable.push(event, &held) {
+                    eprintln!(
+                        "input: reliable queue saturated; coalesced to the latest state snapshot"
+                    );
+                }
+                if let Err(error) = pending_reliable.flush(&input_tx) {
+                    ui_error = Some(error.to_owned());
+                    break 'viewer;
+                }
             }
         }
         for key in prev_keys.difference(&keys) {
@@ -175,14 +305,22 @@ pub fn run(
                     pressed: false,
                 };
                 apply_held(&mut held, &event);
-                let _ = input_tx.try_send(event);
+                if pending_reliable.push(event, &held) {
+                    eprintln!(
+                        "input: reliable queue saturated; coalesced to the latest state snapshot"
+                    );
+                }
+                if let Err(error) = pending_reliable.flush(&input_tx) {
+                    ui_error = Some(error.to_owned());
+                    break 'viewer;
+                }
             }
         }
         prev_keys = keys;
     }
 
     let _ = shutdown_tx.send(());
-    let _ = input_tx.try_send(InputEvent::ReleaseAll);
+    // The network loop owns ReleaseAll and sends it after observing shutdown.
     let network_result = match runtime
         .block_on(async { tokio::time::timeout(Duration::from_secs(5), &mut network_task).await })
     {
@@ -208,13 +346,14 @@ fn present_payload(
     decoder: Option<&mut SoftwareH264Decoder>,
     pixels: &mut Vec<u32>,
 ) -> Result<(), Box<dyn Error>> {
-    let nv12 = match codec {
+    match codec {
         VideoCodec::H264 => {
             let decoder = decoder.ok_or("H.264 decoder missing")?;
-            match decoder.decode_annex_b(bytes)? {
-                Some(frame) => frame.nv12,
+            let frame = match decoder.decode_annex_b(bytes)? {
+                Some(frame) => frame,
                 None => return Ok(()),
-            }
+            };
+            nv12_to_argb_u32(width, height, &frame.nv12, pixels)?;
         }
         VideoCodec::RawNv12 => {
             let (parsed_w, parsed_h, nv12) =
@@ -222,10 +361,9 @@ fn present_payload(
             if (parsed_w, parsed_h) != (width, height) {
                 return Err("NV12 geometry does not match negotiated stream".into());
             }
-            nv12.to_vec()
+            nv12_to_argb_u32(width, height, nv12, pixels)?;
         }
-    };
-    nv12_to_argb_u32(width, height, &nv12, pixels)?;
+    }
     Ok(())
 }
 
@@ -248,37 +386,52 @@ async fn network_loop(
                 let Some(event) = event else { break };
                 apply_held(&mut held, &event);
                 sequence = sequence.saturating_add(1);
-                send_input_event(&session, sequence, event, timeout)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                if let Err(error) = send_input_event(&session, sequence, event, timeout).await {
+                    if is_clean_peer_close(error.as_ref()) {
+                        break;
+                    }
+                    return Err(error.to_string());
+                }
             }
             _ = snapshot.tick() => {
                 sequence = sequence.saturating_add(1);
-                send_input_event(
+                if let Err(error) = send_input_event(
                     &session,
                     sequence,
                     InputEvent::Snapshot(held.clone()),
                     timeout,
                 )
-                .await
-                .map_err(|error| error.to_string())?;
+                .await {
+                    if is_clean_peer_close(error.as_ref()) {
+                        break;
+                    }
+                    return Err(error.to_string());
+                }
             }
             frame = session.receive_media_frame() => {
-                let frame = frame.map_err(|error| error.to_string())?;
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(error) if is_clean_peer_close(&error) => break,
+                    Err(error) => return Err(error.to_string()),
+                };
                 if frame.header.stream_id != config.stream_id
                     || frame.header.codec_epoch != config.codec_epoch
                 {
                     return Err("media frame does not match negotiated stream".to_owned());
                 }
-                if let Ok(mut slot) = latest.lock() {
-                    *slot = Some(frame.bytes);
-                }
+                let mut slot = latest
+                    .lock()
+                    .map_err(|_| "latest-frame slot lock was poisoned".to_owned())?;
+                *slot = Some(frame.bytes);
             }
         }
     }
     sequence = sequence.saturating_add(1);
-    let _ = send_input_event(&session, sequence, InputEvent::ReleaseAll, timeout).await;
-    Ok(())
+    match send_input_event(&session, sequence, InputEvent::ReleaseAll, timeout).await {
+        Ok(()) => Ok(()),
+        Err(error) if is_clean_peer_close(error.as_ref()) => Ok(()),
+        Err(error) => Err(format!("failed to release input state: {error}")),
+    }
 }
 
 fn apply_held(state: &mut InputState, event: &InputEvent) {
@@ -347,4 +500,91 @@ fn hid_usage(key: Key) -> Option<u16> {
         Key::LeftAlt => 0xe2,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pacing_is_bounded_and_never_zero() {
+        assert_eq!(viewer_fps(0), 1);
+        assert_eq!(viewer_fps(60), 60);
+        assert_eq!(viewer_fps(u32::MAX), MAX_VIEWER_FPS as usize);
+    }
+
+    #[test]
+    fn pointer_motion_only_emits_when_position_changes() {
+        let mut pointer = PointerPosition::default();
+        assert!(pointer.changed((1, 2)));
+        assert!(!pointer.changed((1, 2)));
+        assert!(pointer.changed((2, 2)));
+    }
+
+    #[test]
+    fn pointer_motion_keeps_the_latest_position_while_the_queue_is_full() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender.try_send(InputEvent::ReleaseAll).expect("fill queue");
+        let mut pending = Some(InputEvent::PointerMotionAbsolute {
+            x: 10,
+            y: 20,
+            width: 640,
+            height: 360,
+        });
+
+        flush_pending_motion(&sender, &mut pending).expect("full queue is not fatal");
+        pending = Some(InputEvent::PointerMotionAbsolute {
+            x: 30,
+            y: 40,
+            width: 640,
+            height: 360,
+        });
+        assert!(matches!(receiver.try_recv(), Ok(InputEvent::ReleaseAll)));
+        flush_pending_motion(&sender, &mut pending).expect("flush latest");
+
+        assert!(pending.is_none());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(InputEvent::PointerMotionAbsolute { x: 30, y: 40, .. })
+        ));
+    }
+
+    #[test]
+    fn reliable_input_overflow_coalesces_to_the_latest_state_snapshot() {
+        let mut queue = PendingReliableInput::new(2);
+        let mut held = InputState::default();
+        held.set_key(4, true).expect("hold A");
+        assert!(!queue.push(
+            InputEvent::Key {
+                code: 4,
+                pressed: true,
+            },
+            &held,
+        ));
+        held.set_key(5, true).expect("hold B");
+        assert!(!queue.push(
+            InputEvent::Key {
+                code: 5,
+                pressed: true,
+            },
+            &held,
+        ));
+        held.set_button(0, true).expect("hold button");
+        assert!(queue.push(
+            InputEvent::PointerButton {
+                button: 0,
+                pressed: true,
+            },
+            &held,
+        ));
+
+        assert_eq!(queue.len(), 1);
+        assert!(matches!(
+            queue.front(),
+            Some(InputEvent::Snapshot(snapshot))
+                if snapshot.key_pressed(4)
+                    && snapshot.key_pressed(5)
+                    && snapshot.button_pressed(0)
+        ));
+    }
 }

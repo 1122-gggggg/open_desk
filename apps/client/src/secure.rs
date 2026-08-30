@@ -5,7 +5,6 @@ use latencydesk_input::{InputEvent, InputMessage};
 use latencydesk_socket_transport::identity::{
     connect_exact_peer, load_certificate_der, mtls_client_config, TlsIdentity,
 };
-#[cfg(any(windows, test))]
 use latencydesk_socket_transport::product::ProductSessionError;
 use latencydesk_socket_transport::product::{ControlReceiver, ProductSession};
 use latencydesk_socket_transport::quic::bind_client;
@@ -1199,8 +1198,7 @@ where
     }
 }
 
-#[cfg(any(windows, test))]
-fn is_clean_peer_close(error: &(dyn Error + 'static)) -> bool {
+pub(crate) fn is_clean_peer_close(error: &(dyn Error + 'static)) -> bool {
     matches!(
         error.downcast_ref::<ProductSessionError>(),
         Some(ProductSessionError::Quic(transport)) if transport.is_clean_application_close()
@@ -1858,6 +1856,20 @@ mod tests {
             .await,
             NetworkWork::Snapshot
         );
+    }
+
+    #[test]
+    fn recovery_requests_are_rate_limited_after_the_first_request() {
+        let now = tokio::time::Instant::now();
+        assert!(recovery_request_due(None, now));
+        assert!(!recovery_request_due(
+            Some(now - RECOVERY_REQUEST_INTERVAL / 2),
+            now
+        ));
+        assert!(recovery_request_due(
+            Some(now - RECOVERY_REQUEST_INTERVAL),
+            now
+        ));
     }
 
     #[cfg(windows)]
