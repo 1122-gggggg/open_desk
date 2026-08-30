@@ -679,6 +679,9 @@ dependencies = [
 [[package]]
 name = "latencydesk-protocol"
 version = "0.1.0-alpha.2"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "latencydesk-runtime"

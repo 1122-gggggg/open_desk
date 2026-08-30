@@ -5,6 +5,7 @@
 //! trailing bytes so datagram boundaries remain unambiguous.
 
 use core::fmt;
+use zeroize::{Zeroize, Zeroizing};
 
 pub mod quic;
 pub mod stun;
@@ -250,6 +251,7 @@ pub enum ControlKind {
     Pairing = 18,
     Disconnect = 19,
     UnattendedAuth = 20,
+    IceCredentials = 21,
 }
 
 impl TryFrom<u8> for ControlKind {
@@ -277,6 +279,7 @@ impl TryFrom<u8> for ControlKind {
             18 => Ok(Self::Pairing),
             19 => Ok(Self::Disconnect),
             20 => Ok(Self::UnattendedAuth),
+            21 => Ok(Self::IceCredentials),
             other => Err(ProtocolError::UnknownControlKind(other)),
         }
     }
@@ -437,6 +440,8 @@ pub mod video_capability_flags {
     /// Client accepts authenticated candidate advertisements only; this does
     /// not select routes or claim ICE completion.
     pub const AUTHENTICATED_CANDIDATE_EXCHANGE: u16 = 1 << 3;
+    /// Authenticated ICE credentials for signaling only; no connectivity claim.
+    pub const AUTHENTICATED_ICE_CREDENTIALS: u16 = 1 << 4;
 }
 
 /// Host capabilities attached to the selected secure stream configuration.
@@ -448,8 +453,11 @@ pub mod video_stream_flags {
     /// Host may emit authenticated candidate advertisements only; this does
     /// not select routes or claim ICE completion.
     pub const AUTHENTICATED_CANDIDATE_EXCHANGE: u32 = 1 << 1;
+    /// Authenticated ICE credentials for signaling only; no connectivity claim.
+    pub const AUTHENTICATED_ICE_CREDENTIALS: u32 = 1 << 2;
 
-    pub(crate) const KNOWN: u32 = INPUT_APPLIED_ACK | AUTHENTICATED_CANDIDATE_EXCHANGE;
+    pub(crate) const KNOWN: u32 =
+        INPUT_APPLIED_ACK | AUTHENTICATED_CANDIDATE_EXCHANGE | AUTHENTICATED_ICE_CREDENTIALS;
 }
 
 /// Fixed-size receiver codec offer carried by [`ControlKind::Capabilities`].
@@ -498,7 +506,8 @@ impl VideoCodecCapabilities {
         let known = video_capability_flags::H264_HIGH_420
             | video_capability_flags::RAW_NV12
             | video_capability_flags::INPUT_APPLIED_ACK
-            | video_capability_flags::AUTHENTICATED_CANDIDATE_EXCHANGE;
+            | video_capability_flags::AUTHENTICATED_CANDIDATE_EXCHANGE
+            | video_capability_flags::AUTHENTICATED_ICE_CREDENTIALS;
         if self.contract_version != VIDEO_CODEC_CONTRACT_VERSION {
             return Err(ProtocolError::UnsupportedCodecContract(
                 self.contract_version,
@@ -536,6 +545,11 @@ impl VideoCodecCapabilities {
     #[must_use]
     pub const fn supports_authenticated_candidate_exchange(self) -> bool {
         self.flags & video_capability_flags::AUTHENTICATED_CANDIDATE_EXCHANGE != 0
+    }
+
+    #[must_use]
+    pub const fn supports_authenticated_ice_credentials(self) -> bool {
+        self.flags & video_capability_flags::AUTHENTICATED_ICE_CREDENTIALS != 0
     }
 }
 
@@ -659,6 +673,11 @@ impl VideoStreamConfig {
         self.flags & video_stream_flags::AUTHENTICATED_CANDIDATE_EXCHANGE != 0
     }
 
+    #[must_use]
+    pub const fn supports_authenticated_ice_credentials(self) -> bool {
+        self.flags & video_stream_flags::AUTHENTICATED_ICE_CREDENTIALS != 0
+    }
+
     fn validate(self) -> Result<(), ProtocolError> {
         if self.contract_version != VIDEO_CODEC_CONTRACT_VERSION {
             return Err(ProtocolError::UnsupportedCodecContract(
@@ -676,6 +695,11 @@ impl VideoStreamConfig {
         let unknown_flags = self.flags & !video_stream_flags::KNOWN;
         if unknown_flags != 0 {
             return Err(ProtocolError::UnknownVideoStreamFlags(unknown_flags));
+        }
+        if self.supports_authenticated_candidate_exchange()
+            && self.supports_authenticated_ice_credentials()
+        {
+            return Err(ProtocolError::ConflictingIceSignalingModes);
         }
         if self.stream_id == 0
             || self.codec_epoch == 0
@@ -1542,6 +1566,230 @@ pub struct CandidateExchange {
     pub candidates: Vec<IceCandidate>,
 }
 
+/// Role used by the authenticated ICE credential signaling exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum IceCredentialRole {
+    Controlling = 1,
+    Controlled = 2,
+}
+
+impl TryFrom<u8> for IceCredentialRole {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Controlling),
+            2 => Ok(Self::Controlled),
+            other => Err(ProtocolError::InvalidIceCredentialRole(other)),
+        }
+    }
+}
+
+/// Version-one ICE credentials. This is signaling only: it does not claim
+/// candidate pair checks, NAT traversal, relay use, or connectivity.
+pub struct IceCredentialExchange {
+    pub version: u8,
+    pub exchange_id: u64,
+    pub generation: u32,
+    pub role: IceCredentialRole,
+    ufrag: String,
+    password: String,
+}
+
+impl fmt::Debug for IceCredentialExchange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IceCredentialExchange")
+            .field("version", &self.version)
+            .field("exchange_id", &self.exchange_id)
+            .field("generation", &self.generation)
+            .field("role", &self.role)
+            .field("ufrag", &"<redacted>")
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+impl PartialEq for IceCredentialExchange {
+    fn eq(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.exchange_id == other.exchange_id
+            && self.generation == other.generation
+            && self.role == other.role
+            && self.ufrag == other.ufrag
+            && self.password == other.password
+    }
+}
+impl Eq for IceCredentialExchange {}
+
+impl Drop for IceCredentialExchange {
+    fn drop(&mut self) {
+        self.ufrag.zeroize();
+        self.password.zeroize();
+    }
+}
+
+impl IceCredentialExchange {
+    pub const VERSION: u8 = 1;
+    const HEADER_LEN: usize = 18;
+    pub const MIN_UFRAG_LEN: usize = 4;
+    pub const MAX_UFRAG_LEN: usize = 64;
+    pub const MIN_PASSWORD_LEN: usize = 22;
+    pub const MAX_PASSWORD_LEN: usize = 128;
+
+    pub fn new(
+        version: u8,
+        exchange_id: u64,
+        generation: u32,
+        role: IceCredentialRole,
+        ufrag: String,
+        password: String,
+    ) -> Result<Self, ProtocolError> {
+        let value = Self {
+            version,
+            exchange_id,
+            generation,
+            role,
+            ufrag,
+            password,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn ufrag(&self) -> &str {
+        &self.ufrag
+    }
+    pub const fn password_len(&self) -> usize {
+        self.password.len()
+    }
+    pub fn with_password<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        f(&self.password)
+    }
+
+    pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>, ProtocolError> {
+        self.validate()?;
+        let mut out = Zeroizing::new(Vec::with_capacity(
+            Self::HEADER_LEN + self.ufrag.len() + self.password.len(),
+        ));
+        out.push(self.version);
+        out.extend_from_slice(&self.exchange_id.to_be_bytes());
+        out.extend_from_slice(&self.generation.to_be_bytes());
+        out.push(self.role as u8);
+        out.extend_from_slice(&(self.ufrag.len() as u16).to_be_bytes());
+        out.extend_from_slice(&(self.password.len() as u16).to_be_bytes());
+        out.extend_from_slice(self.ufrag.as_bytes());
+        out.extend_from_slice(self.password.as_bytes());
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        if bytes.len() > MAX_CONTROL_BYTES as usize {
+            return Err(ProtocolError::ControlLength(
+                u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+            ));
+        }
+        if bytes.len() < Self::HEADER_LEN {
+            return Err(ProtocolError::Truncated {
+                expected: Self::HEADER_LEN,
+                actual: bytes.len(),
+            });
+        }
+        let ulen = read_u16(bytes, 14) as usize;
+        let plen = read_u16(bytes, 16) as usize;
+        if !(Self::MIN_UFRAG_LEN..=Self::MAX_UFRAG_LEN).contains(&ulen) {
+            return Err(ProtocolError::InvalidIceCredentialUfrag);
+        }
+        if !(Self::MIN_PASSWORD_LEN..=Self::MAX_PASSWORD_LEN).contains(&plen) {
+            return Err(ProtocolError::InvalidIceCredentialPassword);
+        }
+        let expected = Self::HEADER_LEN
+            .checked_add(ulen)
+            .and_then(|n| n.checked_add(plen))
+            .ok_or(ProtocolError::PacketLength)?;
+        if bytes.len() != expected {
+            return Err(ProtocolError::PayloadLength {
+                expected,
+                actual: bytes.len(),
+            });
+        }
+        let version = bytes[0];
+        if version != Self::VERSION {
+            return Err(ProtocolError::UnsupportedVersion(version));
+        }
+        let exchange_id = read_u64(bytes, 1);
+        if exchange_id == 0 {
+            return Err(ProtocolError::InvalidIceCredentialExchangeId);
+        }
+        let generation = read_u32(bytes, 9);
+        if generation == 0 {
+            return Err(ProtocolError::InvalidIceCredentialGeneration);
+        }
+        let role = IceCredentialRole::try_from(bytes[13])?;
+        let split = Self::HEADER_LEN + ulen;
+        if !ice_bytes_charset(&bytes[Self::HEADER_LEN..split]) {
+            return Err(ProtocolError::InvalidIceCredentialUfrag);
+        }
+        if !ice_bytes_charset(&bytes[split..]) {
+            return Err(ProtocolError::InvalidIceCredentialPassword);
+        }
+        let mut ufrag = secret_string_from_bytes(&bytes[Self::HEADER_LEN..split])?;
+        let password = match secret_string_from_bytes(&bytes[split..]) {
+            Ok(password) => password,
+            Err(error) => {
+                ufrag.zeroize();
+                return Err(error);
+            }
+        };
+        Self::new(version, exchange_id, generation, role, ufrag, password)
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.version != Self::VERSION {
+            return Err(ProtocolError::UnsupportedVersion(self.version));
+        }
+        if self.exchange_id == 0 {
+            return Err(ProtocolError::InvalidIceCredentialExchangeId);
+        }
+        if self.generation == 0 {
+            return Err(ProtocolError::InvalidIceCredentialGeneration);
+        }
+        if !(Self::MIN_UFRAG_LEN..=Self::MAX_UFRAG_LEN).contains(&self.ufrag.len())
+            || !ice_charset(&self.ufrag)
+        {
+            return Err(ProtocolError::InvalidIceCredentialUfrag);
+        }
+        if !(Self::MIN_PASSWORD_LEN..=Self::MAX_PASSWORD_LEN).contains(&self.password.len())
+            || !ice_charset(&self.password)
+        {
+            return Err(ProtocolError::InvalidIceCredentialPassword);
+        }
+        Ok(())
+    }
+}
+
+fn secret_string_from_bytes(bytes: &[u8]) -> Result<String, ProtocolError> {
+    match String::from_utf8(bytes.to_vec()) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let mut rejected = error.into_bytes();
+            rejected.zeroize();
+            Err(ProtocolError::InvalidIceCredentialCharset)
+        }
+    }
+}
+
+fn ice_charset(value: &str) -> bool {
+    ice_bytes_charset(value.as_bytes())
+}
+
+fn ice_bytes_charset(value: &[u8]) -> bool {
+    value
+        .iter()
+        .copied()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/'))
+}
+
 impl CandidateExchange {
     pub const VERSION: u8 = 1;
     pub const MAX_CANDIDATES: usize = 8;
@@ -1988,6 +2236,7 @@ pub enum ProtocolError {
     UnknownControlKind(u8),
     UnknownInputAckStatus(u8),
     UnknownVideoStreamFlags(u32),
+    ConflictingIceSignalingModes,
     UnknownFlags(u16),
     UnknownControlFlags(u16),
     ReservedBits,
@@ -2052,6 +2301,12 @@ pub enum ProtocolError {
     InvalidCandidateAddress,
     InvalidCandidateExchangeId,
     InvalidCandidateGeneration,
+    InvalidIceCredentialExchangeId,
+    InvalidIceCredentialGeneration,
+    InvalidIceCredentialRole(u8),
+    InvalidIceCredentialUfrag,
+    InvalidIceCredentialPassword,
+    InvalidIceCredentialCharset,
     CandidateExchangeCount(usize),
     CandidateExchangeLength(usize),
     DuplicateCandidate,
@@ -2828,5 +3083,214 @@ mod tests {
         let encoded = token.encode();
         let decoded = UnattendedTokenWire::decode(&encoded).expect("decode");
         assert_eq!(decoded, token);
+    }
+
+    fn ice_creds(ulen: usize, plen: usize) -> IceCredentialExchange {
+        IceCredentialExchange::new(
+            1,
+            7,
+            3,
+            IceCredentialRole::Controlling,
+            "A".repeat(ulen),
+            "B".repeat(plen),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ice_credentials_round_trip_and_debug_redaction() {
+        let value = IceCredentialExchange::new(
+            1,
+            9,
+            2,
+            IceCredentialRole::Controlled,
+            "uFrag".into(),
+            "secretpasswordABCDEFGHIJKLMNOP".into(),
+        )
+        .unwrap();
+        let encoded = value.encode().unwrap();
+        assert_eq!(IceCredentialExchange::decode(&encoded).unwrap(), value);
+        let debug = format!("{value:?}");
+        assert!(!debug.contains("uFrag") && !debug.contains("secretpassword"));
+        assert_eq!(value.password_len(), 30);
+        assert_eq!(value.with_password(|p| p.len()), 30);
+    }
+
+    #[test]
+    fn ice_credentials_boundaries_and_invalid_fields() {
+        assert!(ice_creds(4, 22).encode().is_ok());
+        assert!(ice_creds(64, 128).encode().is_ok());
+        for version in [0, 2] {
+            assert_eq!(
+                IceCredentialExchange::new(
+                    version,
+                    1,
+                    1,
+                    IceCredentialRole::Controlling,
+                    "ABCD".into(),
+                    "ABCDEFGHIJKLMNOPQRSTUV".into()
+                )
+                .unwrap_err(),
+                ProtocolError::UnsupportedVersion(version)
+            );
+        }
+        assert!(matches!(
+            IceCredentialExchange::new(
+                1,
+                0,
+                1,
+                IceCredentialRole::Controlling,
+                "ABCD".into(),
+                "ABCDEFGHIJKLMNOPQRSTUV".into()
+            ),
+            Err(ProtocolError::InvalidIceCredentialExchangeId)
+        ));
+        assert!(matches!(
+            IceCredentialExchange::new(
+                1,
+                1,
+                0,
+                IceCredentialRole::Controlling,
+                "ABCD".into(),
+                "ABCDEFGHIJKLMNOPQRSTUV".into()
+            ),
+            Err(ProtocolError::InvalidIceCredentialGeneration)
+        ));
+        assert!(IceCredentialExchange::new(
+            1,
+            7,
+            3,
+            IceCredentialRole::Controlling,
+            "AAA".into(),
+            "B".repeat(22)
+        )
+        .is_err());
+        assert!(IceCredentialExchange::new(
+            1,
+            7,
+            3,
+            IceCredentialRole::Controlling,
+            "A".repeat(65),
+            "B".repeat(22)
+        )
+        .is_err());
+        assert!(IceCredentialExchange::new(
+            1,
+            7,
+            3,
+            IceCredentialRole::Controlling,
+            "AAAA".into(),
+            "B".repeat(21)
+        )
+        .is_err());
+        assert!(IceCredentialExchange::new(
+            1,
+            7,
+            3,
+            IceCredentialRole::Controlling,
+            "AAAA".into(),
+            "B".repeat(129)
+        )
+        .is_err());
+        assert!(IceCredentialExchange::new(
+            1,
+            1,
+            1,
+            IceCredentialRole::Controlling,
+            "AB-D".into(),
+            "ABCDEFGHIJKLMNOPQRSTUV".into()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ice_credentials_decode_is_exact_and_bounded() {
+        let encoded = ice_creds(4, 22).encode().unwrap();
+        for end in 0..18 {
+            assert!(IceCredentialExchange::decode(&encoded[..end]).is_err());
+        }
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(matches!(
+            IceCredentialExchange::decode(&trailing),
+            Err(ProtocolError::PayloadLength { .. })
+        ));
+        let mut declared = encoded.clone();
+        declared[14..16].copy_from_slice(&5u16.to_be_bytes());
+        assert!(IceCredentialExchange::decode(&declared).is_err());
+        let mut oversized_ufrag = encoded.clone();
+        oversized_ufrag[14..16].copy_from_slice(&65u16.to_be_bytes());
+        assert!(matches!(
+            IceCredentialExchange::decode(&oversized_ufrag),
+            Err(ProtocolError::InvalidIceCredentialUfrag)
+        ));
+        let mut oversized_password = encoded.clone();
+        oversized_password[16..18].copy_from_slice(&129u16.to_be_bytes());
+        assert!(matches!(
+            IceCredentialExchange::decode(&oversized_password),
+            Err(ProtocolError::InvalidIceCredentialPassword)
+        ));
+        let mut invalid_ufrag = encoded.clone();
+        invalid_ufrag[18] = b'-';
+        assert!(matches!(
+            IceCredentialExchange::decode(&invalid_ufrag),
+            Err(ProtocolError::InvalidIceCredentialUfrag)
+        ));
+        assert!(matches!(
+            IceCredentialExchange::decode(&vec![0; MAX_CONTROL_BYTES as usize + 1]),
+            Err(ProtocolError::ControlLength(_))
+        ));
+        let mut role = encoded;
+        role[13] = 9;
+        assert!(matches!(
+            IceCredentialExchange::decode(&role),
+            Err(ProtocolError::InvalidIceCredentialRole(9))
+        ));
+    }
+
+    #[test]
+    fn ice_credentials_capability_flags_are_explicit() {
+        let c = VideoCodecCapabilities {
+            contract_version: 1,
+            flags: video_capability_flags::H264_HIGH_420
+                | video_capability_flags::AUTHENTICATED_ICE_CREDENTIALS,
+            max_width: 2,
+            max_height: 2,
+            max_fps: 1,
+        };
+        assert!(c.supports_authenticated_ice_credentials());
+        let selected = VideoStreamConfig {
+            contract_version: 1,
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264High420,
+            pixel_format: u32::from_le_bytes(*b"NV12"),
+            stream_id: 1,
+            codec_epoch: 1,
+            width: 2,
+            height: 2,
+            fps: 1,
+            target_bitrate_bps: 1,
+            flags: video_stream_flags::AUTHENTICATED_ICE_CREDENTIALS,
+        };
+        assert!(VideoStreamConfig::decode(&selected.encode().unwrap())
+            .unwrap()
+            .supports_authenticated_ice_credentials());
+        assert!(matches!(
+            VideoStreamConfig {
+                flags: 1 << 31,
+                ..selected
+            }
+            .encode(),
+            Err(ProtocolError::UnknownVideoStreamFlags(_))
+        ));
+        assert!(matches!(
+            VideoStreamConfig {
+                flags: video_stream_flags::AUTHENTICATED_CANDIDATE_EXCHANGE
+                    | video_stream_flags::AUTHENTICATED_ICE_CREDENTIALS,
+                ..selected
+            }
+            .encode(),
+            Err(ProtocolError::ConflictingIceSignalingModes)
+        ));
     }
 }
