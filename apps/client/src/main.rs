@@ -915,6 +915,188 @@ fn terminate_and_reap(children: &mut [TargetChild]) {
     }
 }
 
+const CHILD_REAP_DEADLINE: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChildState {
+    Running,
+    Reaped,
+    PollFailed,
+}
+
+async fn supervise_children<F>(
+    children: &mut [TargetChild],
+    shutdown: F,
+    initial_shutdown: Option<Result<(), String>>,
+) -> Result<(), Box<dyn Error>>
+where
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    let mut shutdown = std::pin::pin!(shutdown);
+    let mut states = vec![ChildState::Running; children.len()];
+    let mut failures = Vec::new();
+    let mut cancelled = initial_shutdown.is_some();
+    if let Some(result) = initial_shutdown {
+        if let Err(error) = result {
+            failures.push(format!("shutdown signal failed: {error}"));
+        }
+        println!(
+            "multi-target: cancellation requested targets={}",
+            children.len()
+        );
+        let _ = io::stdout().flush();
+        for child in children.iter_mut() {
+            if let Err(error) = child.process.kill() {
+                failures.push(format!("{} could not be killed: {error}", child.target));
+            }
+        }
+    }
+    loop {
+        for (index, child) in children.iter_mut().enumerate() {
+            if states[index] == ChildState::Reaped {
+                continue;
+            }
+            match child.process.try_wait() {
+                Ok(Some(status)) => {
+                    states[index] = ChildState::Reaped;
+                    if !status.success() {
+                        failures.push(format!("{} exited with {status}", child.target));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    cancelled = true;
+                    states[index] = ChildState::PollFailed;
+                    failures.push(format!("{} could not be polled: {error}", child.target));
+                    match child.process.kill() {
+                        Ok(()) => match child.process.wait() {
+                            Ok(_) => states[index] = ChildState::Reaped,
+                            Err(wait_error) => failures.push(format!(
+                                "{} could not be waited after kill: {wait_error}",
+                                child.target
+                            )),
+                        },
+                        Err(kill_error) => failures.push(format!(
+                            "{} could not be killed after poll failure: {kill_error}",
+                            child.target
+                        )),
+                    }
+                }
+            }
+        }
+        if states.iter().all(|state| *state == ChildState::Reaped) {
+            break;
+        }
+        if states.contains(&ChildState::PollFailed) {
+            cancelled = true;
+            for (index, child) in children.iter_mut().enumerate() {
+                if states[index] != ChildState::Reaped {
+                    let _ = child.process.kill();
+                }
+            }
+        }
+        if cancelled {
+            let deadline = Instant::now() + CHILD_REAP_DEADLINE;
+            while Instant::now() < deadline {
+                for (index, child) in children.iter_mut().enumerate() {
+                    if states[index] == ChildState::Reaped {
+                        continue;
+                    }
+                    match child.process.try_wait() {
+                        Ok(Some(_)) => states[index] = ChildState::Reaped,
+                        Ok(None) => {}
+                        Err(error) => {
+                            failures.push(format!(
+                                "{} could not be polled while reaping: {error}",
+                                child.target
+                            ));
+                            match child.process.wait() {
+                                Ok(_) => states[index] = ChildState::Reaped,
+                                Err(wait_error) => {
+                                    states[index] = ChildState::PollFailed;
+                                    failures.push(format!(
+                                        "{} could not be waited while reaping: {wait_error}",
+                                        child.target
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                if states.iter().all(|state| *state == ChildState::Reaped) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            for (index, child) in children.iter_mut().enumerate() {
+                if states[index] != ChildState::Reaped {
+                    failures.push(format!(
+                        "{} remained running after {}s reap deadline",
+                        child.target,
+                        CHILD_REAP_DEADLINE.as_secs()
+                    ));
+                }
+            }
+            break;
+        }
+        tokio::select! {
+            signal = &mut shutdown => {
+                cancelled = true;
+                if let Err(error) = signal { failures.push(format!("shutdown signal failed: {error}")); }
+                let running = states.iter().filter(|state| **state != ChildState::Reaped).count();
+                println!("multi-target: cancellation requested targets={running}");
+                let _ = io::stdout().flush();
+                for (index, child) in children.iter_mut().enumerate() {
+                    if states[index] != ChildState::Reaped {
+                        if let Err(error) = child.process.kill() {
+                            failures.push(format!("{} could not be killed: {error}", child.target));
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    let mut forwarders_joined = 0;
+    for (index, child) in children.iter_mut().enumerate() {
+        if states[index] == ChildState::Reaped {
+            forwarders_joined += child.output_threads.len();
+            failures.extend(
+                join_output_forwarders(child)
+                    .into_iter()
+                    .map(|error| format!("{} {error}", child.target)),
+            );
+        } else {
+            failures.push(format!(
+                "{} output forwarders not joined: child was not reaped",
+                child.target
+            ));
+        }
+    }
+    println!(
+        "multi-target: completed reaped={} forwarders_joined={forwarders_joined}",
+        states
+            .iter()
+            .filter(|state| **state == ChildState::Reaped)
+            .count()
+    );
+    let _ = io::stdout().flush();
+    if cancelled {
+        failures.push(format!(
+            "multi-target supervisor cancelled reaped={} forwarders_joined={forwarders_joined}",
+            states
+                .iter()
+                .filter(|state| **state == ChildState::Reaped)
+                .count()
+        ));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("target children failed: {}", failures.join(", ")).into())
+    }
+}
+
 fn spawn_output_forwarder<R, W>(reader: R, output: Arc<Mutex<W>>) -> JoinHandle<io::Result<()>>
 where
     R: Read + Send + 'static,
@@ -972,17 +1154,47 @@ fn join_output_forwarders(child: &mut TargetChild) -> Vec<String> {
 fn run_multi_target(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
     let plans = plan_target_child_args(args)?;
     let exe = env::current_exe()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run_multi_target_async(args, plans, exe))
+}
+
+async fn run_multi_target_async(
+    args: &ClientArgs,
+    plans: Vec<TargetChildPlan>,
+    exe: PathBuf,
+) -> Result<(), Box<dyn Error>> {
     let capture_output = args.input_latency_probes > 0;
     let forwarded_output = Arc::new(Mutex::new(io::stdout()));
     let mut children = Vec::<TargetChild>::with_capacity(plans.len());
+    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
     for plan in plans {
         let mut command = Command::new(&exe);
         command.args(&plan.args);
         if capture_output {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
-        match command.spawn() {
+        let spawned = tokio::select! {
+            biased;
+            signal = &mut ctrl_c => {
+                return supervise_children(
+                    &mut children,
+                    std::future::pending::<Result<(), String>>(),
+                    Some(signal.map_err(|error| error.to_string())),
+                )
+                .await;
+            }
+            result = async { command.spawn() } => result,
+        };
+        match spawned {
             Ok(mut process) => {
+                println!(
+                    "multi-target: spawned target={} pid={}",
+                    plan.target,
+                    process.id()
+                );
+                let _ = io::stdout().flush();
                 let output_threads = if capture_output {
                     match attach_output_forwarders(&mut process, Arc::clone(&forwarded_output)) {
                         Ok(threads) => threads,
@@ -1017,28 +1229,12 @@ fn run_multi_target(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let mut failures = Vec::new();
-    for child in &mut children {
-        match child.process.wait() {
-            Ok(status) if status.success() => {}
-            Ok(status) => failures.push(format!("{} exited with {status}", child.target)),
-            Err(error) => {
-                failures.push(format!("{} could not be waited: {error}", child.target));
-                let _ = child.process.kill();
-                let _ = child.process.wait();
-            }
-        }
-        failures.extend(
-            join_output_forwarders(child)
-                .into_iter()
-                .map(|error| format!("{} {error}", child.target)),
-        );
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("target children failed: {}", failures.join(", ")).into())
-    }
+    supervise_children(
+        &mut children,
+        async { ctrl_c.await.map_err(|error| error.to_string()) },
+        None,
+    )
+    .await
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -1730,6 +1926,139 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines.contains(&first_line.trim_end()));
         assert!(lines.contains(&second_line.trim_end()));
+    }
+
+    #[test]
+    fn multi_target_linger_subprocess() {
+        if env::var_os("LATENCYDESK_TEST_LINGER").is_some() {
+            thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn multi_target_failure_subprocess() {
+        if env::var_os("LATENCYDESK_TEST_FAIL").is_some() {
+            panic!("intentional multi-target child failure");
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestChildMode {
+        Success,
+        Failure,
+        Linger,
+    }
+
+    fn test_child(mode: TestChildMode, target: u16) -> TargetChild {
+        let mut command = Command::new(env::current_exe().expect("test executable"));
+        let test_name = match mode {
+            TestChildMode::Failure => "tests::multi_target_failure_subprocess",
+            TestChildMode::Success | TestChildMode::Linger => {
+                "tests::multi_target_linger_subprocess"
+            }
+        };
+        command
+            .args(["--exact", test_name, "--nocapture"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match mode {
+            TestChildMode::Success => {}
+            TestChildMode::Failure => {
+                command.env("LATENCYDESK_TEST_FAIL", "1");
+            }
+            TestChildMode::Linger => {
+                command.env("LATENCYDESK_TEST_LINGER", "1");
+            }
+        }
+        let mut process = command.spawn().expect("child");
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let output_threads = attach_output_forwarders(&mut process, output).expect("pipes");
+        TargetChild {
+            target: format!("127.0.0.1:{target}").parse().unwrap(),
+            process,
+            output_threads,
+        }
+    }
+
+    fn assert_children_are_lingering(children: &mut [TargetChild]) {
+        thread::sleep(Duration::from_millis(50));
+        for child in children.iter_mut() {
+            if let Some(status) = child.process.try_wait().expect("poll lingering child") {
+                panic!("linger child exited early with {status}");
+            }
+        }
+    }
+
+    #[test]
+    fn multi_target_supervisor_cancels_and_reaps_all_children() {
+        let mut children = vec![
+            test_child(TestChildMode::Linger, 9101),
+            test_child(TestChildMode::Linger, 9102),
+            test_child(TestChildMode::Linger, 9103),
+        ];
+        assert_children_are_lingering(&mut children);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(supervise_children(
+            &mut children,
+            async { Ok::<(), String>(()) },
+            None,
+        ));
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("cancelled reaped=3 forwarders_joined=6"));
+        for child in &mut children {
+            assert!(child.process.try_wait().unwrap().is_some());
+            assert!(child.output_threads.is_empty());
+        }
+    }
+
+    #[test]
+    fn multi_target_supervisor_handles_shutdown_already_captured_during_spawn() {
+        let mut children = vec![
+            test_child(TestChildMode::Linger, 9106),
+            test_child(TestChildMode::Linger, 9107),
+        ];
+        assert_children_are_lingering(&mut children);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(supervise_children(
+            &mut children,
+            std::future::pending::<Result<(), String>>(),
+            Some(Ok(())),
+        ));
+        let error = result.expect_err("captured shutdown must cancel children");
+        assert!(error
+            .to_string()
+            .contains("cancelled reaped=2 forwarders_joined=4"));
+        assert!(children.iter().all(|child| child.output_threads.is_empty()));
+    }
+
+    #[test]
+    fn multi_target_supervisor_preserves_natural_mixed_exit_aggregation() {
+        let mut children = vec![
+            test_child(TestChildMode::Success, 9104),
+            test_child(TestChildMode::Failure, 9105),
+        ];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(supervise_children(
+            &mut children,
+            std::future::pending::<Result<(), String>>(),
+            None,
+        ));
+        let error = result.expect_err("mixed natural exit must aggregate the failed child");
+        assert!(error.to_string().contains("exited with"));
+        for child in &mut children {
+            assert!(child.process.try_wait().unwrap().is_some());
+            assert!(child.output_threads.is_empty());
+        }
     }
 
     #[test]
