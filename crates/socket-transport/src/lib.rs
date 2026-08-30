@@ -7,6 +7,7 @@
 pub mod identity;
 pub mod product;
 pub mod quic;
+pub mod stun;
 
 use latencydesk_protocol::{
     AntiReplayFilter, AuthenticateMessage, ControlHeader, ControlKind, ControlPacket,

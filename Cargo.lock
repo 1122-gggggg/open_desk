@@ -671,6 +671,7 @@ name = "latencydesk-socket-transport"
 version = "0.1.0-alpha.2"
 dependencies = [
  "bytes",
+ "getrandom 0.2.17",
  "latencydesk-protocol",
  "latencydesk-transport",
  "quinn",

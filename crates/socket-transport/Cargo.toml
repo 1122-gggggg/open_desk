@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 bytes = { workspace = true }
+getrandom = { workspace = true }
 latencydesk-protocol = { path = "../protocol" }
 latencydesk-transport = { path = "../transport" }
 quinn = { workspace = true }

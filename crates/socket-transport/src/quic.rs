@@ -13,7 +13,7 @@ use latencydesk_protocol::ProtocolError;
 use rustls::pki_types::CertificateDer;
 use std::error::Error;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -275,6 +275,14 @@ impl QuicInboundStream {
 }
 
 impl QuicConnection {
+    /// UDP source address observed by Quinn for the authenticated peer. This
+    /// is diagnostic path metadata only; certificate verification supplies
+    /// peer identity.
+    #[must_use]
+    pub fn remote_address(&self) -> SocketAddr {
+        self.connection.remote_address()
+    }
+
     /// Waits for a full TLS 1.3 connection. It deliberately does not expose
     /// Quinn's 0-RTT API, so application records cannot enter early data.
     pub async fn connect(
@@ -618,6 +626,49 @@ pub fn bind_client(
     Ok(endpoint)
 }
 
+/// Builds a server endpoint on a caller-owned UDP socket. The caller may use
+/// the socket for a bounded pre-QUIC discovery transaction, but must stop all
+/// other reads and writes before transferring ownership here.
+pub fn bind_server_on_socket(
+    configuration: quinn::ServerConfig,
+    socket: UdpSocket,
+) -> Result<quinn::Endpoint, QuicTransportError> {
+    endpoint_from_socket(Some(configuration), socket)
+}
+
+/// Builds a client endpoint on a caller-owned UDP socket without changing its
+/// local address/port. This is the only valid handoff after same-socket STUN;
+/// constructing a fresh endpoint would discard the discovered NAT mapping.
+pub fn bind_client_on_socket(
+    configuration: quinn::ClientConfig,
+    socket: UdpSocket,
+) -> Result<quinn::Endpoint, QuicTransportError> {
+    let mut endpoint = endpoint_from_socket(None, socket)?;
+    endpoint.set_default_client_config(configuration);
+    Ok(endpoint)
+}
+
+fn endpoint_from_socket(
+    server_configuration: Option<quinn::ServerConfig>,
+    socket: UdpSocket,
+) -> Result<quinn::Endpoint, QuicTransportError> {
+    socket
+        .set_nonblocking(true)
+        .map_err(QuicTransportError::Io)?;
+    let runtime = quinn::default_runtime().ok_or_else(|| {
+        QuicTransportError::Io(std::io::Error::other(
+            "no Quinn async runtime is active for the existing UDP socket",
+        ))
+    })?;
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        server_configuration,
+        socket,
+        runtime,
+    )
+    .map_err(QuicTransportError::Io)
+}
+
 async fn read_stream_record(
     stream: &mut quinn::RecvStream,
 ) -> Result<ReceivedStreamRecord, QuicTransportError> {
@@ -650,7 +701,7 @@ mod tests {
     };
     use rcgen::generate_simple_self_signed;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -835,6 +886,31 @@ mod tests {
             QuicConnection::accept_with_handshake_timeout(&endpoint, Duration::ZERO).await,
             Err(QuicTransportError::HandshakeTimeout)
         ));
+    }
+
+    #[tokio::test]
+    async fn client_endpoint_adopts_an_existing_udp_socket_without_rebinding() {
+        let (_, client_config, _, _) = test_configs();
+        let socket =
+            UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("pre-bound socket");
+        let expected = socket.local_addr().expect("pre-bound address");
+        let endpoint = bind_client_on_socket(client_config, socket).expect("client endpoint");
+        assert_eq!(endpoint.local_addr().expect("endpoint address"), expected);
+        endpoint.close(0_u32.into(), b"test complete");
+        endpoint.wait_idle().await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_connection_exposes_the_observed_peer_source_address() {
+        let pair = connected_pair().await;
+        assert_eq!(
+            pair.client.remote_address(),
+            pair._server_endpoint.local_addr().expect("server address")
+        );
+        assert_eq!(
+            pair.server.remote_address(),
+            pair._client_endpoint.local_addr().expect("client address")
+        );
     }
 
     async fn connected_pair() -> ConnectedPair {
