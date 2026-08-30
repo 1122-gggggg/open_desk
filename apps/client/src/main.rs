@@ -13,9 +13,11 @@ use latencydesk_transport::{IngestOutcome, ReassemblyConfig};
 
 use std::env;
 use std::error::Error;
+use std::ffi::OsString;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::{Child, Command};
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(windows, test))]
@@ -29,9 +31,24 @@ mod secure;
 mod software_viewer;
 
 const MAX_PAIRING_TIMEOUT_SECS: u64 = 3_600;
+const MAX_CONCURRENT_TARGETS: usize = 16;
+
+#[derive(Debug)]
+struct TargetChildPlan {
+    target: SocketAddr,
+    args: Vec<OsString>,
+}
+
+#[derive(Debug)]
+struct TargetChild {
+    target: SocketAddr,
+    process: Child,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClientArgs {
     pub connect_addr: SocketAddr,
+    pub targets: Vec<(SocketAddr, PathBuf)>,
     pub bind_addr: SocketAddr,
     pub peer_alias: Option<String>,
     pub pairing_timeout_secs: u64,
@@ -53,6 +70,7 @@ impl Default for ClientArgs {
     fn default() -> Self {
         Self {
             connect_addr: "127.0.0.1:9000".parse().unwrap(),
+            targets: Vec::new(),
             bind_addr: "0.0.0.0:0".parse().unwrap(),
             peer_alias: None,
             pairing_timeout_secs: 60,
@@ -87,6 +105,20 @@ where
 
     while i < args.len() {
         match args[i].as_str() {
+            "--target" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --target".into());
+                }
+                let value = &args[i + 1];
+                let (addr, cert) = value
+                    .split_once(',')
+                    .ok_or("--target must be <ADDR>,<PEER_CERT_PATH>")?;
+                if addr.is_empty() || cert.is_empty() || cert.contains(',') {
+                    return Err("--target must be <ADDR>,<PEER_CERT_PATH>".into());
+                }
+                config.targets.push((addr.parse()?, PathBuf::from(cert)));
+                i += 2;
+            }
             "--connect" => {
                 if i + 1 >= args.len() {
                     return Err("missing value for --connect".into());
@@ -204,6 +236,7 @@ where
                     "Usage: latencydesk-client [OPTIONS]\n\n\
                      Secure QUIC options (default and required):\n  \
                        --connect <ADDR>          Host address to connect to (default 127.0.0.1:9000)\n  \
+                       --target <ADDR>,<CERT>    Connect to up to 16 exact-pinned Hosts concurrently (repeatable)\n  \
                        --bind <ADDR>             Local socket address to bind (default 0.0.0.0:0)\n  \
                        --identity-cert <PATH>    Client identity certificate in DER format\n  \
                        --identity-key <PATH>     Client PKCS#8 private key in DER format\n  \
@@ -247,6 +280,31 @@ where
         )
         .into());
     }
+    if config.targets.len() > MAX_CONCURRENT_TARGETS {
+        return Err(format!("--target supports at most {MAX_CONCURRENT_TARGETS} targets").into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    config.targets.retain(|t| seen.insert((t.0, t.1.clone())));
+    if !config.targets.is_empty() {
+        if args.iter().any(|a| a == "--connect") || args.iter().any(|a| a == "--peer-cert") {
+            return Err("--target cannot be combined with --connect or --peer-cert".into());
+        }
+        if args.iter().any(|a| a == "--width" || a == "--height") {
+            return Err(
+                "--target cannot be combined with --width or --height; probe geometry is only valid with --inject-probe"
+                    .into(),
+            );
+        }
+        if config.unsafe_udp_lab || config.inject_probe || config.bind_addr.port() != 0 {
+            return Err(
+                "--target requires secure mode, no probe, and an ephemeral bind port".into(),
+            );
+        }
+        if config.targets.len() == 1 {
+            config.connect_addr = config.targets[0].0;
+            config.peer_cert = Some(config.targets[0].1.clone());
+        }
+    }
     if config.show_version {
         return Ok(config);
     }
@@ -284,7 +342,7 @@ where
         if config.identity_key.is_none() {
             missing.push("--identity-key <PATH>");
         }
-        if config.peer_cert.is_none() {
+        if config.peer_cert.is_none() && config.targets.is_empty() {
             missing.push("--peer-cert <PATH>");
         }
         if !missing.is_empty() {
@@ -610,11 +668,104 @@ fn receive_completed_frames_for(
     Ok(completed)
 }
 
+fn plan_target_child_args(args: &ClientArgs) -> Result<Vec<TargetChildPlan>, Box<dyn Error>> {
+    if args.targets.len() < 2 {
+        return Err("multi-target planning requires at least two targets".into());
+    }
+    let identity_cert = args
+        .identity_cert
+        .as_ref()
+        .ok_or("multi-target mode requires --identity-cert")?;
+    let identity_key = args
+        .identity_key
+        .as_ref()
+        .ok_or("multi-target mode requires --identity-key")?;
+
+    Ok(args
+        .targets
+        .iter()
+        .map(|(addr, cert)| {
+            let mut child_args = vec![
+                OsString::from("--connect"),
+                OsString::from(addr.to_string()),
+                OsString::from("--peer-cert"),
+                cert.as_os_str().to_owned(),
+                OsString::from("--identity-cert"),
+                identity_cert.as_os_str().to_owned(),
+                OsString::from("--identity-key"),
+                identity_key.as_os_str().to_owned(),
+                OsString::from("--bind"),
+                OsString::from(args.bind_addr.to_string()),
+                OsString::from("--pairing-timeout"),
+                OsString::from(args.pairing_timeout_secs.to_string()),
+            ];
+            if let Some(frames) = args.max_frames {
+                child_args.push(OsString::from("--frames"));
+                child_args.push(OsString::from(frames.to_string()));
+            }
+            TargetChildPlan {
+                target: *addr,
+                args: child_args,
+            }
+        })
+        .collect())
+}
+
+fn terminate_and_reap(children: &mut [TargetChild]) {
+    for child in children.iter_mut() {
+        let _ = child.process.kill();
+    }
+    for child in children.iter_mut() {
+        let _ = child.process.wait();
+    }
+}
+
+fn run_multi_target(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
+    let plans = plan_target_child_args(args)?;
+    let exe = env::current_exe()?;
+    let mut children = Vec::<TargetChild>::with_capacity(plans.len());
+    for plan in plans {
+        let mut command = Command::new(&exe);
+        command.args(&plan.args);
+        match command.spawn() {
+            Ok(process) => children.push(TargetChild {
+                target: plan.target,
+                process,
+            }),
+            Err(error) => {
+                terminate_and_reap(&mut children);
+                return Err(format!(
+                    "failed to spawn isolated client for {}: {error}",
+                    plan.target
+                )
+                .into());
+            }
+        }
+    }
+
+    let mut failures = Vec::new();
+    for child in &mut children {
+        match child.process.wait() {
+            Ok(status) if status.success() => {}
+            Ok(status) => failures.push(format!("{} exited with {status}", child.target)),
+            Err(error) => failures.push(format!("{} could not be waited: {error}", child.target)),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("target children failed: {}", failures.join(", ")).into())
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_client_args()?;
     if args.show_version {
         println!("latencydesk-client {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    if args.targets.len() > 1 {
+        return run_multi_target(&args);
     }
     if args.unsafe_udp_lab {
         eprintln!(
@@ -934,6 +1085,140 @@ mod tests {
         assert_eq!(args.peer_cert, Some(PathBuf::from("host-cert.der")));
         assert_eq!(args.max_frames, Some(2));
         assert_eq!(args.pairing_timeout_secs, 12);
+    }
+
+    #[test]
+    fn client_parser_accepts_repeated_secure_targets_and_plans_isolated_children() {
+        let args = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client.der",
+            "--identity-key",
+            "key.der",
+            "--target",
+            "127.0.0.1:9001,host-a.der",
+            "--target",
+            "127.0.0.1:9002,host-b.der",
+            "--bind",
+            "127.0.0.1:0",
+            "--pairing-timeout",
+            "12",
+            "--frames",
+            "3",
+        ])
+        .expect("targets");
+        assert_eq!(args.targets.len(), 2);
+        let plan = plan_target_child_args(&args).expect("plan");
+        let first = plan[0]
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(plan[0].target, "127.0.0.1:9001".parse().unwrap());
+        assert_eq!(
+            first,
+            vec![
+                "--connect",
+                "127.0.0.1:9001",
+                "--peer-cert",
+                "host-a.der",
+                "--identity-cert",
+                "client.der",
+                "--identity-key",
+                "key.der",
+                "--bind",
+                "127.0.0.1:0",
+                "--pairing-timeout",
+                "12",
+                "--frames",
+                "3",
+            ]
+        );
+        assert!(!first.iter().any(|arg| arg == "--target"));
+    }
+
+    #[test]
+    fn client_parser_rejects_malformed_or_unsafe_targets() {
+        assert!(parse_client_args_from(["latencydesk-client", "--target", "bad"]).is_err());
+        assert!(parse_client_args_from([
+            "latencydesk-client",
+            "--unsafe-udp-lab",
+            "--approve",
+            "--target",
+            "127.0.0.1:1,host.der"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn client_parser_deduplicates_targets_and_rejects_conflicting_single_target_flags() {
+        let deduplicated = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client.der",
+            "--identity-key",
+            "key.der",
+            "--target",
+            "127.0.0.1:9001,host-a.der",
+            "--target",
+            "127.0.0.1:9001,host-a.der",
+            "--target",
+            "127.0.0.1:9002,host-b.der",
+        ])
+        .expect("duplicate targets are harmless");
+        assert_eq!(deduplicated.targets.len(), 2);
+
+        let mixed = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client.der",
+            "--identity-key",
+            "key.der",
+            "--connect",
+            "127.0.0.1:9000",
+            "--target",
+            "127.0.0.1:9001,host-a.der",
+        ])
+        .expect_err("target mode cannot silently override an explicit connect address");
+        assert!(mixed.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn client_parser_rejects_non_ephemeral_multi_target_bind() {
+        let error = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client.der",
+            "--identity-key",
+            "key.der",
+            "--bind",
+            "127.0.0.1:4000",
+            "--target",
+            "127.0.0.1:9001,host-a.der",
+            "--target",
+            "127.0.0.1:9002,host-b.der",
+        ])
+        .expect_err("children cannot share a fixed local UDP port");
+        assert!(error.to_string().contains("ephemeral bind port"));
+    }
+
+    #[test]
+    fn client_parser_rejects_probe_geometry_in_multi_target_mode() {
+        let error = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client.der",
+            "--identity-key",
+            "key.der",
+            "--width",
+            "1280",
+            "--target",
+            "127.0.0.1:9001,host-a.der",
+            "--target",
+            "127.0.0.1:9002,host-b.der",
+        ])
+        .expect_err("probe geometry has no multi-target meaning");
+        assert!(error.to_string().contains("probe geometry"));
     }
 
     #[test]
