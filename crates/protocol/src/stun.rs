@@ -16,6 +16,44 @@ const XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const FINGERPRINT: u16 = 0x8028;
 const FINGERPRINT_XOR: u32 = 0x5354_554e;
 
+/// Validates the framing and final RFC 8489 FINGERPRINT of any bounded STUN
+/// message without interpreting its method-specific attributes.
+pub fn validate_message_fingerprint(bytes: &[u8]) -> Result<(), StunError> {
+    if bytes.len() < HEADER_LEN {
+        return Err(StunError::Truncated {
+            needed: HEADER_LEN,
+            actual: bytes.len(),
+        });
+    }
+    if bytes.len() > MAX_MESSAGE_BYTES {
+        return Err(StunError::MessageTooLarge(bytes.len()));
+    }
+    if read_u32(bytes, 4) != MAGIC_COOKIE {
+        return Err(StunError::BadMagicCookie);
+    }
+    let declared = usize::from(read_u16(bytes, 2));
+    if declared % 4 != 0 {
+        return Err(StunError::UnalignedMessageLength(declared as u16));
+    }
+    if declared + HEADER_LEN != bytes.len() {
+        return Err(StunError::MessageLength {
+            declared,
+            actual: bytes.len() - HEADER_LEN,
+        });
+    }
+    let mut fingerprint_seen = false;
+    parse_attributes(bytes, |kind, value, offset, next_offset| {
+        if kind == FINGERPRINT {
+            validate_one_fingerprint(bytes, value, offset, next_offset, &mut fingerprint_seen)?;
+        }
+        Ok(())
+    })?;
+    if !fingerprint_seen {
+        return Err(StunError::MissingFingerprint);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TransactionId([u8; 12]);
 
@@ -376,6 +414,27 @@ mod tests {
         assert_eq!(&encoded[4..8], &MAGIC_COOKIE.to_be_bytes());
         assert_eq!(&encoded[8..20], TRANSACTION.as_bytes());
         assert_eq!(decode_binding_request(&encoded, true), Ok(TRANSACTION));
+    }
+
+    #[test]
+    fn generic_fingerprint_validator_rejects_mutation_and_trailing_data() {
+        let valid = encode_binding_request(TRANSACTION);
+        assert_eq!(validate_message_fingerprint(&valid), Ok(()));
+
+        let mut mutated = valid.clone();
+        let last = mutated.len() - 1;
+        mutated[last] ^= 1;
+        assert_eq!(
+            validate_message_fingerprint(&mutated),
+            Err(StunError::InvalidFingerprint)
+        );
+
+        let mut trailing = valid;
+        trailing.extend_from_slice(&[0; 4]);
+        assert!(matches!(
+            validate_message_fingerprint(&trailing),
+            Err(StunError::MessageLength { .. })
+        ));
     }
 
     #[test]
