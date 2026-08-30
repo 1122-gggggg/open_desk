@@ -16,10 +16,10 @@ latencydesk-platform = { path = "../platform" }
 latencydesk-surface = { path = "../surface" }
 
 [target.'cfg(windows)'.dependencies]
-cxx = "=1.0.175"
+cxx = "=1.0.199"
 
 [build-dependencies]
-cxx-build = "=1.0.175"
+cxx-build = "=1.0.199"
 
 [lints]
 workspace = true
