@@ -59,4 +59,12 @@ Before merging a runtime dependency:
 - include it in SBOM/advisory scanning;
 - avoid pulling a framework merely to simplify an M0 prototype.
 
+The ICE adapter pins the focused `is` 0.11.0 crate rather than the complete
+str0m/WebRTC stack. `is` and its required transitive dependencies are
+permissively licensed; the reviewed `is`/`str0m-proto` source contained no
+detected `unsafe` blocks. The lockfile, advisory scan, Rust 1.85 minimum, standard
+HMAC-SHA1 ICE feature, and upstream non-cryptographic transaction-ID limitation
+were reviewed; LatencyDesk supplies its own OS-CSPRNG credentials and role
+tie-breaker and never treats the transaction ID as authentication.
+
 GPL components may be supported only through a clearly reviewed separate-process boundary when legally appropriate; they are not linked into the permissive core by default.

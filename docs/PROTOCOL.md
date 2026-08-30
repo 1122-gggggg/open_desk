@@ -81,6 +81,19 @@ cannot alter the existing QUIC route, certificate identity, authorization, or
 reconnect policy. Connectivity checks, pair nomination, consent freshness,
 rendezvous, and relay are not implemented by this message.
 
+The transport layer has a separate bounded Sans-I/O RFC 8445 adapter. It uses
+OS-CSPRNG short-term credentials and role tie-breakers, standard STUN
+`MESSAGE-INTEGRITY` HMAC-SHA1 (not SHA-1 password hashing), a unique final
+FINGERPRINT, one address family, at most eight local and eight remote candidates
+and 64 pairs, and bounded Ta/RTO/retransmits/establishment time. Wrong
+credentials, corrupted fingerprints, unexpected destination sockets, and
+post-deadline packets are rejected. ICE and Quinn own a UDP socket sequentially,
+never concurrently: after nomination, raw ICE reads stop and the exact socket is
+handed to Quinn for a new TLS 1.3 exact-peer connection. The upstream ICE
+transaction ID is only a correlation value; authentication depends on the
+CSPRNG password and HMAC. This adapter is currently an in-process loopback gate,
+not an application signaling, route-selection, NAT traversal, or relay path.
+
 ## 3. Capability negotiation
 
 Each peer advertises:

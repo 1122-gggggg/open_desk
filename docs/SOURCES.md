@@ -24,6 +24,8 @@ Reviewed for the architecture on 2026-08-30. These links are implementation refe
 - Quinn 0.11.8 `SendStream::set_priority`: https://docs.rs/quinn/0.11.8/quinn/struct.SendStream.html#method.set_priority
 - IETF RFC 8445 — ICE: https://www.rfc-editor.org/rfc/rfc8445
 - IETF RFC 8656 — TURN: https://www.rfc-editor.org/rfc/rfc8656
+- `is` 0.11.0 — focused Sans-I/O ICE agent extracted from str0m: https://docs.rs/is/0.11.0/is/
+- str0m upstream and ICE design provenance: https://github.com/algesten/str0m
 
 ## Video acceleration/provider references
 

@@ -23,7 +23,7 @@ Client。
 | 其他 Client | 已有可攜式軟體 Viewer（OpenH264／raw NV12 顯示與輸入轉送），並保留 headless 收幀及 input probe | Alpha 實作；跨機器與原生 UX 證據仍待完成 |
 | Windows Host | 因真實 capture/input provider 尚未接線，安全 Host 會在開 socket 前拒絕執行 | 不支援 |
 | 媒體 | raw NV12 分片後以 QUIC DATAGRAM 傳輸；沒有正式 H.264／AV1 encode/decode 路徑 | 僅適合低解析 LAN preview |
-| WAN 連線 | Direct IP，並可為同一台 exact-pinned Host 競速最多 4 個已知位址；opt-in RFC 8489 Binding 會在之後交給 Quinn 的同一 UDP socket 發現一個 srflx 位址；診斷 probe 可在 exact-mTLS 與產品握手後交換有界 candidate advertisement | 已有 same-socket discovery 與 authenticated advertisement 證據；candidate 不會改變 active route。尚無 ICE check／nomination／consent、rendezvous、TURN／relay、自動 Internet traversal、互動式 recovery 或 QUIC path migration |
+| WAN 連線 | Direct IP，並可為同一台 exact-pinned Host 競速最多 4 個已知位址；opt-in RFC 8489 Binding 與 authenticated candidate advertisement；隔離且有界的 Sans-I/O ICE adapter 會先做真實 HMAC check／nomination，再把 nominated socket 原封不動交給 Quinn exact-mTLS | 已驗證 same-socket ICE→Quinn loopback integration，但尚未接入 App signaling／routing。仍無 rendezvous、真實 NAT matrix、TURN／relay、自動 Internet traversal、互動式 recovery 或 QUIC path migration |
 | 發行 | 沒有受支援的簽章安裝程式、更新器或正式服務 | 未實作 |
 | 舊傳輸 | 明文自製 UDP，必須明確加入 `--unsafe-udp-lab` | 僅限本機相容性測試 |
 
@@ -100,6 +100,14 @@ artifact 要求 fake server 觀察到的 STUN source、Client local／reflexive 
 從 1 開始、candidate 數量互相吻合，且 authenticated Host route 完全不變。這是
 authenticated advertisement，不是可用的 ICE checklist；沒有 connectivity check、
 nomination、consent、TURN，也不能宣稱已穿透 NAT。
+
+Transport crate 另有隔離的 RFC 8445 Sans-I/O gate，使用專用 `is` ICE core。
+兩個真實 UDP socket 會完成有界 `MESSAGE-INTEGRITY` check、role resolution 與
+nomination；停止 raw ICE read 後，把同一組 socket／port 交給 Quinn，之後仍必須
+完成 TLS 1.3 mTLS 並核對雙方 certificate chain。錯誤 credential、fingerprint
+mutation、超限／混合 candidate、role conflict 與丟棄 liveness check 都有負向
+測試。這只證明單機上安全的循序 ICE→QUIC seam；candidate／credential signaling、
+rendezvous、真實 NAT、TURN、route promotion 與跨機器成功率仍未實作。
 
 同時多目標輸入 gate 會由一個 supervisor 啟動 2、4、8 或 16 個 exact-pinned
 child，要求所有已 flush 的 start marker 都先於任一 stop marker，再分別保留每台

@@ -65,6 +65,13 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
 - receiving an authenticated candidate never changes the current route. A
   future connectivity-check/nomination layer must independently authenticate
   checks, limit amplification, prove consent, and retain exact-peer identity;
+- the isolated ICE adapter uses OS-CSPRNG short-term credentials and role
+  tie-breakers, HMAC-authenticated STUN, unique final fingerprints, candidate/
+  pair/retry/deadline caps, and exact local-socket destinations. Upstream
+  transaction IDs are correlation values and never authorization nonces;
+- ICE raw reads and Quinn never race on one socket: ICE ownership ends and the
+  receive queue is drained before the nominated socket enters Quinn. A nominated
+  pair still has no desktop authority until exact-mTLS and the product handshake;
 - rate limits before expensive parsing/decompression;
 - connection and incomplete-frame quotas.
 

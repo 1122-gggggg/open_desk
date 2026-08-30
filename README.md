@@ -24,7 +24,7 @@ Windows client on a trusted, low-latency LAN.
 | Other clients | Portable software viewer with OpenH264/raw-NV12 presentation and input forwarding; headless receive and input probe remain available | Alpha implementation; cross-machine and native-UX evidence pending |
 | Windows host | Secure hosting is rejected before opening a socket because real capture/input providers are not connected | Unsupported |
 | Media | Raw NV12 fragmented across QUIC DATAGRAMs; no production H.264/AV1 encode/decode path | Low-resolution LAN preview only |
-| WAN connectivity | Direct IP plus a bounded race across four known exact-pinned addresses; opt-in RFC 8489 Binding discovers one srflx address on the exact UDP socket later handed to Quinn; a diagnostic probe can exchange a bounded candidate advertisement only after exact-mTLS and the product handshake | Same-socket discovery and authenticated advertisement evidence implemented; candidates do not change the active route. No ICE checks/nomination/consent, rendezvous, TURN/relay, automatic Internet traversal, interactive recovery, or QUIC path migration |
+| WAN connectivity | Direct IP plus a bounded race across four known exact-pinned addresses; opt-in RFC 8489 Binding and authenticated candidate advertisement; an isolated bounded Sans-I/O ICE adapter performs real HMAC-authenticated checks/nomination before handing the nominated sockets unchanged to Quinn exact-mTLS | Same-socket ICE→Quinn loopback integration is verified but is not wired into application signaling or routing. No rendezvous, real NAT matrix, TURN/relay, automatic Internet traversal, interactive recovery, or QUIC path migration |
 | Distribution | No supported signed installer, updater, or production service | Not implemented |
 | Legacy transport | Plaintext custom UDP, available only with explicit `--unsafe-udp-lab` | Local compatibility test only |
 
@@ -108,6 +108,17 @@ exchange IDs to the active random session ID, start at generation 1, mirror the
 bounded candidate counts, and leave the authenticated Host route unchanged.
 This is authenticated advertisement, not a working ICE checklist: it performs
 no connectivity checks, nomination, consent, TURN, or NAT traversal.
+
+The transport crate now also contains an isolated RFC 8445 Sans-I/O gate using
+the focused `is` ICE core. Two real UDP sockets complete bounded
+`MESSAGE-INTEGRITY` checks, role resolution, and nomination; raw ICE reads then
+stop and those exact sockets/ports are handed to Quinn, which must still finish
+TLS 1.3 mutual authentication and expose both expected certificate chains.
+Wrong credentials, fingerprint mutation, oversized/mixed candidates, role
+conflict, and dropped liveness checks have negative tests. This proves a safe
+sequential ICE→QUIC seam on one machine; candidate/credential signaling,
+rendezvous, real NATs, TURN, route promotion, and cross-machine success remain
+unimplemented.
 
 The multi-target process gate starts two distinct-certificate Hosts, proves
 both are authenticated and streaming at the same time, then runs a second
