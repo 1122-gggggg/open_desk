@@ -18,6 +18,7 @@ Client。
 | 控制與輸入 | 已驗證的產品握手、帶 session stamp 的可靠 QUIC lane；input stream 的 Quinn 傳送優先權高於 control | 已實作並通過 in-process 測試 |
 | 同時連線多台 Host | 可重複使用 `--target <ADDR>,<PEER_CERT>`，以 2–16 個隔離的安全 Client 子程序同時開啟多台 exact-pinned Host | 已實作並通過 parser／planner 測試；跨機器多 Host soak 仍待完成 |
 | Linux Host | 真實 X11 root 擷取、CPU BGRA-to-NV12 轉換，以及在獨立連線／task 中執行、不受擷取與軟體編碼阻塞的 XTEST 輸入 | 安全 Alpha 路徑；X11 到 headless 的 process loopback 已驗證，可見輸入延遲與跨機器呈現仍待完成 |
+| Successor session | Linux X11 Host 可保留同一個 endpoint，依序接受 1–16 個 exact-pinned session；headless Client 可自動建立同一個有界 clean sequence；每個 successor 都在 ReleaseAll 後取得新的隨機 identity 與嚴格遞增 lifecycle epoch | Clean Host／headless Client successor 已實作；突發斷線、互動式 reconnect、Windows Host persistence 與 network handoff 仍待完成 |
 | Windows Client | 嚴格 raw-NV12 驗證、Direct3D 11 Viewer、有界 latest-frame 呈現及原生輸入轉送；`--frames` 可 headless 執行 | 安全 Alpha 路徑；Windows Viewer 跨機器 E2E 證據仍待完成 |
 | 其他 Client | 已有可攜式軟體 Viewer（OpenH264／raw NV12 顯示與輸入轉送），並保留 headless 收幀及 input probe | Alpha 實作；跨機器與原生 UX 證據仍待完成 |
 | Windows Host | 因真實 capture/input provider 尚未接線，安全 Host 會在開 socket 前拒絕執行 | 不支援 |
@@ -129,6 +130,13 @@ cargo run --locked -p latencydesk-host -- \
 
 Host 只接受完全相符的 pinned Client certificate；驗證對端成功後才會開啟
 capture 與 XTEST。
+
+Linux X11 若要使用有限度的 persistent listener，可加入 `--max-sessions 2`（上限
+16）。Host 會先拆除所有 session-owned state 並完成 `ReleaseAll`，才接受下一條
+exact-pinned 連線。Windows 在 native provider restart 完成獨立 soak 前仍只允許預設值 `1`。
+headless Client 可加入 `--frames 3 --session-count 2` 執行有界驗證序列；它會關閉
+每個 ProductSession、保留 Client endpoint，並要求每個 successor 都具備新 identity
+與嚴格更新的所有 lifecycle epoch。
 
 ### 3. 啟動互動式 Viewer
 

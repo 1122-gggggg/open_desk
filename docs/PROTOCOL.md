@@ -25,6 +25,14 @@ LatencyDesk plans one TLS-authenticated QUIC connection:
 
 Every message type has an explicit maximum length. Reliable stream messages use length-prefixed frames with a negotiated cap; they never deserialize an unbounded nested object.
 
+Every active connection carries a nonzero session ID plus generation,
+authorization, display, and codec epochs. A successor connection uses a fresh
+random session ID and strictly greater generation, authorization, display, and
+codec epochs. The Client rejects a replacement handshake that reuses the
+session ID or fails to advance any epoch; old
+disconnect, input, control, and media records therefore cannot target the
+successor even if delayed work survives transport teardown.
+
 ## 3. Capability negotiation
 
 Each peer advertises:
