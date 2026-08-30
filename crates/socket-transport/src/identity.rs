@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinSet;
 
 /// DNS subject alternative name present in every generated identity.
 pub const TLS_SERVER_NAME: &str = "latencydesk.local";
@@ -46,6 +47,8 @@ pub const QUIC_SEND_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
 pub const QUIC_DATAGRAM_RECEIVE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum queued outgoing QUIC DATAGRAM bytes.
 pub const QUIC_DATAGRAM_SEND_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum exact-pinned endpoints raced for one logical Host connection.
+pub const MAX_PARALLEL_CONNECT_CANDIDATES: usize = 4;
 
 const QUIC_CRYPTO_BUFFER_BYTES: usize = 64 * 1024;
 const QUIC_IDLE_TIMEOUT_MILLIS: u32 = 30_000;
@@ -118,6 +121,21 @@ pub enum IdentityError {
     MissingPeerCertificate,
     /// The authenticated leaf did not exactly equal the expected DER certificate.
     PeerCertificateMismatch,
+    /// A multi-endpoint connection attempt had no remote addresses.
+    NoConnectionCandidates,
+    /// A multi-endpoint connection attempt exceeded its fixed fan-out bound.
+    TooManyConnectionCandidates { actual: usize, maximum: usize },
+    /// A remote address was unspecified, multicast, broadcast, or used port zero.
+    InvalidConnectionCandidate(SocketAddr),
+    /// Per-candidate handshakes require a nonzero local timeout.
+    InvalidConnectionAttemptTimeout,
+    /// Every bounded candidate attempt failed authentication or transport setup.
+    ConnectionCandidatesExhausted {
+        attempts: usize,
+        last_error: Box<IdentityError>,
+    },
+    /// One candidate task terminated without returning a connection result.
+    ConnectionAttemptTaskFailed,
     /// An identity file exceeded its fixed input limit.
     FileTooLarge {
         /// Non-secret description of the file's role.
@@ -189,6 +207,29 @@ impl fmt::Display for IdentityError {
             Self::PeerCertificateMismatch => {
                 formatter.write_str("authenticated peer leaf did not match the exact certificate")
             }
+            Self::NoConnectionCandidates => {
+                formatter.write_str("no connection candidates were supplied")
+            }
+            Self::TooManyConnectionCandidates { actual, maximum } => write!(
+                formatter,
+                "connection candidate count {actual} exceeds the fixed limit {maximum}"
+            ),
+            Self::InvalidConnectionCandidate(address) => {
+                write!(formatter, "connection candidate {address} is not a usable unicast endpoint")
+            }
+            Self::InvalidConnectionAttemptTimeout => {
+                formatter.write_str("connection candidate timeout must be nonzero")
+            }
+            Self::ConnectionCandidatesExhausted {
+                attempts,
+                last_error,
+            } => write!(
+                formatter,
+                "all {attempts} exact-pinned connection candidate(s) failed; last failure: {last_error}"
+            ),
+            Self::ConnectionAttemptTaskFailed => {
+                formatter.write_str("a connection candidate task terminated unexpectedly")
+            }
             Self::FileTooLarge {
                 kind,
                 path,
@@ -244,12 +285,18 @@ impl Error for IdentityError {
             Self::ClientVerifier(error) => Some(error),
             Self::QuicCrypto(error) => Some(error),
             Self::QuicTransport(error) => Some(error),
+            Self::ConnectionCandidatesExhausted { last_error, .. } => Some(last_error.as_ref()),
             Self::Io { source, .. } => Some(source),
             Self::InvalidDisplayName(_)
             | Self::FileTooLarge { .. }
             | Self::IdentityPathsMustDiffer
             | Self::MissingPeerCertificate
-            | Self::PeerCertificateMismatch => None,
+            | Self::PeerCertificateMismatch
+            | Self::NoConnectionCandidates
+            | Self::TooManyConnectionCandidates { .. }
+            | Self::InvalidConnectionCandidate(_)
+            | Self::InvalidConnectionAttemptTimeout
+            | Self::ConnectionAttemptTaskFailed => None,
             #[cfg(unix)]
             Self::InsecurePrivateKeyPermissions { .. } => None,
             #[cfg(windows)]
@@ -644,6 +691,108 @@ pub async fn connect_exact_peer(
         .map_err(IdentityError::QuicTransport)?;
     verify_exact_peer(&connection, exact_server_certificate_der)?;
     Ok(connection)
+}
+
+/// Result of racing a bounded set of addresses for one exact-pinned Host.
+#[derive(Debug)]
+pub struct ExactPeerConnection {
+    pub connection: QuicConnection,
+    pub remote: SocketAddr,
+    pub attempts_started: usize,
+}
+
+/// Races a small, caller-ordered set of addresses and returns the first fully
+/// authenticated exact-peer connection.
+///
+/// Every attempt independently completes TLS 1.3 and exact-leaf verification;
+/// an address never wins merely because its UDP/QUIC handshake completed first.
+/// The fixed fan-out and per-attempt timeout prevent an unbounded socket/task
+/// storm. Dropping or shutting down a Tokio `JoinSet` aborts unfinished tasks.
+///
+/// Sources:
+/// - https://docs.rs/tokio/1.44.2/tokio/task/struct.JoinSet.html
+/// - https://docs.rs/quinn/0.11.8/quinn/struct.Endpoint.html#method.connect
+pub async fn connect_exact_peer_candidates(
+    endpoint: &quinn::Endpoint,
+    remotes: &[SocketAddr],
+    exact_server_certificate_der: &[u8],
+    attempt_timeout: Duration,
+) -> Result<ExactPeerConnection, IdentityError> {
+    if remotes.is_empty() {
+        return Err(IdentityError::NoConnectionCandidates);
+    }
+    if remotes.len() > MAX_PARALLEL_CONNECT_CANDIDATES {
+        return Err(IdentityError::TooManyConnectionCandidates {
+            actual: remotes.len(),
+            maximum: MAX_PARALLEL_CONNECT_CANDIDATES,
+        });
+    }
+    if attempt_timeout.is_zero() {
+        return Err(IdentityError::InvalidConnectionAttemptTimeout);
+    }
+    exact_root_store(exact_server_certificate_der)?;
+
+    let mut unique_remotes = Vec::with_capacity(remotes.len());
+    for &remote in remotes {
+        let broadcast_v4 =
+            matches!(remote.ip(), std::net::IpAddr::V4(address) if address.octets() == [255; 4]);
+        if remote.port() == 0
+            || remote.ip().is_unspecified()
+            || remote.ip().is_multicast()
+            || broadcast_v4
+        {
+            return Err(IdentityError::InvalidConnectionCandidate(remote));
+        }
+        if !unique_remotes.contains(&remote) {
+            unique_remotes.push(remote);
+        }
+    }
+    let attempts_started = unique_remotes.len();
+    let certificate = Arc::<[u8]>::from(exact_server_certificate_der.to_vec());
+    let mut attempts = JoinSet::new();
+
+    for remote in unique_remotes {
+        let endpoint = endpoint.clone();
+        let certificate = Arc::clone(&certificate);
+        attempts.spawn(async move {
+            let result = match tokio::time::timeout(
+                attempt_timeout,
+                connect_exact_peer(&endpoint, remote, certificate.as_ref()),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(IdentityError::QuicTransport(QuicTransportError::Io(
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("exact-pinned connection attempt to {remote} timed out"),
+                    ),
+                ))),
+            };
+            (remote, result)
+        });
+    }
+
+    let mut last_error = None;
+    while let Some(completed) = attempts.join_next().await {
+        match completed {
+            Ok((remote, Ok(connection))) => {
+                attempts.shutdown().await;
+                return Ok(ExactPeerConnection {
+                    connection,
+                    remote,
+                    attempts_started,
+                });
+            }
+            Ok((_remote, Err(error))) => last_error = Some(error),
+            Err(_) => last_error = Some(IdentityError::ConnectionAttemptTaskFailed),
+        }
+    }
+
+    Err(IdentityError::ConnectionCandidatesExhausted {
+        attempts: attempts_started,
+        last_error: Box::new(last_error.unwrap_or(IdentityError::ConnectionAttemptTaskFailed)),
+    })
 }
 
 /// Accepts, completes mandatory client-certificate authentication, and checks
@@ -1314,6 +1463,127 @@ mod tests {
             Ok(Err(_)) => {}
             Err(_) => panic!("server did not finish or observe the mismatch close"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn candidate_race_does_not_wait_for_an_unreachable_first_address() {
+        let server_identity = TlsIdentity::generate("Race Server").expect("server identity");
+        let client_identity = TlsIdentity::generate("Race Client").expect("client identity");
+        let server_certificate = server_identity.certificate_der().to_vec();
+        let client_certificate = client_identity.certificate_der().to_vec();
+        let server_endpoint = bind_server(
+            mtls_server_config(&server_identity, &client_certificate).expect("server config"),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        )
+        .expect("server endpoint");
+        let client_endpoint = bind_client(
+            mtls_client_config(&client_identity, &server_certificate).expect("client config"),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        )
+        .expect("client endpoint");
+        let server_address = server_endpoint.local_addr().expect("server address");
+        let unused_address = {
+            let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .expect("reserve unused address");
+            let address = socket.local_addr().expect("unused address");
+            drop(socket);
+            address
+        };
+        let candidates = [unused_address, server_address];
+
+        let (accepted, connected) = tokio::join!(
+            timeout(
+                Duration::from_secs(2),
+                accept_exact_peer(&server_endpoint, &client_certificate)
+            ),
+            timeout(
+                Duration::from_secs(2),
+                connect_exact_peer_candidates(
+                    &client_endpoint,
+                    &candidates,
+                    &server_certificate,
+                    Duration::from_secs(1),
+                )
+            ),
+        );
+        let _accepted = accepted
+            .expect("server accept timed out")
+            .expect("server accepted exact client");
+        let connected = connected
+            .expect("candidate race timed out")
+            .expect("candidate race connected");
+        assert_eq!(connected.remote, server_address);
+        assert_eq!(connected.attempts_started, 2);
+        assert_eq!(
+            connected
+                .connection
+                .peer_certificate_chain()
+                .expect("server chain"),
+            vec![server_certificate]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_race_is_bounded_and_rejects_empty_input() {
+        let identity = TlsIdentity::generate("Bounded Race").expect("identity");
+        let configuration = mtls_client_config(&identity, identity.certificate_der())
+            .expect("client configuration");
+        let endpoint = bind_client(configuration, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("client endpoint");
+
+        assert!(connect_exact_peer_candidates(
+            &endpoint,
+            &[],
+            identity.certificate_der(),
+            Duration::from_millis(10),
+        )
+        .await
+        .is_err());
+        assert!(connect_exact_peer_candidates(
+            &endpoint,
+            &[SocketAddr::from((Ipv4Addr::LOCALHOST, 9)); MAX_PARALLEL_CONNECT_CANDIDATES + 1],
+            identity.certificate_der(),
+            Duration::from_millis(10),
+        )
+        .await
+        .is_err());
+        assert!(matches!(
+            connect_exact_peer_candidates(
+                &endpoint,
+                &[SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))],
+                identity.certificate_der(),
+                Duration::from_millis(10),
+            )
+            .await,
+            Err(IdentityError::InvalidConnectionCandidate(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_race_reports_bounded_exhaustion() {
+        let identity = TlsIdentity::generate("Exhausted Race").expect("identity");
+        let endpoint = bind_client(
+            mtls_client_config(&identity, identity.certificate_der()).expect("client config"),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        )
+        .expect("client endpoint");
+        let remotes = [
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 10)),
+        ];
+        let error = connect_exact_peer_candidates(
+            &endpoint,
+            &remotes,
+            identity.certificate_der(),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("unreachable candidates must fail");
+
+        assert!(matches!(
+            error,
+            IdentityError::ConnectionCandidatesExhausted { attempts: 2, .. }
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

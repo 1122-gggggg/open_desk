@@ -767,6 +767,12 @@ mod linux {
             | IdentityError::QuicCrypto(_)
             | IdentityError::FileTooLarge { .. }
             | IdentityError::IdentityPathsMustDiffer
+            | IdentityError::NoConnectionCandidates
+            | IdentityError::TooManyConnectionCandidates { .. }
+            | IdentityError::InvalidConnectionCandidate(_)
+            | IdentityError::InvalidConnectionAttemptTimeout
+            | IdentityError::ConnectionCandidatesExhausted { .. }
+            | IdentityError::ConnectionAttemptTaskFailed
             | IdentityError::InsecurePrivateKeyPermissions { .. }
             | IdentityError::Io { .. } => AcceptFailureDisposition::Fatal,
         }
@@ -1780,6 +1786,12 @@ mod windows {
             | IdentityError::QuicCrypto(_)
             | IdentityError::FileTooLarge { .. }
             | IdentityError::IdentityPathsMustDiffer
+            | IdentityError::NoConnectionCandidates
+            | IdentityError::TooManyConnectionCandidates { .. }
+            | IdentityError::InvalidConnectionCandidate(_)
+            | IdentityError::InvalidConnectionAttemptTimeout
+            | IdentityError::ConnectionCandidatesExhausted { .. }
+            | IdentityError::ConnectionAttemptTaskFailed
             | IdentityError::InsecureWindowsPrivateKeyAcl { .. }
             | IdentityError::WindowsAclCommandFailed { .. }
             | IdentityError::Io { .. } => AcceptFailureDisposition::Fatal,

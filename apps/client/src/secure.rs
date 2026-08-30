@@ -2,8 +2,10 @@
 
 use super::ClientArgs;
 use latencydesk_input::{InputEvent, InputMessage};
+#[cfg(test)]
+use latencydesk_socket_transport::identity::connect_exact_peer;
 use latencydesk_socket_transport::identity::{
-    connect_exact_peer, load_certificate_der, mtls_client_config, TlsIdentity,
+    connect_exact_peer_candidates, load_certificate_der, mtls_client_config, TlsIdentity,
 };
 use latencydesk_socket_transport::product::ProductSessionError;
 use latencydesk_socket_transport::product::{ControlReceiver, ProductSession};
@@ -16,6 +18,7 @@ use std::future::Future;
 use std::time::Duration;
 
 const CLIENT_RELIABLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIENT_CANDIDATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(windows, test))]
 const CLIENT_CLEANUP_SCHEDULER_ALLOWANCE: Duration = Duration::from_millis(250);
@@ -167,18 +170,24 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
     );
     println!("transport: QUIC v1 / TLS 1.3 / exact-certificate mTLS");
 
-    let session = runtime.block_on(async {
+    let candidates = super::connection_candidates(args);
+    let candidate_timeout = operation_timeout.min(CLIENT_CANDIDATE_ATTEMPT_TIMEOUT);
+    let (session, selected_remote, attempts_started) = runtime.block_on(async {
         tokio::time::timeout(operation_timeout, async {
-            let connection = connect_exact_peer(
+            let connected = connect_exact_peer_candidates(
                 &endpoint,
-                args.connect_addr,
+                &candidates,
                 &exact_peer_certificate,
+                candidate_timeout,
             )
             .await
             .map_err(|error| format!("exact-peer mTLS connection failed: {error}"))?;
-            ProductSession::client(connection)
+            let selected_remote = connected.remote;
+            let attempts_started = connected.attempts_started;
+            let session = ProductSession::client(connected.connection)
                 .await
-                .map_err(|error| format!("secure product handshake failed: {error}"))
+                .map_err(|error| format!("secure product handshake failed: {error}"))?;
+            Ok::<_, String>((session, selected_remote, attempts_started))
         })
         .await
         .map_err(|_| {
@@ -190,6 +199,7 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
     })?;
 
     let session_id = session.stamp().session_id;
+    println!("route: authenticated {selected_remote} after racing {attempts_started} candidate(s)");
     println!("handshake: active session_id={session_id}");
 
     let result = if args.inject_probe {

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -32,6 +31,7 @@ def valid_result(**overrides: object) -> dict[str, object]:
         "host_peer_completed_log": False,
         "host_exact_mtls_log": True,
         "client_exact_mtls_log": True,
+        "client_fallback_selected": True,
         "host_session_id": 73,
         "client_session_id": 73,
         "received_session_id": 73,
@@ -74,6 +74,15 @@ class OutputParsingTests(unittest.TestCase):
         )
         self.assertEqual(secure_connect_test.parse_received("no summary"), (None, 0))
 
+    def test_parses_authenticated_fallback_route(self) -> None:
+        self.assertEqual(
+            secure_connect_test.parse_client_route(
+                "route: authenticated 127.0.0.1:34567 after racing 2 candidate(s)\n"
+            ),
+            ("127.0.0.1:34567", 2),
+        )
+        self.assertEqual(secure_connect_test.parse_client_route("no route"), (None, 0))
+
     def test_sensitive_temporary_path_is_redacted(self) -> None:
         root = Path("/tmp/private-smoke")
         text = f"failed reading {root}/host/{secure_connect_test.PRIVATE_KEY_FILE}"
@@ -103,6 +112,12 @@ class FailClosedValidationTests(unittest.TestCase):
         self.assertFalse(checks["client_exact_mtls_log"])
         self.assertTrue(any("host exact-certificate" in error for error in errors))
         self.assertTrue(any("client exact-certificate" in error for error in errors))
+
+    def test_valid_client_must_win_through_the_authenticated_fallback(self) -> None:
+        checks, errors = self.validate(client_fallback_selected=False)
+
+        self.assertFalse(checks["client_fallback_selected"])
+        self.assertTrue(any("fallback" in error for error in errors))
 
     def test_rogue_must_exit_itself_before_product_session(self) -> None:
         checks, errors = self.validate(rogue_timed_out=True, rogue_session_id=73)
@@ -165,6 +180,7 @@ class CommandConstructionTests(unittest.TestCase):
             host_bin=Path("latencydesk-host"),
             client_bin=Path("latencydesk-client"),
             listen_addr="127.0.0.1:34567",
+            valid_primary_addr="127.0.0.1:34568",
             host_dir=Path("identities/host"),
             client_dir=Path("identities/client"),
             rogue_dir=Path("identities/rogue"),
@@ -191,12 +207,17 @@ class CommandConstructionTests(unittest.TestCase):
         self.assertIn("--fps", host)
         self.assertEqual(host[host.index("--frames") + 1], "16")
         self.assertEqual(client[client.index("--frames") + 1], "8")
+        self.assertEqual(client[client.index("--connect") + 1], "127.0.0.1:34568")
+        self.assertEqual(
+            client[client.index("--fallback-address") + 1], "127.0.0.1:34567"
+        )
 
     def test_rogue_uses_rogue_identity_but_correct_host_pin(self) -> None:
         _, rogue, _ = secure_connect_test.build_secure_commands(
             host_bin=Path("host"),
             client_bin=Path("client"),
             listen_addr="127.0.0.1:9",
+            valid_primary_addr="127.0.0.1:10",
             host_dir=Path("host-id"),
             client_dir=Path("client-id"),
             rogue_dir=Path("rogue-id"),
@@ -228,6 +249,12 @@ class CommandConstructionTests(unittest.TestCase):
     def test_host_frame_limit_is_larger_than_client_requirement(self) -> None:
         self.assertEqual(secure_connect_test.host_frame_limit(3), 11)
         self.assertEqual(secure_connect_test.host_frame_limit(20), 40)
+
+    def test_fallback_smoke_reserves_two_distinct_udp_ports(self) -> None:
+        first, second = secure_connect_test.pick_distinct_free_udp_ports()
+        self.assertNotEqual(first, second)
+        self.assertGreater(first, 0)
+        self.assertGreater(second, 0)
 
 
 class PlatformGateTests(unittest.TestCase):

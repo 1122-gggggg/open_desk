@@ -61,6 +61,10 @@ RECEIVED_RE = re.compile(
     r"^received:\s*session_id=(\d+)\s+frames=(\d+)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
+CLIENT_ROUTE_RE = re.compile(
+    r"^route:\s*authenticated\s+(\S+)\s+after\s+racing\s+(\d+)\s+candidate\(s\)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 CERTIFICATE_FILE = "identity.cert.der"
 PRIVATE_KEY_FILE = "identity.key.der"
@@ -213,13 +217,18 @@ def find_binary(name: str, explicit: Path | None = None) -> Path:
     raise FileNotFoundError(f"missing executable {name}; checked: {rendered}")
 
 
-def pick_free_udp_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = int(probe.getsockname()[1])
-    if port <= 0:
-        raise RuntimeError("operating system returned an invalid UDP port")
-    return port
+def pick_distinct_free_udp_ports() -> tuple[int, int]:
+    with (
+        socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as first,
+        socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as second,
+    ):
+        first.bind(("127.0.0.1", 0))
+        second.bind(("127.0.0.1", 0))
+        first_port = int(first.getsockname()[1])
+        second_port = int(second.getsockname()[1])
+    if first_port <= 0 or second_port <= 0 or first_port == second_port:
+        raise RuntimeError("operating system did not reserve two distinct UDP ports")
+    return first_port, second_port
 
 
 def parse_host_session_id(output: str) -> int | None:
@@ -238,6 +247,13 @@ def parse_received(output: str) -> tuple[int | None, int]:
         return None, 0
     session, frames = matches[-1]
     return int(session), int(frames)
+
+
+def parse_client_route(output: str) -> tuple[str | None, int]:
+    match = CLIENT_ROUTE_RE.search(output)
+    if match is None:
+        return None, 0
+    return match.group(1), int(match.group(2))
 
 
 def sanitize_log(text: str, sensitive_root: Path, limit: int = TAIL_CHARS) -> str:
@@ -282,6 +298,7 @@ def build_secure_commands(
     host_bin: Path,
     client_bin: Path,
     listen_addr: str,
+    valid_primary_addr: str,
     host_dir: Path,
     client_dir: Path,
     rogue_dir: Path,
@@ -338,6 +355,8 @@ def build_secure_commands(
     valid_command = [
         str(client_bin),
         "--connect",
+        valid_primary_addr,
+        "--fallback-address",
         listen_addr,
         "--bind",
         "127.0.0.1:0",
@@ -373,6 +392,7 @@ def validate_secure_result(
     host_peer_completed_log: bool,
     host_exact_mtls_log: bool,
     client_exact_mtls_log: bool,
+    client_fallback_selected: bool,
     host_session_id: int | None,
     client_session_id: int | None,
     received_session_id: int | None,
@@ -405,6 +425,7 @@ def validate_secure_result(
         ),
         "host_exact_mtls_log": host_exact_mtls_log,
         "client_exact_mtls_log": client_exact_mtls_log,
+        "client_fallback_selected": client_fallback_selected,
         "product_session_nonzero": (
             host_session_id is not None
             and client_session_id is not None
@@ -441,6 +462,9 @@ def validate_secure_result(
         ),
         "host_exact_mtls_log": "host exact-certificate mTLS authentication log is missing",
         "client_exact_mtls_log": "client exact-certificate mTLS transport log is missing",
+        "client_fallback_selected": (
+            "valid client did not authenticate through the configured fallback address"
+        ),
         "product_session_nonzero": "both ProductSession IDs must be present and nonzero",
         "product_session_ids_match": (
             f"ProductSession ID mismatch host={host_session_id!r} client={client_session_id!r}"
@@ -614,6 +638,7 @@ def run_secure_smoke(
         "host_peer_completed_log": False,
         "host_exact_mtls_log": False,
         "client_exact_mtls_log": False,
+        "client_fallback_selected": False,
         "host_session_id": None,
         "client_session_id": None,
         "received_session_id": None,
@@ -628,6 +653,8 @@ def run_secure_smoke(
     host_output = ""
     rogue_output = ""
     client_output = ""
+    listen_addr: str | None = None
+    valid_primary_addr: str | None = None
 
     temporary = tempfile.TemporaryDirectory(prefix="latencydesk-secure-smoke-")
     temporary_root = Path(temporary.name)
@@ -646,11 +673,14 @@ def run_secure_smoke(
         ready_timeout, rogue_pairing, valid_pairing = timeout_budgets(
             args.pairing_timeout
         )
-        listen_addr = f"127.0.0.1:{pick_free_udp_port()}"
+        listen_port, valid_primary_port = pick_distinct_free_udp_ports()
+        listen_addr = f"127.0.0.1:{listen_port}"
+        valid_primary_addr = f"127.0.0.1:{valid_primary_port}"
         host_command, rogue_command, valid_command = build_secure_commands(
             host_bin=host_bin,
             client_bin=client_bin,
             listen_addr=listen_addr,
+            valid_primary_addr=valid_primary_addr,
             host_dir=host_dir,
             client_dir=client_dir,
             rogue_dir=rogue_dir,
@@ -765,6 +795,12 @@ def run_secure_smoke(
     observation["client_exact_mtls_log"] = (
         CLIENT_MTLS_MARKER.lower() in client_output.lower()
     )
+    selected_remote, candidate_attempts = parse_client_route(client_output)
+    observation["client_fallback_selected"] = (
+        listen_addr is not None
+        and selected_remote == listen_addr
+        and candidate_attempts >= 2
+    )
     observation["host_session_id"] = parse_host_session_id(host_output)
     observation["client_session_id"] = parse_client_session_id(client_output)
     received_session, received_frames = parse_received(client_output)
@@ -788,6 +824,7 @@ def run_secure_smoke(
         host_peer_completed_log=bool(observation["host_peer_completed_log"]),
         host_exact_mtls_log=bool(observation["host_exact_mtls_log"]),
         client_exact_mtls_log=bool(observation["client_exact_mtls_log"]),
+        client_fallback_selected=bool(observation["client_fallback_selected"]),
         host_session_id=observation["host_session_id"],
         client_session_id=observation["client_session_id"],
         received_session_id=observation["received_session_id"],
@@ -811,6 +848,8 @@ def run_secure_smoke(
                 "client_session_id": observation["client_session_id"],
                 "received_session_id": observation["received_session_id"],
                 "received_frames": observation["received_frames"],
+                "selected_remote": selected_remote,
+                "candidate_attempts": candidate_attempts,
                 "host_shutdown_mode": (
                     "peer_completed"
                     if observation["host_peer_completed_log"]

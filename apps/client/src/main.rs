@@ -3,6 +3,7 @@
 //! Native QUIC/UDP client role coordinator using platform providers.
 
 use latencydesk_input::{InputEvent, InputMessage};
+use latencydesk_socket_transport::identity::MAX_PARALLEL_CONNECT_CANDIDATES;
 use latencydesk_socket_transport::{
     AuthenticatedDatagramEndpoint, AuthenticatedSessionConfig, HandshakeState, SessionRole,
     SocketError, UdpEndpoint, APPROVE_LAN_TEST_SECRET, DEFAULT_MAX_SOCKET_DATAGRAM,
@@ -32,6 +33,7 @@ mod software_viewer;
 
 const MAX_PAIRING_TIMEOUT_SECS: u64 = 3_600;
 const MAX_CONCURRENT_TARGETS: usize = 16;
+const MAX_FALLBACK_ADDRESS_ARGUMENTS: usize = 16;
 
 #[derive(Debug)]
 struct TargetChildPlan {
@@ -48,6 +50,7 @@ struct TargetChild {
 #[derive(Debug, Clone)]
 pub struct ClientArgs {
     pub connect_addr: SocketAddr,
+    pub fallback_addresses: Vec<SocketAddr>,
     pub targets: Vec<(SocketAddr, PathBuf)>,
     pub bind_addr: SocketAddr,
     pub peer_alias: Option<String>,
@@ -70,6 +73,7 @@ impl Default for ClientArgs {
     fn default() -> Self {
         Self {
             connect_addr: "127.0.0.1:9000".parse().unwrap(),
+            fallback_addresses: Vec::new(),
             targets: Vec::new(),
             bind_addr: "0.0.0.0:0".parse().unwrap(),
             peer_alias: None,
@@ -124,6 +128,13 @@ where
                     return Err("missing value for --connect".into());
                 }
                 config.connect_addr = args[i + 1].parse()?;
+                i += 2;
+            }
+            "--fallback-address" => {
+                if i + 1 >= args.len() {
+                    return Err("missing value for --fallback-address".into());
+                }
+                config.fallback_addresses.push(args[i + 1].parse()?);
                 i += 2;
             }
             "--bind" => {
@@ -236,6 +247,7 @@ where
                     "Usage: latencydesk-client [OPTIONS]\n\n\
                      Secure QUIC options (default and required):\n  \
                        --connect <ADDR>          Host address to connect to (default 127.0.0.1:9000)\n  \
+                       --fallback-address <ADDR> Alternate address for the same exact-pinned Host (repeatable, max 3)\n  \
                        --target <ADDR>,<CERT>    Connect to up to 16 exact-pinned Hosts concurrently (repeatable)\n  \
                        --bind <ADDR>             Local socket address to bind (default 0.0.0.0:0)\n  \
                        --identity-cert <PATH>    Client identity certificate in DER format\n  \
@@ -279,6 +291,38 @@ where
             "--pairing-timeout must be between 1 and {MAX_PAIRING_TIMEOUT_SECS} seconds"
         )
         .into());
+    }
+    if config.fallback_addresses.len() > MAX_FALLBACK_ADDRESS_ARGUMENTS {
+        return Err(format!(
+            "--fallback-address accepts at most {MAX_FALLBACK_ADDRESS_ARGUMENTS} entries"
+        )
+        .into());
+    }
+    let mut seen_fallbacks = std::collections::HashSet::new();
+    config
+        .fallback_addresses
+        .retain(|address| *address != config.connect_addr && seen_fallbacks.insert(*address));
+    if config.fallback_addresses.len() + 1 > MAX_PARALLEL_CONNECT_CANDIDATES {
+        return Err(format!(
+            "--fallback-address accepts at most {} alternate addresses",
+            MAX_PARALLEL_CONNECT_CANDIDATES - 1
+        )
+        .into());
+    }
+    if !config.fallback_addresses.is_empty() {
+        if !config.targets.is_empty() {
+            return Err("--fallback-address cannot be combined with --target".into());
+        }
+        if config.unsafe_udp_lab {
+            return Err("--fallback-address is available only for secure QUIC mode".into());
+        }
+    }
+    if config.bind_addr.is_ipv4()
+        && connection_candidates(&config)
+            .iter()
+            .any(SocketAddr::is_ipv6)
+    {
+        return Err("IPv6 connection candidates require an IPv6 bind such as --bind [::]:0".into());
     }
     if config.targets.len() > MAX_CONCURRENT_TARGETS {
         return Err(format!("--target supports at most {MAX_CONCURRENT_TARGETS} targets").into());
@@ -354,6 +398,13 @@ where
         }
     }
     Ok(config)
+}
+
+fn connection_candidates(args: &ClientArgs) -> Vec<SocketAddr> {
+    let mut candidates = Vec::with_capacity(1 + args.fallback_addresses.len());
+    candidates.push(args.connect_addr);
+    candidates.extend(args.fallback_addresses.iter().copied());
+    candidates
 }
 
 fn now_ns() -> u64 {
@@ -1085,6 +1136,114 @@ mod tests {
         assert_eq!(args.peer_cert, Some(PathBuf::from("host-cert.der")));
         assert_eq!(args.max_frames, Some(2));
         assert_eq!(args.pairing_timeout_secs, 12);
+    }
+
+    #[test]
+    fn client_parser_builds_a_deduplicated_bounded_endpoint_race() {
+        let args = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client.der",
+            "--identity-key",
+            "key.der",
+            "--peer-cert",
+            "host.der",
+            "--connect",
+            "127.0.0.1:9000",
+            "--fallback-address",
+            "127.0.0.1:9001",
+            "--fallback-address",
+            "127.0.0.1:9001",
+            "--fallback-address",
+            "127.0.0.1:9002",
+        ])
+        .expect("bounded alternatives");
+        assert_eq!(
+            connection_candidates(&args),
+            vec![
+                "127.0.0.1:9000".parse().unwrap(),
+                "127.0.0.1:9001".parse().unwrap(),
+                "127.0.0.1:9002".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn client_parser_rejects_unbounded_or_incompatible_endpoint_races() {
+        let too_many = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client.der",
+            "--identity-key",
+            "key.der",
+            "--peer-cert",
+            "host.der",
+            "--fallback-address",
+            "127.0.0.1:9001",
+            "--fallback-address",
+            "127.0.0.1:9002",
+            "--fallback-address",
+            "127.0.0.1:9003",
+            "--fallback-address",
+            "127.0.0.1:9004",
+        ])
+        .expect_err("candidate race must be bounded");
+        assert!(too_many.to_string().contains("at most"));
+
+        let wrong_family = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client.der",
+            "--identity-key",
+            "key.der",
+            "--peer-cert",
+            "host.der",
+            "--fallback-address",
+            "[::1]:9001",
+        ])
+        .expect_err("an IPv4-bound endpoint cannot race IPv6");
+        assert!(wrong_family.to_string().contains("IPv6 bind"));
+
+        let mixed_target = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client.der",
+            "--identity-key",
+            "key.der",
+            "--target",
+            "127.0.0.1:9000,host-a.der",
+            "--target",
+            "127.0.0.1:9001,host-b.der",
+            "--fallback-address",
+            "127.0.0.1:9010",
+        ])
+        .expect_err("one fallback address cannot be shared across distinct hosts");
+        assert!(mixed_target.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn client_parser_deduplicates_fallbacks_before_enforcing_the_race_limit() {
+        let args = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client.der",
+            "--identity-key",
+            "key.der",
+            "--peer-cert",
+            "host.der",
+            "--fallback-address",
+            "127.0.0.1:9001",
+            "--fallback-address",
+            "127.0.0.1:9001",
+            "--fallback-address",
+            "127.0.0.1:9001",
+            "--fallback-address",
+            "127.0.0.1:9001",
+            "--fallback-address",
+            "127.0.0.1:9002",
+        ])
+        .expect("duplicate fallback flags do not consume connection fan-out");
+        assert_eq!(connection_candidates(&args).len(), 3);
     }
 
     #[test]
