@@ -117,6 +117,12 @@ pub enum ProductProtocolViolation {
     HandshakeAuthorizationMismatch { expected: u32, actual: u32 },
     /// The post-mTLS handshake used a non-canonical legacy nonce value.
     HandshakeNonceMismatch,
+    /// A replacement connection reused its session identity or did not advance
+    /// every lifecycle epoch beyond the prior authenticated session.
+    NonMonotonicSuccessor {
+        previous: SessionStamp,
+        actual: SessionStamp,
+    },
 }
 
 /// Product-session construction, framing, and bounded-media failures.
@@ -247,6 +253,22 @@ impl ProductSession {
         Self::host_with_reassembly(connection, session_id, ReassemblyConfig::default()).await
     }
 
+    /// Activates a Host session with a caller-allocated lifecycle stamp.
+    /// Reconnect authorities use this path so successor generations are not
+    /// collapsed back to the compatibility `1/1/1/1` epochs.
+    pub async fn host_with_stamp(
+        connection: QuicConnection,
+        stamp: SessionStamp,
+    ) -> Result<Self, ProductSessionError> {
+        Self::host_with_stamp_reassembly_timeout(
+            connection,
+            stamp,
+            ReassemblyConfig::default(),
+            DEFAULT_PRODUCT_HANDSHAKE_TIMEOUT,
+        )
+        .await
+    }
+
     /// Host constructor with caller-selected bounded reassembly limits.
     pub async fn host_with_reassembly(
         connection: QuicConnection,
@@ -268,6 +290,22 @@ impl ProductSession {
         Self::client_with_reassembly(connection, ReassemblyConfig::default()).await
     }
 
+    /// Activates a replacement Client session only when the Host supplies a
+    /// fresh session identity and advances every lifecycle epoch.
+    pub async fn client_successor(
+        connection: QuicConnection,
+        previous: SessionStamp,
+    ) -> Result<Self, ProductSessionError> {
+        validate_active_product_stamp(previous)?;
+        Self::client_with_reassembly_timeout_after(
+            connection,
+            ReassemblyConfig::default(),
+            DEFAULT_PRODUCT_HANDSHAKE_TIMEOUT,
+            Some(previous),
+        )
+        .await
+    }
+
     /// Client constructor with caller-selected bounded reassembly limits.
     pub async fn client_with_reassembly(
         connection: QuicConnection,
@@ -287,9 +325,25 @@ impl ProductSession {
         reassembly: ReassemblyConfig,
         timeout: Duration,
     ) -> Result<Self, ProductSessionError> {
+        Self::host_with_stamp_reassembly_timeout(
+            connection,
+            active_stamp(session_id),
+            reassembly,
+            timeout,
+        )
+        .await
+    }
+
+    async fn host_with_stamp_reassembly_timeout(
+        connection: QuicConnection,
+        stamp: SessionStamp,
+        reassembly: ReassemblyConfig,
+        timeout: Duration,
+    ) -> Result<Self, ProductSessionError> {
+        validate_active_product_stamp(stamp)?;
         let timeout_connection = connection.clone();
         let operation = async move {
-            let session = Self::new(connection, active_stamp(session_id), reassembly)?;
+            let session = Self::new(connection, stamp, reassembly)?;
             let record = encode_handshake_completed(session.stamp)?;
             session.connection.send_control(&record).await?;
             Ok(session)
@@ -310,6 +364,15 @@ impl ProductSession {
         connection: QuicConnection,
         reassembly: ReassemblyConfig,
         timeout: Duration,
+    ) -> Result<Self, ProductSessionError> {
+        Self::client_with_reassembly_timeout_after(connection, reassembly, timeout, None).await
+    }
+
+    async fn client_with_reassembly_timeout_after(
+        connection: QuicConnection,
+        reassembly: ReassemblyConfig,
+        timeout: Duration,
+        previous: Option<SessionStamp>,
     ) -> Result<Self, ProductSessionError> {
         // Validate local resource policy before waiting on peer-controlled I/O.
         let reassembler = Reassembler::new(reassembly)?;
@@ -339,6 +402,22 @@ impl ProductSession {
                     return Err(error);
                 }
             };
+            if let Some(previous) = previous {
+                if stamp.session_id == previous.session_id
+                    || stamp.generation <= previous.generation
+                    || stamp.authorization_epoch <= previous.authorization_epoch
+                    || stamp.display_epoch <= previous.display_epoch
+                    || stamp.codec_epoch <= previous.codec_epoch
+                {
+                    return fail_peer_protocol(
+                        &connection,
+                        ProductProtocolViolation::NonMonotonicSuccessor {
+                            previous,
+                            actual: stamp,
+                        },
+                    );
+                }
+            }
             Ok(Self {
                 connection,
                 stamp,
@@ -364,6 +443,12 @@ impl ProductSession {
     #[must_use]
     pub const fn stamp(&self) -> SessionStamp {
         self.stamp
+    }
+
+    /// Closes only this product connection. The owning endpoint remains usable
+    /// for a strictly newer successor session.
+    pub fn close(&self, error_code: u32, reason: &[u8]) {
+        self.connection.close(error_code, reason);
     }
 
     /// Snapshot of Quinn's current path telemetry for adaptation feedback.
@@ -638,6 +723,7 @@ impl ProductSession {
         stamp: SessionStamp,
         reassembly: ReassemblyConfig,
     ) -> Result<Self, ProductSessionError> {
+        validate_active_product_stamp(stamp)?;
         Ok(Self {
             connection,
             stamp,
@@ -709,6 +795,16 @@ impl ControlReceiver {
     }
 }
 
+fn validate_active_product_stamp(stamp: SessionStamp) -> Result<(), ProductSessionError> {
+    stamp.validate_pending()?;
+    if stamp.authorization_epoch == 0 || stamp.display_epoch == 0 || stamp.codec_epoch == 0 {
+        return Err(ProductSessionError::Protocol(
+            ProtocolError::InvalidSessionStamp,
+        ));
+    }
+    Ok(())
+}
+
 fn active_stamp(session_id: NonZeroU64) -> SessionStamp {
     SessionStamp {
         session_id: session_id.get(),
@@ -755,12 +851,7 @@ fn validate_handshake_completed(
     record: &crate::quic::ReceivedStreamRecord,
 ) -> Result<SessionStamp, ProductSessionError> {
     let stamp = record.stamp;
-    let canonical = stamp.session_id != 0
-        && stamp.generation == ACTIVE_GENERATION
-        && stamp.authorization_epoch == ACTIVE_EPOCH
-        && stamp.display_epoch == ACTIVE_EPOCH
-        && stamp.codec_epoch == ACTIVE_EPOCH;
-    if !canonical {
+    if validate_active_product_stamp(stamp).is_err() {
         return Err(ProductSessionError::PeerProtocol(
             ProductProtocolViolation::InvalidHandshakeStamp(stamp),
         ));
@@ -1011,6 +1102,181 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn caller_supplied_lifecycle_stamp_survives_the_product_handshake() {
+        let pair = connected_pair(1_450).await;
+        let stamp = SessionStamp {
+            session_id: 81,
+            generation: 7,
+            authorization_epoch: 8,
+            display_epoch: 9,
+            codec_epoch: 10,
+        };
+        let (host, client) = tokio::join!(
+            ProductSession::host_with_stamp(pair.server, stamp),
+            ProductSession::client(pair.client),
+        );
+
+        assert_eq!(host.expect("host session").stamp(), stamp);
+        assert_eq!(client.expect("client session").stamp(), stamp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successor_client_rejects_a_non_monotonic_generation() {
+        let pair = connected_pair(1_450).await;
+        let previous = SessionStamp {
+            session_id: 80,
+            generation: 7,
+            authorization_epoch: 8,
+            display_epoch: 9,
+            codec_epoch: 10,
+        };
+        let replayed = SessionStamp {
+            session_id: 81,
+            generation: 7,
+            authorization_epoch: 9,
+            display_epoch: 9,
+            codec_epoch: 10,
+        };
+        let (host, client) = tokio::join!(
+            ProductSession::host_with_stamp(pair.server, replayed),
+            ProductSession::client_successor(pair.client, previous),
+        );
+        host.expect("host publishes its stamp");
+        assert!(matches!(
+            client,
+            Err(ProductSessionError::PeerProtocol(
+                ProductProtocolViolation::NonMonotonicSuccessor { .. }
+            ))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successor_client_accepts_fresh_identity_and_strictly_new_lifecycle_epochs() {
+        let pair = connected_pair(1_450).await;
+        let previous = SessionStamp {
+            session_id: 80,
+            generation: 7,
+            authorization_epoch: 8,
+            display_epoch: 9,
+            codec_epoch: 10,
+        };
+        let successor = SessionStamp {
+            session_id: 81,
+            generation: 8,
+            authorization_epoch: 9,
+            display_epoch: 10,
+            codec_epoch: 11,
+        };
+        let (host, client) = tokio::join!(
+            ProductSession::host_with_stamp(pair.server, successor),
+            ProductSession::client_successor(pair.client, previous),
+        );
+        assert_eq!(host.expect("host successor").stamp(), successor);
+        assert_eq!(client.expect("client successor").stamp(), successor);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successor_client_rejects_reused_identity_or_non_monotonic_stream_epochs() {
+        let previous = SessionStamp {
+            session_id: 80,
+            generation: 7,
+            authorization_epoch: 8,
+            display_epoch: 9,
+            codec_epoch: 10,
+        };
+        for invalid in [
+            SessionStamp {
+                session_id: 80,
+                generation: 8,
+                authorization_epoch: 9,
+                display_epoch: 10,
+                codec_epoch: 11,
+            },
+            SessionStamp {
+                session_id: 81,
+                generation: 8,
+                authorization_epoch: 9,
+                display_epoch: 9,
+                codec_epoch: 11,
+            },
+            SessionStamp {
+                session_id: 81,
+                generation: 8,
+                authorization_epoch: 9,
+                display_epoch: 10,
+                codec_epoch: 10,
+            },
+        ] {
+            let pair = connected_pair(1_450).await;
+            let (host, client) = tokio::join!(
+                ProductSession::host_with_stamp(pair.server, invalid),
+                ProductSession::client_successor(pair.client, previous),
+            );
+            host.expect("host publishes its invalid successor stamp");
+            assert!(matches!(
+                client,
+                Err(ProductSessionError::PeerProtocol(
+                    ProductProtocolViolation::NonMonotonicSuccessor { .. }
+                ))
+            ));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_endpoint_accepts_a_fresh_product_session_after_clean_close() {
+        let pair = connected_pair(1_450).await;
+        let server_endpoint = pair._server_endpoint;
+        let client_endpoint = pair._client_endpoint;
+        let server_address = server_endpoint.local_addr().expect("server address");
+        let first_stamp = SessionStamp {
+            session_id: 91,
+            generation: 1,
+            authorization_epoch: 1,
+            display_epoch: 1,
+            codec_epoch: 1,
+        };
+        let (first_host, first_client) = tokio::join!(
+            ProductSession::host_with_stamp(pair.server, first_stamp),
+            ProductSession::client(pair.client),
+        );
+        let first_host = first_host.expect("first host session");
+        let first_client = first_client.expect("first client session");
+        first_client.close(0, b"first session complete");
+        drop(first_client);
+        drop(first_host);
+
+        let (server_connection, client_connection) = tokio::join!(
+            QuicConnection::accept(&server_endpoint),
+            QuicConnection::connect(&client_endpoint, server_address, "localhost"),
+        );
+        let successor_stamp = SessionStamp {
+            session_id: 92,
+            generation: 2,
+            authorization_epoch: 2,
+            display_epoch: 2,
+            codec_epoch: 2,
+        };
+        let (successor_host, successor_client) = tokio::join!(
+            ProductSession::host_with_stamp(
+                server_connection.expect("successor server connection"),
+                successor_stamp,
+            ),
+            ProductSession::client_successor(
+                client_connection.expect("successor client connection"),
+                first_stamp,
+            ),
+        );
+        assert_eq!(
+            successor_host.expect("successor host").stamp(),
+            successor_stamp
+        );
+        assert_eq!(
+            successor_client.expect("successor client").stamp(),
+            successor_stamp
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn host_handshake_times_out_when_peer_advertises_zero_stream_credit() {
         let pair =
             connected_pair_with_configs(test_configs_with_client_uni_stream_credit(1_450, Some(0)))
@@ -1061,7 +1327,7 @@ mod tests {
             generation: 2,
             authorization_epoch: 1,
             display_epoch: 1,
-            codec_epoch: 1,
+            codec_epoch: 0,
         };
         let record = encode_handshake_completed(wrong_stamp).expect("handshake record");
         pair.server

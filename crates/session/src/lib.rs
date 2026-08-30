@@ -4,6 +4,7 @@ use core::fmt;
 
 pub mod authorization;
 pub mod disconnect;
+pub mod lifecycle;
 pub mod nat;
 pub mod pairing;
 pub mod runtime;

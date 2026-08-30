@@ -9,6 +9,8 @@ pub enum DisconnectError {
     AlreadyClosed,
     DrainTimeout,
     InvalidWireMessage,
+    SessionMismatch,
+    AuthorizationEpochMismatch,
 }
 
 impl fmt::Display for DisconnectError {
@@ -111,6 +113,12 @@ impl SafeDisconnectController {
         wire: &DisconnectWire<'_>,
         now_ns: u64,
     ) -> Result<(), DisconnectError> {
+        if wire.session_id != self.session_id {
+            return Err(DisconnectError::SessionMismatch);
+        }
+        if wire.authorization_epoch != self.authorization_epoch {
+            return Err(DisconnectError::AuthorizationEpochMismatch);
+        }
         if self.is_closed() {
             return Err(DisconnectError::AlreadyClosed);
         }
@@ -151,5 +159,38 @@ impl SafeDisconnectController {
             reason,
             timestamp_ns: now_ns,
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_disconnect_rejects_stale_session_and_epoch_without_closing_successor() {
+        let mut controller = SafeDisconnectController::new(42, 7, 1_000);
+        let wrong_session = DisconnectWire {
+            reason: DisconnectReason::UserInitiated,
+            session_id: 41,
+            authorization_epoch: 7,
+            message: "stale session",
+        };
+        assert_eq!(
+            controller.handle_remote_disconnect(&wrong_session, 100),
+            Err(DisconnectError::SessionMismatch)
+        );
+        assert_eq!(controller.state(), DisconnectState::Connected);
+
+        let wrong_epoch = DisconnectWire {
+            reason: DisconnectReason::UserInitiated,
+            session_id: 42,
+            authorization_epoch: 6,
+            message: "stale epoch",
+        };
+        assert_eq!(
+            controller.handle_remote_disconnect(&wrong_epoch, 101),
+            Err(DisconnectError::AuthorizationEpochMismatch)
+        );
+        assert_eq!(controller.state(), DisconnectState::Connected);
     }
 }
