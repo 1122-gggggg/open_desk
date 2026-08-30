@@ -256,7 +256,9 @@ mod tests {
         let remote = remote_gatherer.finish_gathering();
 
         let mut router = ConnectionRouter::new(true, 1_000_000_000); // 1s direct timeout
-        router.set_candidates(local, remote, 0x1234, [9_u8; 16]);
+        router
+            .set_candidates(local, remote, 0x1234, [9_u8; 16])
+            .expect("valid candidates");
 
         // Within 1s window, router probes direct path
         let initial_path = router
@@ -266,15 +268,21 @@ mod tests {
 
         // If direct checks time out at 1.5s -> seamless fallback to Relay!
         let mut timeout_router = ConnectionRouter::new(true, 1_000_000_000);
-        timeout_router.set_candidates(
-            local_gatherer.finish_gathering(),
-            remote_gatherer.finish_gathering(),
-            0x5678,
-            [9_u8; 16],
-        );
+        timeout_router
+            .set_candidates(
+                local_gatherer.finish_gathering(),
+                remote_gatherer.finish_gathering(),
+                0x5678,
+                [9_u8; 16],
+            )
+            .expect("valid candidates");
+        assert!(matches!(
+            timeout_router.select_initial_path(1_500_000_000),
+            Ok(ConnectionPath::Direct { .. })
+        ));
         let fallback_path = timeout_router
-            .select_initial_path(1_500_000_000)
-            .expect("fallback path");
+            .select_initial_path(2_500_000_001)
+            .expect("fallback path after relative timeout");
         assert!(matches!(fallback_path, ConnectionPath::Relay { .. }));
         assert!(timeout_router.is_using_relay());
     }
@@ -312,13 +320,15 @@ mod tests {
             )
             .unwrap();
 
-        let mut router = ConnectionRouter::new(true, 500_000_000);
-        router.set_candidates(
-            local_gatherer.finish_gathering(),
-            remote_gatherer.finish_gathering(),
-            0x9999,
-            [7_u8; 16],
-        );
+        let mut router = ConnectionRouter::new(true, 0);
+        router
+            .set_candidates(
+                local_gatherer.finish_gathering(),
+                remote_gatherer.finish_gathering(),
+                0x9999,
+                [7_u8; 16],
+            )
+            .expect("valid candidates");
 
         // Start on relay fallback after direct timeout
         let path = router.select_initial_path(1_000_000_000).expect("path");

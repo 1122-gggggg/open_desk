@@ -1213,10 +1213,21 @@ impl IceCandidate {
         if self.port == 0 {
             return Err(ProtocolError::InvalidCandidatePort);
         }
-        if let Some((_, rel_port)) = self.related_address {
+        if !is_usable_candidate_address(self.ip) {
+            return Err(ProtocolError::InvalidCandidateAddress);
+        }
+        if let Some((related, rel_port)) = self.related_address {
             if rel_port == 0 {
                 return Err(ProtocolError::InvalidCandidatePort);
             }
+            if !is_usable_candidate_address(related) {
+                return Err(ProtocolError::InvalidCandidateAddress);
+            }
+        }
+        let is_relayed = self.candidate_type == CandidateType::Relayed;
+        let has_relay_provider = self.relay_provider != RelayProvider::None;
+        if is_relayed != has_relay_provider {
+            return Err(ProtocolError::InvalidCandidateRelayProvider);
         }
         Ok(())
     }
@@ -1365,6 +1376,15 @@ impl IceCandidate {
         };
         candidate.validate()?;
         Ok(candidate)
+    }
+}
+
+fn is_usable_candidate_address(address: WireIpAddr) -> bool {
+    match address {
+        WireIpAddr::V4(octets) => {
+            octets != [0; 4] && octets != [255; 4] && octets[0] & 0xf0 != 0xe0
+        }
+        WireIpAddr::V6(octets) => octets != [0; 16] && octets[0] != 0xff,
     }
 }
 
@@ -1735,6 +1755,7 @@ pub enum ProtocolError {
     InvalidCandidateType(u8),
     InvalidTransportProtocol(u8),
     InvalidRelayProvider(u8),
+    InvalidCandidateRelayProvider,
     InvalidCandidatePort,
     InvalidCandidateComponent,
     InvalidCandidateAddress,
@@ -2111,6 +2132,54 @@ mod tests {
         let encoded = candidate.encode().expect("encode");
         let decoded = IceCandidate::decode(&encoded).expect("decode");
         assert_eq!(decoded, candidate);
+    }
+
+    #[test]
+    fn ice_candidate_rejects_inconsistent_relay_provider() {
+        let mut candidate = IceCandidate {
+            foundation: [1; 8],
+            component: 1,
+            transport: TransportProtocol::Udp,
+            priority: compute_candidate_priority(CandidateType::Host, 100, 1),
+            candidate_type: CandidateType::Host,
+            relay_provider: RelayProvider::Turn,
+            ip: WireIpAddr::V4([192, 0, 2, 10]),
+            port: 50_000,
+            related_address: None,
+        };
+        assert!(candidate.validate().is_err());
+
+        candidate.candidate_type = CandidateType::Relayed;
+        candidate.relay_provider = RelayProvider::None;
+        candidate.priority = compute_candidate_priority(CandidateType::Relayed, 100, 1);
+        assert!(candidate.validate().is_err());
+    }
+
+    #[test]
+    fn ice_candidate_rejects_unspecified_and_multicast_addresses() {
+        let mut candidate = IceCandidate {
+            foundation: [1; 8],
+            component: 1,
+            transport: TransportProtocol::Udp,
+            priority: compute_candidate_priority(CandidateType::Host, 100, 1),
+            candidate_type: CandidateType::Host,
+            relay_provider: RelayProvider::None,
+            ip: WireIpAddr::V4([0, 0, 0, 0]),
+            port: 50_000,
+            related_address: None,
+        };
+        assert!(candidate.validate().is_err());
+
+        candidate.ip = WireIpAddr::V4([224, 0, 0, 1]);
+        assert!(candidate.validate().is_err());
+
+        candidate.ip = WireIpAddr::V6([0; 16]);
+        assert!(candidate.validate().is_err());
+
+        let mut multicast_v6 = [0; 16];
+        multicast_v6[0] = 0xff;
+        candidate.ip = WireIpAddr::V6(multicast_v6);
+        assert!(candidate.validate().is_err());
     }
 
     #[test]

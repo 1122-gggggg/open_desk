@@ -239,8 +239,10 @@ pub struct RouterStats {
 pub struct ConnectionRouter {
     is_controlling: bool,
     direct_check_timeout_ns: u64,
+    initial_check_started_ns: Option<u64>,
     probe_interval_ns: u64,
     last_probe_ns: u64,
+    next_probe_cursor: usize,
     local_candidates: Vec<IceCandidate>,
     remote_candidates: Vec<IceCandidate>,
     pairs: Vec<CandidatePair>,
@@ -255,8 +257,10 @@ impl ConnectionRouter {
         Self {
             is_controlling,
             direct_check_timeout_ns,
+            initial_check_started_ns: None,
             probe_interval_ns: 500_000_000, // 500ms
             last_probe_ns: 0,
+            next_probe_cursor: 0,
             local_candidates: Vec::new(),
             remote_candidates: Vec::new(),
             pairs: Vec::new(),
@@ -279,9 +283,27 @@ impl ConnectionRouter {
         remote: Vec<IceCandidate>,
         relay_session_id: u64,
         remote_peer_id: [u8; 16],
-    ) {
+    ) -> Result<(), NatError> {
+        if local.is_empty() || remote.is_empty() {
+            return Err(NatError::NoCandidatesAvailable);
+        }
+        if local.len() > MAX_CANDIDATES || remote.len() > MAX_CANDIDATES {
+            return Err(NatError::CandidateLimitReached);
+        }
+        if local
+            .iter()
+            .chain(remote.iter())
+            .any(|candidate| candidate.validate().is_err())
+        {
+            return Err(NatError::InvalidCandidate);
+        }
+
         self.local_candidates = local;
         self.remote_candidates = remote;
+        self.initial_check_started_ns = None;
+        self.last_probe_ns = 0;
+        self.next_probe_cursor = 0;
+        self.active_path = None;
 
         let mut pairs = Vec::new();
         for loc in &self.local_candidates {
@@ -295,19 +317,24 @@ impl ConnectionRouter {
         pairs.sort_by_key(|b| std::cmp::Reverse(b.pair_priority));
         self.pairs = pairs;
 
-        // Establish default fallback relay path
-        let relay_provider = self
+        // A relay path exists only after the caller supplies a real allocated
+        // relay candidate and nonzero session/peer identities. Never invent a
+        // TURN route from direct-only candidates.
+        self.fallback_relay_path = self
             .local_candidates
             .iter()
-            .find(|c| c.candidate_type == CandidateType::Relayed)
-            .map(|c| c.relay_provider)
-            .unwrap_or(RelayProvider::Turn);
-
-        self.fallback_relay_path = Some(ConnectionPath::Relay {
-            relay_session_id,
-            provider: relay_provider,
-            remote_peer_id,
-        });
+            .find(|candidate| {
+                candidate.candidate_type == CandidateType::Relayed
+                    && candidate.validate().is_ok()
+                    && relay_session_id != 0
+                    && remote_peer_id != [0; 16]
+            })
+            .map(|candidate| ConnectionPath::Relay {
+                relay_session_id,
+                provider: candidate.relay_provider,
+                remote_peer_id,
+            });
+        Ok(())
     }
 
     #[must_use]
@@ -356,38 +383,42 @@ impl ConnectionRouter {
             return Ok(path);
         }
 
-        // 2. If direct checks are still within initial check window, attempt top direct pair
-        let has_pending_direct = self
-            .pairs
-            .iter()
-            .any(|p| p.is_direct() && p.state != CandidatePairState::Failed);
+        // The timeout is a duration, not an absolute monotonic timestamp. It
+        // begins when this candidate generation is first evaluated.
+        let started_ns = *self.initial_check_started_ns.get_or_insert(now_ns);
+        let elapsed_ns = now_ns.saturating_sub(started_ns);
 
-        if has_pending_direct && now_ns < self.direct_check_timeout_ns {
-            self.stats.direct_attempts += 1;
+        // 2. Within the direct-check window, start the highest-priority waiting
+        // pair. If a check is already in progress, return that exact pair rather
+        // than accidentally resurrecting a failed higher-priority pair.
+        if elapsed_ns < self.direct_check_timeout_ns {
             if let Some(pair) = self
                 .pairs
                 .iter_mut()
-                .find(|p| p.is_direct() && p.state == CandidatePairState::Waiting)
+                .find(|pair| pair.is_direct() && pair.state == CandidatePairState::Waiting)
             {
                 pair.state = CandidatePairState::InProgress;
+                self.stats.direct_attempts = self.stats.direct_attempts.saturating_add(1);
+                return Ok(direct_path(*pair));
             }
-            // Return transient direct target for probing
-            if let Some(pair) = self.pairs.iter().find(|p| p.is_direct()) {
-                let path = ConnectionPath::Direct {
-                    local_ip: pair.local.ip,
-                    local_port: pair.local.port,
-                    remote_ip: pair.remote.ip,
-                    remote_port: pair.remote.port,
-                    pair_priority: pair.pair_priority,
-                };
-                return Ok(path);
+            if let Some(pair) = self
+                .pairs
+                .iter()
+                .find(|pair| pair.is_direct() && pair.state == CandidatePairState::InProgress)
+            {
+                return Ok(direct_path(*pair));
             }
         }
 
         // 3. Direct checks timed out or unavailable -> Seamless fallback to encrypted Relay
+        for pair in &mut self.pairs {
+            if pair.is_direct() && pair.state == CandidatePairState::InProgress {
+                pair.state = CandidatePairState::Failed;
+            }
+        }
         if let Some(relay_path) = self.fallback_relay_path {
             self.active_path = Some(relay_path);
-            self.stats.relay_fallbacks += 1;
+            self.stats.relay_fallbacks = self.stats.relay_fallbacks.saturating_add(1);
             return Ok(relay_path);
         }
 
@@ -451,18 +482,207 @@ impl ConnectionRouter {
             return None;
         }
 
-        // Find top unverified direct pair to probe
-        if let Some(pair) = self
-            .pairs
-            .iter_mut()
-            .find(|p| p.is_direct() && p.state != CandidatePairState::Succeeded)
-        {
-            pair.state = CandidatePairState::InProgress;
-            self.last_probe_ns = now_ns;
-            self.stats.probes_sent += 1;
-            return Some(*pair);
+        // Rotate through eligible direct pairs so one failed high-priority path
+        // cannot starve every other interface/address family forever.
+        let pair_count = self.pairs.len();
+        for offset in 0..pair_count {
+            let index = (self.next_probe_cursor + offset) % pair_count;
+            let pair = &mut self.pairs[index];
+            if pair.is_direct()
+                && !matches!(
+                    pair.state,
+                    CandidatePairState::Succeeded | CandidatePairState::InProgress
+                )
+            {
+                pair.state = CandidatePairState::InProgress;
+                self.next_probe_cursor = (index + 1) % pair_count;
+                self.last_probe_ns = now_ns;
+                self.stats.probes_sent = self.stats.probes_sent.saturating_add(1);
+                return Some(*pair);
+            }
         }
 
         None
+    }
+}
+
+fn direct_path(pair: CandidatePair) -> ConnectionPath {
+    ConnectionPath::Direct {
+        local_ip: pair.local.ip,
+        local_port: pair.local.port,
+        remote_ip: pair.remote.ip,
+        remote_port: pair.remote.port,
+        pair_priority: pair.pair_priority,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidates(
+        host_octets: &[[u8; 4]],
+        relay: bool,
+        preference_start: u16,
+    ) -> Vec<IceCandidate> {
+        let mut gatherer = CandidateGatherer::new();
+        for (index, octets) in host_octets.iter().copied().enumerate() {
+            gatherer
+                .add_host_candidate(
+                    WireIpAddr::V4(octets),
+                    5_000 + index as u16,
+                    1,
+                    preference_start.saturating_sub(index as u16),
+                )
+                .expect("host candidate");
+        }
+        if relay {
+            gatherer
+                .add_relay_candidate(
+                    WireIpAddr::V4([198, 51, 100, 10]),
+                    7_000,
+                    RelayProvider::Turn,
+                    1,
+                    1,
+                )
+                .expect("relay candidate");
+        }
+        gatherer.finish_gathering()
+    }
+
+    #[test]
+    fn direct_timeout_is_relative_to_the_first_selection() {
+        let mut router = ConnectionRouter::new(true, 1_000_000_000);
+        router
+            .set_candidates(
+                candidates(&[[10, 0, 0, 1]], true, 100),
+                candidates(&[[10, 0, 0, 2]], true, 100),
+                7,
+                [9; 16],
+            )
+            .expect("valid candidates");
+
+        assert!(matches!(
+            router.select_initial_path(10_000_000_000),
+            Ok(ConnectionPath::Direct { .. })
+        ));
+        assert!(matches!(
+            router.select_initial_path(11_000_000_001),
+            Ok(ConnectionPath::Relay { .. })
+        ));
+    }
+
+    #[test]
+    fn router_never_invents_a_relay_without_an_allocated_candidate() {
+        let mut router = ConnectionRouter::new(true, 100);
+        router
+            .set_candidates(
+                candidates(&[[10, 0, 0, 1]], false, 100),
+                candidates(&[[10, 0, 0, 2]], false, 100),
+                7,
+                [9; 16],
+            )
+            .expect("valid candidates");
+
+        let first = router.select_initial_path(1_000).expect("direct probe");
+        let pair_priority = match first {
+            ConnectionPath::Direct { pair_priority, .. } => pair_priority,
+            ConnectionPath::Relay { .. } => panic!("relay was not allocated"),
+        };
+        let pair_index = router
+            .pairs()
+            .iter()
+            .position(|pair| pair.pair_priority == pair_priority)
+            .expect("selected pair");
+        router.record_check_result(pair_index, false, 0, 1_001);
+
+        assert_eq!(
+            router.select_initial_path(1_101),
+            Err(NatError::NoValidPath)
+        );
+    }
+
+    #[test]
+    fn failed_high_priority_pair_advances_to_the_next_waiting_pair() {
+        let mut router = ConnectionRouter::new(true, 1_000_000_000);
+        router
+            .set_candidates(
+                candidates(&[[10, 0, 0, 1], [10, 0, 1, 1]], true, 100),
+                candidates(&[[10, 0, 0, 2]], true, 100),
+                7,
+                [9; 16],
+            )
+            .expect("valid candidates");
+
+        let first = router.select_initial_path(10).expect("first direct pair");
+        let first_priority = match first {
+            ConnectionPath::Direct { pair_priority, .. } => pair_priority,
+            ConnectionPath::Relay { .. } => panic!("expected direct pair"),
+        };
+        let first_index = router
+            .pairs()
+            .iter()
+            .position(|pair| pair.pair_priority == first_priority)
+            .expect("first pair index");
+        router.record_check_result(first_index, false, 0, 20);
+
+        let second = router.select_initial_path(30).expect("second direct pair");
+        assert!(matches!(
+            second,
+            ConnectionPath::Direct { pair_priority, .. } if pair_priority != first_priority
+        ));
+    }
+
+    #[test]
+    fn background_probing_rotates_after_a_failed_pair() {
+        let mut router = ConnectionRouter::new(true, 0);
+        router
+            .set_candidates(
+                candidates(&[[10, 0, 0, 1], [10, 0, 1, 1]], true, 100),
+                candidates(&[[10, 0, 0, 2]], true, 100),
+                7,
+                [9; 16],
+            )
+            .expect("valid candidates");
+        assert!(matches!(
+            router.select_initial_path(1),
+            Ok(ConnectionPath::Relay { .. })
+        ));
+
+        let first = router
+            .tick_background_probing(500_000_001)
+            .expect("first background pair");
+        let first_index = router
+            .pairs()
+            .iter()
+            .position(|pair| pair.pair_priority == first.pair_priority)
+            .expect("first pair index");
+        router.record_check_result(first_index, false, 0, 500_000_002);
+
+        let second = router
+            .tick_background_probing(1_000_000_002)
+            .expect("second background pair");
+        assert_ne!(second.pair_priority, first.pair_priority);
+    }
+
+    #[test]
+    fn router_rejects_invalid_or_unbounded_candidate_batches_before_mutation() {
+        let valid_remote = candidates(&[[10, 0, 0, 2]], false, 100);
+        let mut invalid_local = candidates(&[[10, 0, 0, 1]], false, 100);
+        invalid_local[0].relay_provider = RelayProvider::Turn;
+        let mut router = ConnectionRouter::new(true, 100);
+
+        assert_eq!(
+            router.set_candidates(invalid_local, valid_remote.clone(), 0, [0; 16]),
+            Err(NatError::InvalidCandidate)
+        );
+        assert!(router.pairs().is_empty());
+
+        let valid = valid_remote[0];
+        assert_eq!(
+            router.set_candidates(vec![valid; MAX_CANDIDATES + 1], valid_remote, 0, [0; 16]),
+            Err(NatError::CandidateLimitReached)
+        );
+        assert!(router.pairs().is_empty());
     }
 }
