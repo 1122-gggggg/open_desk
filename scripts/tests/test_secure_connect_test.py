@@ -32,6 +32,7 @@ def valid_result(**overrides: object) -> dict[str, object]:
         "host_exact_mtls_log": True,
         "client_exact_mtls_log": True,
         "client_fallback_selected": True,
+        "host_desktop_stream_log": True,
         "first_session_completed": True,
         "host_survived_first_session": True,
         "successor_session_distinct": True,
@@ -79,6 +80,13 @@ received: session_id=42 frames=3
         self.assertEqual(
             secure_connect_test.parse_received_all(client_output), [(41, 3), (42, 3)]
         )
+
+    def test_counts_only_explicit_linux_desktop_stream_announcements(self) -> None:
+        output = """stream: H.264 4:2:0 224x180 over QUIC DATAGRAM
+stream: explicit Raw NV12 320x180 over QUIC DATAGRAM
+stream: unverified 320x180 over QUIC DATAGRAM
+"""
+        self.assertEqual(secure_connect_test.parse_host_desktop_streams(output), 2)
 
     def test_does_not_accept_legacy_or_malformed_session_logs(self) -> None:
         self.assertIsNone(
@@ -145,6 +153,12 @@ class FailClosedValidationTests(unittest.TestCase):
 
         self.assertFalse(checks["client_fallback_selected"])
         self.assertTrue(any("fallback" in error for error in errors))
+
+    def test_two_real_desktop_stream_announcements_are_required(self) -> None:
+        checks, errors = self.validate(host_desktop_stream_log=False)
+
+        self.assertFalse(checks["host_desktop_stream_log"])
+        self.assertTrue(any("desktop stream" in error for error in errors))
 
     def test_successor_requires_first_cleanup_and_distinct_session(self) -> None:
         checks, errors = self.validate(

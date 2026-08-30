@@ -47,7 +47,6 @@ UNSAFE_FLAG = "--unsafe-udp-lab"
 HOST_READY_MARKER = "Listening securely on"
 HOST_MTLS_MARKER = "mTLS: exact client certificate authenticated"
 HOST_REJECTION_MARKER = "mTLS: rejected unauthenticated connection"
-HOST_STREAM_MARKER = "stream: NV12"
 HOST_SHUTDOWN_MARKER = "shutdown: Ctrl-C requested"
 HOST_PEER_COMPLETED_MARKER = "session: peer completed normally"
 CLIENT_MTLS_MARKER = "mTLS: exact host certificate authenticated"
@@ -69,6 +68,10 @@ RECEIVED_RE = re.compile(
 )
 CLIENT_ROUTE_RE = re.compile(
     r"^route:\s*authenticated\s+(\S+)\s+after\s+racing\s+(\d+)\s+candidate\(s\)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+HOST_DESKTOP_STREAM_RE = re.compile(
+    r"^stream:\s+(?:H\.264 4:2:0|explicit Raw NV12)\s+\d+x\d+\s+over QUIC DATAGRAM\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -282,6 +285,10 @@ def parse_client_routes(output: str) -> list[tuple[str, int]]:
     return [(remote, int(count)) for remote, count in CLIENT_ROUTE_RE.findall(output)]
 
 
+def parse_host_desktop_streams(output: str) -> int:
+    return len(HOST_DESKTOP_STREAM_RE.findall(output))
+
+
 def sanitize_log(text: str, sensitive_root: Path, limit: int = TAIL_CHARS) -> str:
     """Redact the owned credential directory before retaining a bounded tail."""
     variants = {
@@ -423,6 +430,7 @@ def validate_secure_result(
     host_exact_mtls_log: bool,
     client_exact_mtls_log: bool,
     client_fallback_selected: bool,
+    host_desktop_stream_log: bool,
     first_session_completed: bool,
     host_survived_first_session: bool,
     successor_session_distinct: bool,
@@ -460,6 +468,7 @@ def validate_secure_result(
         "host_exact_mtls_log": host_exact_mtls_log,
         "client_exact_mtls_log": client_exact_mtls_log,
         "client_fallback_selected": client_fallback_selected,
+        "host_desktop_stream_log": host_desktop_stream_log,
         "first_session_completed": first_session_completed,
         "host_survived_first_session": host_survived_first_session,
         "successor_session_distinct": successor_session_distinct,
@@ -502,6 +511,9 @@ def validate_secure_result(
         "client_exact_mtls_log": "client exact-certificate mTLS transport log is missing",
         "client_fallback_selected": (
             "valid client did not authenticate through the configured fallback address"
+        ),
+        "host_desktop_stream_log": (
+            "host did not announce one authenticated desktop stream per valid session"
         ),
         "first_session_completed": "first valid session did not receive its requested frames",
         "host_survived_first_session": "host listener exited before the successor session",
@@ -684,6 +696,7 @@ def run_secure_smoke(
         "host_exact_mtls_log": False,
         "client_exact_mtls_log": False,
         "client_fallback_selected": False,
+        "host_desktop_stream_log": False,
         "first_session_completed": False,
         "host_survived_first_session": False,
         "successor_session_distinct": False,
@@ -835,6 +848,8 @@ def run_secure_smoke(
     observation["client_exact_mtls_log"] = (
         client_output.lower().count(CLIENT_MTLS_MARKER.lower()) >= 2
     )
+    host_desktop_streams = parse_host_desktop_streams(host_output)
+    observation["host_desktop_stream_log"] = host_desktop_streams >= 2
     client_routes = parse_client_routes(client_output)
     selected_remote, candidate_attempts = client_routes[-1] if client_routes else (None, 0)
     observation["client_fallback_selected"] = (
@@ -919,6 +934,7 @@ def run_secure_smoke(
         host_exact_mtls_log=bool(observation["host_exact_mtls_log"]),
         client_exact_mtls_log=bool(observation["client_exact_mtls_log"]),
         client_fallback_selected=bool(observation["client_fallback_selected"]),
+        host_desktop_stream_log=bool(observation["host_desktop_stream_log"]),
         first_session_completed=bool(observation["first_session_completed"]),
         host_survived_first_session=bool(observation["host_survived_first_session"]),
         successor_session_distinct=bool(observation["successor_session_distinct"]),
@@ -945,6 +961,7 @@ def run_secure_smoke(
                 "host_session_id": observation["host_session_id"],
                 "host_session_ids": host_session_ids,
                 "host_lifecycles": host_lifecycles,
+                "host_desktop_streams": host_desktop_streams,
                 "first_client_session_id": observation["first_client_session_id"],
                 "first_client_received_frames": observation["first_client_received_frames"],
                 "client_session_id": observation["client_session_id"],
@@ -973,7 +990,8 @@ def run_secure_smoke(
     )
     report["real_desktop_capture"] = bool(
         not errors
-        and HOST_STREAM_MARKER.lower() in host_output.lower()
+        and observation["host_desktop_stream_log"]
+        and first_received_frames >= args.frames
         and received_frames >= args.frames
     )
     return report
