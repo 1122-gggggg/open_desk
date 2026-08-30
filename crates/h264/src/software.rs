@@ -7,7 +7,7 @@
 use crate::{wrap_access_unit, ContinuityPlanner, H264Error, LowDelayPolicy};
 use latencydesk_codec::EncodedAccessUnit;
 use openh264::decoder::Decoder;
-use openh264::encoder::{Encoder, EncoderConfig};
+use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate};
 use openh264::formats::{YUVSlices, YUVSource};
 
 pub struct SoftwareH264Encoder {
@@ -49,10 +49,10 @@ impl SoftwareH264Encoder {
         let y_len = (width as usize).saturating_mul(height as usize);
         let uv_len = y_len / 4;
         let config = EncoderConfig::new()
-            .set_bitrate_bps(target_bitrate_bps.max(64_000))
-            .max_frame_rate(fps as f32)
-            .enable_skip_frame(false)
-            .set_multiple_thread_idc(1);
+            .bitrate(BitRate::from_bps(target_bitrate_bps.max(64_000)))
+            .max_frame_rate(FrameRate::from_hz(fps as f32))
+            .skip_frames(false)
+            .num_threads(1);
         let encoder = Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
             .map_err(|_| H264Error::SoftwareEncode)?;
         Ok(Self {
