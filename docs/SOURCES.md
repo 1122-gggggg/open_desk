@@ -1,6 +1,6 @@
 # Primary Technical Sources
 
-Reviewed for the architecture on 2026-08-13. These links are implementation references, not blanket endorsements or performance proof.
+Reviewed for the architecture on 2026-08-30. These links are implementation references, not blanket endorsements or performance proof.
 
 ## Windows
 
@@ -21,6 +21,7 @@ Reviewed for the architecture on 2026-08-13. These links are implementation refe
 - IETF RFC 9000 — QUIC: https://www.rfc-editor.org/rfc/rfc9000
 - IETF RFC 9001 — Using TLS to Secure QUIC: https://www.rfc-editor.org/rfc/rfc9001
 - IETF RFC 9221 — QUIC DATAGRAM: https://www.rfc-editor.org/rfc/rfc9221
+- Quinn 0.11.8 `SendStream::set_priority`: https://docs.rs/quinn/0.11.8/quinn/struct.SendStream.html#method.set_priority
 - IETF RFC 8445 — ICE: https://www.rfc-editor.org/rfc/rfc8445
 - IETF RFC 8656 — TURN: https://www.rfc-editor.org/rfc/rfc8656
 
@@ -35,8 +36,14 @@ Reviewed for the architecture on 2026-08-13. These links are implementation refe
 ## Adjacent open-source projects — architecture/provenance review only
 
 - RustDesk: https://github.com/rustdesk/rustdesk
+- RustDesk video service: https://github.com/rustdesk/rustdesk/blob/master/src/server/video_service.rs
+- RustDesk license boundary: https://github.com/rustdesk/rustdesk/blob/master/LICENCE
 - Sunshine: https://github.com/LizardByte/Sunshine
+- Sunshine low-latency encoder configuration: https://github.com/LizardByte/Sunshine/blob/master/docs/configuration.md
+- Moonlight latency and frame-pacing FAQ: https://github.com/moonlight-stream/moonlight-docs/wiki/Frequently-Asked-Questions
 - Moonlight common core: https://github.com/moonlight-stream/moonlight-common-c
+- Selkies WebRTC/congestion-control FAQ: https://github.com/selkies-project/selkies/blob/main/docs/faq.md
+- TigerVNC: https://github.com/TigerVNC/tigervnc
 - FreeRDP: https://github.com/FreeRDP/FreeRDP
 
 Before implementing a provider, re-check the current official API, SDK, platform, license, and distribution terms. This source list does not freeze them.

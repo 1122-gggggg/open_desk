@@ -16,8 +16,9 @@ Windows client on a trusted, low-latency LAN.
 | --- | --- | --- |
 | Secure transport | TLS 1.3-only mTLS over Quinn QUIC; both sides pin and byte-check the expected leaf certificate; no automatic UDP downgrade | Default product path; in-process tests pass |
 | Device identity | `latencydesk-identity` creates persistent self-signed certificate DER and PKCS#8 private-key DER files without overwriting an existing identity | Implemented; certificate exchange is manual |
-| Control and input | Authenticated product handshake and session-stamped reliable QUIC lanes | Implemented and tested in process |
-| Linux host | Real X11 root capture, CPU BGRA-to-NV12 conversion, and reconciled XTEST input | Secure alpha path; X11-to-headless process loopback is verified, while cross-machine rendering and visible input effects remain pending |
+| Control and input | Authenticated product handshake; session-stamped reliable QUIC lanes; the input stream has higher Quinn send priority than control | Implemented and tested in process |
+| Concurrent targets | Repeatable `--target <ADDR>,<PEER_CERT>` launches 2–16 isolated secure client processes so one controller can open several exact-pinned Hosts at once | Implemented and parser/planner tested; cross-machine multi-Host soak remains pending |
+| Linux host | Real X11 root capture, CPU BGRA-to-NV12 conversion, and reconciled XTEST input on a connection/task isolated from blocking capture and software encode | Secure alpha path; X11-to-headless process loopback is verified, while visible input latency and cross-machine rendering remain pending |
 | Windows client | Strict raw-NV12 validation, Direct3D 11 viewer, bounded latest-frame presentation, and native input forwarding; `--frames` provides headless mode | Secure alpha path; Windows viewer cross-machine E2E evidence is still pending |
 | Other clients | Portable software viewer with OpenH264/raw-NV12 presentation and input forwarding; headless receive and input probe remain available | Alpha implementation; cross-machine and native-UX evidence pending |
 | Windows host | Secure hosting is rejected before opening a socket because real capture/input providers are not connected | Unsupported |
@@ -52,6 +53,17 @@ and secure-default CLI parsing:
 ```bash
 cargo test --locked -p latencydesk-socket-transport -p latencydesk-identity -p latencydesk-host -p latencydesk-client
 ```
+
+The deterministic stress gate overlaps eight independent simulated sessions,
+runs all four network profiles per session, and proves that an input item is the
+first scheduler pop even when each session's realtime-video queue is saturated:
+
+```bash
+cargo run --locked -p latencydesk-stress
+```
+
+This is a queue-isolation and accounting gate, not an optical latency result or
+a substitute for real multi-machine testing.
 
 The repository also has a process-level secure loopback gate for Linux X11. It
 generates disposable identities, proves that a rogue certificate is rejected
@@ -151,6 +163,26 @@ For a bounded headless receive check on any supported client platform, add
 `--frames 60`. The portable viewer is an alpha software path; cross-machine
 rendering, input effects, resize/DPI behavior, and long-duration recovery remain
 product-readiness gates rather than verified support claims.
+
+### 4. Open several exact-pinned Hosts concurrently
+
+Use one repeatable `--target` entry per Host. Each Host must trust the same
+client identity certificate, while every target entry supplies that Host's own
+exact certificate pin. The supervisor starts an isolated child process per
+target, so one Host's viewer, queue, or connection failure does not share runtime
+state with another. Paths containing commas are not accepted by this alpha CLI.
+
+```bash
+cargo run --locked -p latencydesk-client -- \
+  --identity-cert "$HOME/.local/share/latencydesk/client/identity.cert.der" \
+  --identity-key "$HOME/.local/share/latencydesk/client/identity.key.der" \
+  --target "192.168.1.20:9000,$HOME/.local/share/latencydesk/peers/host-a.cert.der" \
+  --target "192.168.1.21:9000,$HOME/.local/share/latencydesk/peers/host-b.cert.der"
+```
+
+The current bound is 16 unique address/certificate pairs and requires an
+ephemeral local bind port. This supports one Client controlling multiple Hosts;
+it does not make one Host accept multiple controllers.
 
 This is the intended secure workflow. The repository retains a successful
 single-machine X11-to-headless process result, but not a cross-machine Windows

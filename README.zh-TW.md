@@ -15,8 +15,9 @@ Client。
 | --- | --- | --- |
 | 安全傳輸 | Quinn QUIC 上僅允許 TLS 1.3 的 mTLS；雙方 pin 並逐 byte 檢查預期 leaf certificate；不會自動降級 UDP | 預設產品路徑；in-process 測試通過 |
 | 裝置身分 | `latencydesk-identity` 產生持久的 self-signed certificate DER 與 PKCS#8 private-key DER，且不覆寫現有身分 | 已實作；certificate 仍須手動交換 |
-| 控制與輸入 | 已驗證的產品握手、帶 session stamp 的可靠 QUIC lane | 已實作並通過 in-process 測試 |
-| Linux Host | 真實 X11 root 擷取、CPU BGRA-to-NV12 轉換、經狀態協調的 XTEST 輸入 | 安全 Alpha 路徑；X11 到 headless 的 process loopback 已驗證，跨機器呈現與可見輸入效果仍待完成 |
+| 控制與輸入 | 已驗證的產品握手、帶 session stamp 的可靠 QUIC lane；input stream 的 Quinn 傳送優先權高於 control | 已實作並通過 in-process 測試 |
+| 同時連線多台 Host | 可重複使用 `--target <ADDR>,<PEER_CERT>`，以 2–16 個隔離的安全 Client 子程序同時開啟多台 exact-pinned Host | 已實作並通過 parser／planner 測試；跨機器多 Host soak 仍待完成 |
+| Linux Host | 真實 X11 root 擷取、CPU BGRA-to-NV12 轉換，以及在獨立連線／task 中執行、不受擷取與軟體編碼阻塞的 XTEST 輸入 | 安全 Alpha 路徑；X11 到 headless 的 process loopback 已驗證，可見輸入延遲與跨機器呈現仍待完成 |
 | Windows Client | 嚴格 raw-NV12 驗證、Direct3D 11 Viewer、有界 latest-frame 呈現及原生輸入轉送；`--frames` 可 headless 執行 | 安全 Alpha 路徑；Windows Viewer 跨機器 E2E 證據仍待完成 |
 | 其他 Client | 已有可攜式軟體 Viewer（OpenH264／raw NV12 顯示與輸入轉送），並保留 headless 收幀及 input probe | Alpha 實作；跨機器與原生 UX 證據仍待完成 |
 | Windows Host | 因真實 capture/input provider 尚未接線，安全 Host 會在開 socket 前拒絕執行 | 不支援 |
@@ -49,6 +50,16 @@ cargo fmt --all -- --check
 ```bash
 cargo test --locked -p latencydesk-socket-transport -p latencydesk-identity -p latencydesk-host -p latencydesk-client
 ```
+
+確定性的壓力 gate 會同時啟動 8 個彼此獨立的模擬 session，每個 session 跑完
+4 種網路 profile，並驗證每個 session 的 realtime-video queue 完全飽和時，input
+仍會在第一次 scheduler pop 被服務：
+
+```bash
+cargo run --locked -p latencydesk-stress
+```
+
+這只能證明 queue 隔離與帳務不變量，不是光學延遲結果，也不能取代真實多機測試。
 
 倉庫另有 Linux X11 的程序級安全 loopback gate。它會產生拋棄式 identity，
 證明 rogue certificate 先被拒絕、之後仍可接受 pinned Client，完成 TLS 1.3
@@ -143,6 +154,24 @@ cargo run --locked -p latencydesk-client -- \
 若要在支援的 Client 平台做有限次數 headless 收幀檢查，可加入
 `--frames 60`。可攜式 Viewer 仍是 Alpha 軟體路徑；跨機器呈現、可見輸入
 效果、resize／DPI 與長時間復原仍是產品就緒度 gate，不能視為已驗證支援。
+
+### 4. 同時開啟多台 exact-pinned Host
+
+每台 Host 各加入一組可重複的 `--target`。所有 Host 都必須信任同一張 Client
+identity certificate，而每一組 target 都要提供該 Host 自己的 exact certificate
+pin。Supervisor 會為每台 Host 啟動隔離的子程序，因此某一台的 Viewer、queue
+或連線故障不會和其他台共用 runtime 狀態。這個 Alpha CLI 不接受含逗號的路徑。
+
+```bash
+cargo run --locked -p latencydesk-client -- \
+  --identity-cert "$HOME/.local/share/latencydesk/client/identity.cert.der" \
+  --identity-key "$HOME/.local/share/latencydesk/client/identity.key.der" \
+  --target "192.168.1.20:9000,$HOME/.local/share/latencydesk/peers/host-a.cert.der" \
+  --target "192.168.1.21:9000,$HOME/.local/share/latencydesk/peers/host-b.cert.der"
+```
+
+目前上限是 16 組不重複的 address／certificate，且 local bind port 必須為 0。
+此功能是「一個 Client 控制多台 Host」，不代表單一 Host 可接受多個 controller。
 
 這是預期的安全操作流程。倉庫已保留成功的單機 X11 到 headless process
 結果，但尚未有跨機器 Windows Viewer 結果。請把失敗視為 Alpha 缺陷，

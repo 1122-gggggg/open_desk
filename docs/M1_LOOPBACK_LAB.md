@@ -71,10 +71,15 @@ cargo run -p latencydesk-lab -- \
   --csv artifacts/lab-trace.csv \
   --report artifacts/lab-report.json
 
-cargo run -p latencydesk-stress -- \
-  --iterations 1000000 --max-len 4096 \
-  --output artifacts/parser-stress.json
+cargo run --locked -p latencydesk-stress \
+  > artifacts/multisession-stress.json
 ```
+
+The stress executable overlaps eight isolated sessions behind a start barrier,
+runs four deterministic network profiles per session, checks exact frame
+accounting, and saturates each session's realtime-video scheduler before
+asserting that input is serviced on the first pop. Its JSON result is a
+deterministic software gate, not physical input-to-photon evidence.
 
 ## Exit criteria
 
