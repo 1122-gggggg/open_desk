@@ -721,6 +721,8 @@ name = "latencydesk-route-probe"
 version = "0.1.0-alpha.2"
 dependencies = [
  "latencydesk-protocol",
+ "latencydesk-rendezvous",
+ "latencydesk-rendezvousd",
  "latencydesk-socket-transport",
  "latencydesk-transport",
  "quinn",

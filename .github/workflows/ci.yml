@@ -129,6 +129,23 @@ jobs:
           path: artifacts/ci/turn-product-process.json
           if-no-files-found: error
           retention-days: 30
+      - name: Integrated rendezvous-derived route process gate
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p artifacts/ci
+          python3 scripts/rendezvous_route_process_test.py \
+            --binary target/debug/latencydesk-route-probe \
+            --rendezvous-bin target/debug/latencydesk-rendezvousd \
+            --identity-bin target/debug/latencydesk-identity \
+            --timeout 20 --output artifacts/ci/rendezvous-route-process.json
+      - name: Upload integrated rendezvous route evidence
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v7
+        with:
+          name: rendezvous-route-process-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/ci/rendezvous-route-process.json
+          if-no-files-found: error
+          retention-days: 30
       - name: Isolated NAT behavior and exact-mTLS ProductSession matrices
         if: matrix.os == 'ubuntu-latest'
         run: |

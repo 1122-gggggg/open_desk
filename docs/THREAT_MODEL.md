@@ -131,7 +131,14 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
   context; callers cannot supply it and the exporter secret is zeroized.
   Rollback creates another bounded promotion token instead of changing
   authority unilaterally. The current harness still supplies its route digest,
-  so committed rendezvous/ICE nomination provenance remains a separate gate;
+  while the stricter integrated gate accepts route metadata only through the
+  opaque Complete-gated rendezvous token. It gives the Client no product
+  destination flags, validates exactly two committed Responder Host candidates,
+  normalizes both canonical registrations/device IDs, and derives equal
+  per-path digests before TLS-exporter binding. Client destination and Server
+  peer-source tuples must equal the indexed committed candidates. This remains loopback
+  process evidence; normal desktop orchestration and authenticated ICE consent
+  remain separate gates;
 - the underlying rendezvous state never trusts a payload to name its sender.
   The daemon supplies `DeviceId` from the authenticated client certificate; a
   match requires reciprocal exact expected-peer fingerprints,

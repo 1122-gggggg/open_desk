@@ -375,8 +375,14 @@ immutable transcript digest is now derived internally from Quinn's TLS exporter
 using a fixed label and a canonical binary context containing the full
 `SessionStamp` plus route digest. Callers cannot inject a transcript digest;
 the 32-byte exporter secret is zeroized and never exposed. The route-probe's
-route digest is still harness-generated rather than a typed committed
-rendezvous/ICE nomination proof, so automatic route admission remains pending.
+legacy mode still uses a harness-generated route digest. Its integrated mode
+instead requires the opaque Complete-gated rendezvous token, takes two product
+destinations only from the committed Responder registration, normalizes
+Initiator/Responder registration order, and hashes both canonical
+registrations, exact device IDs, full stamp, path index, and committed candidate
+before TLS-exporter binding. The Client's observed destinations and Server's
+observed peer source tuples must also equal the indexed committed Responder and
+Initiator candidates respectively.
 
 The process gate below starts separate server/client processes on two distinct
 loopback UDP ports, promotes epoch 1→2, transfers exact control/input/media
@@ -391,8 +397,27 @@ python3 scripts/route_promotion_process_test.py \
   --timeout 20 --output artifacts/route-promotion-process.json
 ```
 
+The stricter three-process gate starts the exact-mTLS rendezvous daemon plus
+route Server and Client. The Client receives no `--host`/`--host2` arguments;
+the committed registration is its only product destination source:
+
+```bash
+python3 scripts/rendezvous_route_process_test.py \
+  --binary target/debug/latencydesk-route-probe \
+  --rendezvous-bin target/debug/latencydesk-rendezvousd \
+  --identity-bin target/debug/latencydesk-identity \
+  --timeout 20 --output artifacts/rendezvous-route-process.json
+```
+
+It requires equal nonzero/distinct route digests on both peers, exact
+match/generation/exchange agreement, three live native process identities and
+the exact three declared UDP ports owned by each route PID, committed
+candidate/source equality, exact-mTLS, epoch 2 promotion, injected active-path
+failure, epoch 3 retained rollback, and exact control/input/media payloads.
+
 This is real two-process exact-mTLS product-lane evidence, but only on one
-machine and two loopback paths. The normal desktop Host/Client still does not
+machine and two loopback paths; the integrated variant uses three processes.
+The normal desktop Host/Client still does not
 automatically create this route set from rendezvous/ICE/TURN, and physical
 router, CGNAT, relay-failure, inter-network, and latency claims remain pending.
 

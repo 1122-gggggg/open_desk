@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 latencydesk-protocol = { path = "../../crates/protocol" }
+latencydesk-rendezvous = { path = "../../crates/rendezvous" }
+latencydesk-rendezvousd = { path = "../rendezvous" }
 latencydesk-socket-transport = { path = "../../crates/socket-transport" }
 latencydesk-transport = { path = "../../crates/transport" }
 quinn.workspace = true
