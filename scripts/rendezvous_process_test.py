@@ -34,7 +34,9 @@ CLIENT_REPORT_RE = re.compile(
     r"desktop_payload=(true|false)\s+relay=(true|false)\s*$",
     re.I | re.M,
 )
-SECRET_RE = re.compile(r"(?:private[-_ ]?key|ice[-_ ]?(?:ufrag|password)|BEGIN .*PRIVATE)", re.I)
+SECRET_RE = re.compile(
+    r"(?:private[-_ ]?key|ice[-_ ]?(?:ufrag|password)|BEGIN .*PRIVATE)", re.I
+)
 
 
 def free_udp_port() -> int:
@@ -67,6 +69,8 @@ def server_command(
         str(timeout),
         "--max-registrations",
         "2",
+        "--max-matches",
+        "1",
     ]
 
 
@@ -230,7 +234,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "stranger": stranger.output(),
             }
             if any(SECRET_RE.search(output) for output in outputs.values()):
-                raise ValueError("rendezvous process output contains secret-like material")
+                raise ValueError(
+                    "rendezvous process output contains secret-like material"
+                )
             server_report = parse_server(outputs["server"])
             client_a_report = parse_client(outputs["client_a"], "initiator")
             client_b_report = parse_client(outputs["client_b"], "responder")

@@ -1,4 +1,4 @@
-use latencydesk_rendezvousd::serve_one_match;
+use latencydesk_rendezvousd::serve_matches;
 use latencydesk_socket_transport::identity::{
     load_certificate_der, mtls_server_config_for_exact_clients, TlsIdentity,
 };
@@ -12,8 +12,8 @@ use std::time::Duration;
 const HELP: &str = "Usage: latencydesk-rendezvousd \
 --listen <UNICAST_ADDR> \
 --identity-cert <DER> --identity-key <PKCS8_DER> \
---allowed-client-cert <DER> --allowed-client-cert <DER> \
---total-timeout <1..=3600> --max-registrations 2";
+--allowed-client-cert <DER> (2..=32) --total-timeout <1..=3600> \
+--max-registrations <2..=64> --max-matches <1..=32>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Args {
@@ -23,6 +23,7 @@ struct Args {
     allowed_clients: Vec<PathBuf>,
     total_timeout: Duration,
     max_registrations: usize,
+    max_matches: usize,
 }
 
 fn parse_from<I, S>(args: I) -> Result<Args, String>
@@ -40,6 +41,7 @@ where
     let mut allowed_clients = Vec::new();
     let mut timeout_seconds = None;
     let mut max_registrations = None;
+    let mut max_matches = None;
     let mut index = 1;
     while index < values.len() {
         let flag = values[index].as_str();
@@ -62,6 +64,9 @@ where
             "--max-registrations" => {
                 max_registrations = Some(value.parse::<usize>().map_err(|_| "invalid maximum")?);
             }
+            "--max-matches" => {
+                max_matches = Some(value.parse::<usize>().map_err(|_| "invalid maximum")?);
+            }
             other => return Err(format!("unknown option {other}")),
         }
         index += 2;
@@ -72,16 +77,25 @@ where
     }
     let certificate = certificate.ok_or("--identity-cert is required")?;
     let private_key = private_key.ok_or("--identity-key is required")?;
-    if allowed_clients.len() != 2 || allowed_clients[0] == allowed_clients[1] {
-        return Err("exactly two distinct --allowed-client-cert paths are required".into());
+    if !(2..=32).contains(&allowed_clients.len())
+        || allowed_clients
+            .iter()
+            .enumerate()
+            .any(|(index, path)| allowed_clients[..index].contains(path))
+    {
+        return Err("2..=32 distinct --allowed-client-cert paths are required".into());
     }
     let timeout_seconds = timeout_seconds.ok_or("--total-timeout is required")?;
     if !(1..=3_600).contains(&timeout_seconds) {
         return Err("--total-timeout must be in 1..=3600".into());
     }
     let max_registrations = max_registrations.ok_or("--max-registrations is required")?;
-    if max_registrations != 2 {
-        return Err("this bounded service requires --max-registrations 2".into());
+    if !(2..=64).contains(&max_registrations) {
+        return Err("--max-registrations must be in 2..=64".into());
+    }
+    let max_matches = max_matches.ok_or("--max-matches is required")?;
+    if !(1..=32).contains(&max_matches) || max_matches.saturating_mul(2) > max_registrations {
+        return Err("--max-matches must be 1..=32 and fit registration cap".into());
     }
     Ok(Args {
         listen,
@@ -90,6 +104,7 @@ where
         allowed_clients,
         total_timeout: Duration::from_secs(timeout_seconds),
         max_registrations,
+        max_matches,
     })
 }
 
@@ -109,7 +124,6 @@ fn remaining_before(deadline: tokio::time::Instant) -> Result<Duration, &'static
 }
 
 async fn run(args: Args) -> Result<(), Box<dyn Error>> {
-    debug_assert_eq!(args.max_registrations, 2);
     let identity = TlsIdentity::load_der(&args.certificate, &args.private_key)?;
     let allowed = args
         .allowed_clients
@@ -123,7 +137,13 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
     let service_budget = remaining_before(deadline)?;
     let result = tokio::time::timeout(
         service_budget,
-        serve_one_match(&endpoint, &allowed, service_budget),
+        serve_matches(
+            &endpoint,
+            &allowed,
+            service_budget,
+            args.max_registrations,
+            args.max_matches,
+        ),
     )
     .await
     .map_err(|_| "rendezvous total lifecycle deadline elapsed");
@@ -142,6 +162,10 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
+    if env::args().nth(1).as_deref() == Some("--version") {
+        println!("latencydesk-rendezvousd {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let args = match parse_from(env::args()) {
         Ok(args) => args,
         Err(error) => {
@@ -176,6 +200,8 @@ mod tests {
             "30",
             "--max-registrations",
             "2",
+            "--max-matches",
+            "1",
         ]
     }
 
@@ -186,6 +212,7 @@ mod tests {
         assert_eq!(parsed.allowed_clients.len(), 2);
         assert_eq!(parsed.total_timeout, Duration::from_secs(30));
         assert_eq!(parsed.max_registrations, 2);
+        assert_eq!(parsed.max_matches, 1);
     }
 
     #[test]
@@ -194,7 +221,7 @@ mod tests {
             ("127.0.0.1:9443", "0.0.0.0:9443"),
             ("127.0.0.1:9443", "127.0.0.1:0"),
             ("30", "0"),
-            ("2", "3"),
+            ("2", "65"),
         ] {
             let args = valid_args()
                 .into_iter()

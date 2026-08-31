@@ -618,7 +618,16 @@ def repository_state() -> tuple[str | None, bool | None]:
     try:
         dirty = bool(
             subprocess.run(
-                ["git", "status", "--porcelain", "--untracked-files=no"],
+                [
+                    "git",
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=normal",
+                    "--",
+                    ".",
+                    ":(exclude)artifacts",
+                    ":(exclude)target",
+                ],
                 cwd=str(ROOT),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,

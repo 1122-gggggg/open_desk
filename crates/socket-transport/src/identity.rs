@@ -50,7 +50,7 @@ pub const QUIC_DATAGRAM_SEND_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum exact-pinned endpoints raced for one logical Host connection.
 pub const MAX_PARALLEL_CONNECT_CANDIDATES: usize = 4;
 /// Maximum exact client leaves trusted by one bounded rendezvous endpoint.
-pub const MAX_ALLOWED_EXACT_CLIENTS: usize = 16;
+pub const MAX_ALLOWED_EXACT_CLIENTS: usize = 32;
 /// Negotiated idle bound for detecting a dead authenticated network path.
 pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Keepalive cadence used while an interactive session would otherwise be idle.
@@ -213,8 +213,9 @@ impl fmt::Display for IdentityError {
             Self::PeerCertificateMismatch => {
                 formatter.write_str("authenticated peer leaf did not match the exact certificate")
             }
-            Self::InvalidAllowedPeerSet => formatter.write_str(
-                "exact client certificate allowlist must contain 1..=16 unique leaves",
+            Self::InvalidAllowedPeerSet => write!(
+                formatter,
+                "exact client certificate allowlist must contain 1..={MAX_ALLOWED_EXACT_CLIENTS} unique leaves"
             ),
             Self::NoConnectionCandidates => {
                 formatter.write_str("no connection candidates were supplied")
@@ -1701,6 +1702,9 @@ mod tests {
     fn allowed_client_set_rejects_empty_duplicate_and_unbounded_inputs() {
         let server_identity = TlsIdentity::generate("Rendezvous Server").unwrap();
         let client = TlsIdentity::generate("Rendezvous Client").unwrap();
+        assert!(IdentityError::InvalidAllowedPeerSet
+            .to_string()
+            .contains(&MAX_ALLOWED_EXACT_CLIENTS.to_string()));
         assert!(matches!(
             mtls_server_config_for_exact_clients(&server_identity, &[]),
             Err(IdentityError::InvalidAllowedPeerSet)

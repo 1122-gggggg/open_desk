@@ -36,6 +36,8 @@ impl fmt::Debug for DeviceId {
 pub struct RendezvousLimits {
     pub max_pending: usize,
     pub max_pending_per_device: usize,
+    pub max_successful_registrations: usize,
+    pub max_matches: usize,
 }
 
 impl Default for RendezvousLimits {
@@ -43,6 +45,8 @@ impl Default for RendezvousLimits {
         Self {
             max_pending: 1_024,
             max_pending_per_device: 4,
+            max_successful_registrations: 64,
+            max_matches: 32,
         }
     }
 }
@@ -51,7 +55,10 @@ impl RendezvousLimits {
     fn validate(self) -> Result<Self, RendezvousError> {
         if !(1..=4_096).contains(&self.max_pending)
             || !(1..=16).contains(&self.max_pending_per_device)
+            || !(2..=64).contains(&self.max_successful_registrations)
+            || !(1..=32).contains(&self.max_matches)
             || self.max_pending_per_device > self.max_pending
+            || self.max_matches.saturating_mul(2) > self.max_successful_registrations
         {
             return Err(RendezvousError::InvalidLimits);
         }
@@ -122,11 +129,19 @@ struct StoredDelivery {
 }
 
 #[derive(Debug)]
+struct ReservedMatch {
+    expires_at: u64,
+}
+
+#[derive(Debug)]
 pub struct RendezvousBroker {
     limits: RendezvousLimits,
     pending: HashMap<[u8; 16], PendingRegistration>,
     deliveries: HashMap<(DeviceId, [u8; 16]), StoredDelivery>,
+    reserved: HashMap<[u8; 16], ReservedMatch>,
     completed: HashMap<[u8; 16], u64>,
+    successful_registrations: usize,
+    matches: usize,
 }
 
 impl RendezvousBroker {
@@ -135,7 +150,10 @@ impl RendezvousBroker {
             limits: limits.validate()?,
             pending: HashMap::new(),
             deliveries: HashMap::new(),
+            reserved: HashMap::new(),
             completed: HashMap::new(),
+            successful_registrations: 0,
+            matches: 0,
         })
     }
 
@@ -152,6 +170,7 @@ impl RendezvousBroker {
         }
         let match_id = registration.match_id;
         if self.completed.contains_key(&match_id)
+            || self.reserved.contains_key(&match_id)
             || self
                 .deliveries
                 .contains_key(&(authenticated_device, match_id))
@@ -161,6 +180,9 @@ impl RendezvousBroker {
         let expires_at = now
             .checked_add(u64::from(registration.ttl_seconds))
             .ok_or(RendezvousError::TimeOverflow)?;
+        if self.successful_registrations >= self.limits.max_successful_registrations {
+            return Err(RendezvousError::Capacity);
+        }
 
         if let Some(waiting) = self.pending.get(&match_id) {
             if waiting.device == authenticated_device {
@@ -183,6 +205,7 @@ impl RendezvousBroker {
             let completed_limit = self.limits.max_pending.saturating_mul(4);
             if self.deliveries.len() >= self.limits.max_pending
                 || self.completed.len() >= completed_limit
+                || self.matches.saturating_add(self.reserved.len()) >= self.limits.max_matches
             {
                 return Err(RendezvousError::Capacity);
             }
@@ -205,7 +228,17 @@ impl RendezvousBroker {
                     expires_at: delivery_expiry,
                 },
             );
-            self.completed.insert(match_id, delivery_expiry);
+            // A reciprocal registration is only a reservation.  The caller
+            // must confirm both authenticated deliveries before this counts
+            // as a successful match; otherwise a disconnected waiter could
+            // consume a match slot without ever receiving the peer offer.
+            self.reserved.insert(
+                match_id,
+                ReservedMatch {
+                    expires_at: delivery_expiry,
+                },
+            );
+            self.successful_registrations += 1;
             return Ok(RegisterOutcome::Matched(caller_delivery));
         }
 
@@ -230,6 +263,7 @@ impl RendezvousBroker {
                 expires_at,
             },
         );
+        self.successful_registrations += 1;
         Ok(RegisterOutcome::Waiting { expires_at })
     }
 
@@ -246,7 +280,69 @@ impl RendezvousBroker {
             .ok_or(RendezvousError::DeliveryUnavailable)
     }
 
-    pub fn cleanup(&mut self, now: u64) {
+    /// Commits a reciprocal match after both authenticated peers have
+    /// acknowledged receipt of their delivery.  Until this call the match is
+    /// only a reservation and does not consume the match cap.
+    pub fn confirm_match(&mut self, match_id: [u8; 16], now: u64) -> Result<(), RendezvousError> {
+        if self
+            .reserved
+            .get(&match_id)
+            .is_none_or(|reserved| reserved.expires_at <= now)
+        {
+            return Err(RendezvousError::DeliveryUnavailable);
+        }
+        let reserved = self
+            .reserved
+            .remove(&match_id)
+            .ok_or(RendezvousError::DeliveryUnavailable)?;
+        self.completed.insert(match_id, reserved.expires_at);
+        self.matches += 1;
+        Ok(())
+    }
+
+    fn release_registrations(&mut self, requested: usize) -> usize {
+        let released = requested.min(self.successful_registrations);
+        self.successful_registrations -= released;
+        released
+    }
+
+    /// Cancels an in-flight match without counting it as successful.  The
+    /// match id remains replay-protected for its normal lifetime.
+    pub fn abort_match(&mut self, match_id: [u8; 16], now: u64) -> usize {
+        let released = self
+            .reserved
+            .remove(&match_id)
+            .map(|_| self.release_registrations(2))
+            .unwrap_or(0);
+        self.deliveries.retain(|(_, id), _| *id != match_id);
+        self.completed.insert(
+            match_id,
+            now.saturating_add(u64::from(RendezvousRegistration::MAX_TTL_SECONDS)),
+        );
+        released
+    }
+
+    /// Removes a disconnected waiting registration.  It is deliberately
+    /// idempotent so a disconnect watcher and an admission race cannot
+    /// resurrect or accidentally match a stale waiter.
+    pub fn cancel_waiting(&mut self, device: DeviceId, match_id: [u8; 16], now: u64) -> usize {
+        if self
+            .pending
+            .get(&match_id)
+            .is_some_and(|pending| pending.device == device)
+        {
+            self.pending.remove(&match_id);
+            self.completed.insert(
+                match_id,
+                now.saturating_add(u64::from(RendezvousRegistration::MAX_TTL_SECONDS)),
+            );
+            return self.release_registrations(1);
+        }
+        0
+    }
+
+    pub fn cleanup(&mut self, now: u64) -> usize {
+        let mut released = 0;
         let expired_pending: Vec<_> = self
             .pending
             .iter()
@@ -258,10 +354,26 @@ impl RendezvousBroker {
                 match_id,
                 now.saturating_add(u64::from(RendezvousRegistration::MAX_TTL_SECONDS)),
             );
+            released += self.release_registrations(1);
         }
         self.deliveries
             .retain(|_, delivery| delivery.expires_at > now);
+        let expired_reserved: Vec<_> = self
+            .reserved
+            .iter()
+            .filter_map(|(match_id, reserved)| (reserved.expires_at <= now).then_some(*match_id))
+            .collect();
+        for match_id in expired_reserved {
+            self.reserved.remove(&match_id);
+            self.deliveries.retain(|(_, id), _| *id != match_id);
+            self.completed.insert(
+                match_id,
+                now.saturating_add(u64::from(RendezvousRegistration::MAX_TTL_SECONDS)),
+            );
+            released += self.release_registrations(2);
+        }
         self.completed.retain(|_, expires_at| *expires_at > now);
+        released
     }
 
     #[must_use]
@@ -398,6 +510,7 @@ mod tests {
         let limits = RendezvousLimits {
             max_pending: 1,
             max_pending_per_device: 1,
+            ..RendezvousLimits::default()
         };
         let mut broker = RendezvousBroker::new(limits).unwrap();
         let initiator = device(1);
@@ -467,6 +580,7 @@ mod tests {
         let mut per_device = RendezvousBroker::new(RendezvousLimits {
             max_pending: 2,
             max_pending_per_device: 1,
+            ..RendezvousLimits::default()
         })
         .unwrap();
         per_device
@@ -539,6 +653,7 @@ mod tests {
             RendezvousBroker::new(RendezvousLimits {
                 max_pending: 0,
                 max_pending_per_device: 1,
+                ..RendezvousLimits::default()
             }),
             Err(RendezvousError::InvalidLimits)
         ));
@@ -550,5 +665,188 @@ mod tests {
             registration,
         };
         assert!(!format!("{delivery:?}").contains(&"A".repeat(32)));
+    }
+
+    #[test]
+    fn successful_registration_and_match_caps_are_exact() {
+        let mut broker = RendezvousBroker::new(RendezvousLimits {
+            max_successful_registrations: 2,
+            max_matches: 1,
+            ..RendezvousLimits::default()
+        })
+        .unwrap();
+        let first = device(1);
+        let second = device(2);
+        let third = device(3);
+        broker
+            .register(
+                first,
+                registration(RendezvousRole::Initiator, second, [1; 16]),
+                1,
+            )
+            .unwrap();
+        assert!(matches!(
+            broker.register(
+                second,
+                registration(RendezvousRole::Responder, first, [1; 16]),
+                2,
+            ),
+            Ok(RegisterOutcome::Matched(_))
+        ));
+        assert!(matches!(
+            broker.register(
+                third,
+                registration(RendezvousRole::Initiator, first, [2; 16]),
+                3,
+            ),
+            Err(RendezvousError::Capacity)
+        ));
+        assert!(matches!(
+            RendezvousBroker::new(RendezvousLimits {
+                max_successful_registrations: 2,
+                max_matches: 2,
+                ..RendezvousLimits::default()
+            }),
+            Err(RendezvousError::InvalidLimits)
+        ));
+    }
+
+    #[test]
+    fn disconnected_waiter_is_cancelled_and_cannot_match_a_late_responder() {
+        let mut broker = RendezvousBroker::new(RendezvousLimits {
+            max_successful_registrations: 6,
+            max_matches: 1,
+            ..RendezvousLimits::default()
+        })
+        .unwrap();
+        let initiator = device(1);
+        let responder = device(2);
+        let match_id = [0xD1; 16];
+        broker
+            .register(
+                initiator,
+                registration(RendezvousRole::Initiator, responder, match_id),
+                10,
+            )
+            .unwrap();
+
+        // This is the service's connection-close watcher transition.  The
+        // late responder must not observe a stale pending waiter.
+        broker.cancel_waiting(initiator, match_id, 11);
+        assert_eq!(broker.pending_len(), 0);
+        assert!(matches!(
+            broker.register(
+                responder,
+                registration(RendezvousRole::Responder, initiator, match_id),
+                12,
+            ),
+            Err(RendezvousError::Replay)
+        ));
+        assert_eq!(broker.pending_len(), 0);
+    }
+
+    #[test]
+    fn match_cap_is_reserved_but_not_committed_before_both_delivery_acks() {
+        let mut broker = RendezvousBroker::new(RendezvousLimits {
+            max_successful_registrations: 6,
+            max_matches: 1,
+            ..RendezvousLimits::default()
+        })
+        .unwrap();
+        let a = device(1);
+        let b = device(2);
+        let c = device(3);
+        let d = device(4);
+        let first = [0xE1; 16];
+        broker
+            .register(a, registration(RendezvousRole::Initiator, b, first), 20)
+            .unwrap();
+        assert!(matches!(
+            broker.register(b, registration(RendezvousRole::Responder, a, first), 21),
+            Ok(RegisterOutcome::Matched(_))
+        ));
+        assert!(matches!(
+            broker.register(b, registration(RendezvousRole::Responder, a, first), 21),
+            Err(RendezvousError::Replay)
+        ));
+        assert!(matches!(
+            broker.register(a, registration(RendezvousRole::Initiator, b, first), 21),
+            Err(RendezvousError::Replay)
+        ));
+
+        // A second pair cannot overrun max_matches while the first pair is
+        // still waiting for the two authenticated delivery acknowledgements.
+        let second = [0xE2; 16];
+        broker
+            .register(c, registration(RendezvousRole::Initiator, d, second), 22)
+            .unwrap();
+        assert!(matches!(
+            broker.register(d, registration(RendezvousRole::Responder, c, second), 23),
+            Err(RendezvousError::Capacity)
+        ));
+
+        // An aborted one-sided delivery does not count as a match and its
+        // replay id remains fenced.
+        assert_eq!(broker.abort_match(first, 24), 2);
+        assert!(matches!(
+            broker.register(d, registration(RendezvousRole::Responder, c, second), 25),
+            Ok(RegisterOutcome::Matched(_))
+        ));
+        broker.confirm_match(second, 26).unwrap();
+        assert!(matches!(
+            broker.register(
+                a,
+                registration(RendezvousRole::Initiator, b, [0xE3; 16]),
+                27
+            ),
+            Ok(RegisterOutcome::Waiting { .. })
+        ));
+        assert!(matches!(
+            broker.register(
+                b,
+                registration(RendezvousRole::Responder, a, [0xE3; 16]),
+                28
+            ),
+            Err(RendezvousError::Capacity)
+        ));
+    }
+
+    #[test]
+    fn cancelling_three_waiters_refunds_registration_capacity_for_a_later_pair() {
+        let mut broker = RendezvousBroker::new(RendezvousLimits {
+            max_successful_registrations: 4,
+            max_matches: 2,
+            ..RendezvousLimits::default()
+        })
+        .unwrap();
+        let initiator = device(1);
+        let responder = device(2);
+        for (offset, now) in [(1_u8, 10_u64), (2, 11), (3, 12)] {
+            let match_id = [offset; 16];
+            broker
+                .register(
+                    initiator,
+                    registration(RendezvousRole::Initiator, responder, match_id),
+                    now,
+                )
+                .unwrap();
+            assert_eq!(broker.cancel_waiting(initiator, match_id, now + 1), 1);
+        }
+        let match_id = [0xF1; 16];
+        broker
+            .register(
+                initiator,
+                registration(RendezvousRole::Initiator, responder, match_id),
+                20,
+            )
+            .unwrap();
+        assert!(matches!(
+            broker.register(
+                responder,
+                registration(RendezvousRole::Responder, initiator, match_id),
+                21,
+            ),
+            Ok(RegisterOutcome::Matched(_))
+        ));
     }
 }
