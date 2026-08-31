@@ -1,0 +1,15 @@
+[package]
+name = "latencydesk-turn-relayd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[lints]
+workspace = true
+[dependencies]
+latencydesk-turn-relay = { path = "../../crates/turn-relay" }
+tokio.workspace = true
+getrandom.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+

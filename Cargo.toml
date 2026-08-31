@@ -27,6 +27,8 @@ members = [
     "crates/test-codec",
     "crates/testkit",
     "crates/transport",
+    "crates/turn-relay",
+    "apps/turn-relayd",
 ]
 
 [workspace.package]
@@ -46,6 +48,7 @@ quinn = { version = "=0.11.8", default-features = false, features = ["log", "run
 rcgen = { version = "=0.13.2", default-features = false, features = ["ring"] }
 rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
 sha2 = "0.10.8"
+hmac = "0.12.1"
 subtle = "2.6.1"
 tokio = { version = "=1.44.2", default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 zeroize = "1.8.2"
