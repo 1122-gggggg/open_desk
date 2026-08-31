@@ -22,8 +22,10 @@ evidence.
    TLS 1.3 exact-leaf mTLS and the session-stamped product handshake complete.
 2. `CandidateExchange` v1 has an exact wire version, exchange ID, generation,
    count, and length-delimited candidates. It accepts 1–8 candidates, one IP
-   family, and UDP host/server-reflexive types only. TCP and relayed types wait
-   for separately defined transport and allocation semantics.
+   family, and UDP host/server-reflexive types. It also accepts TURN-relayed
+   metadata only for the exact `Relayed`/`Turn` type/provider pair with an RFC
+   8445 relay type-preference byte of zero. TCP, DERP, and provider/type drift
+   fail closed. Relay metadata never proves a live allocation or route authority.
 3. The exchange ID must equal the active random product session ID. Generation
    starts at 1 and advances by exactly one on the reliable ordered lane.
    Pre-handshake, malformed, wrong-kind, cross-session, replayed, stale,
@@ -54,8 +56,8 @@ evidence.
   Client bind addresses; interface enumeration and privacy policy remain
   separate work.
 - No claim is made for NAT traversal, Internet connection success, ICE
-  completion, TURN/relay, UDP-blocked fallback, cross-machine behavior, or
-  AnyDesk/RustDesk parity or superiority.
+  completion, automatic TURN selection, UDP-blocked fallback, cross-machine
+  behavior, or AnyDesk/RustDesk parity or superiority.
 
 ## Sources
 
@@ -63,3 +65,4 @@ evidence.
 - RFC 8489, STUN: https://www.rfc-editor.org/rfc/rfc8489.html
 - RFC 8838, Trickle ICE: https://www.rfc-editor.org/rfc/rfc8838.html
 - RFC 9000, QUIC: https://www.rfc-editor.org/rfc/rfc9000.html
+- Parser fuzz plan: [Candidate exchange and rendezvous parser fuzz plan](../fuzzing/CANDIDATE_EXCHANGE.md)

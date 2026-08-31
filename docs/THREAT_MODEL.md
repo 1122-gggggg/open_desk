@@ -61,7 +61,9 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
 - candidate advertisements are accepted only after exact-mTLS and the product
   handshake, are capped at eight, bind their exchange ID to the active random
   session ID, and use consecutive generations; malformed, replayed,
-  cross-session, mixed-family, TCP, and relay claims close that connection;
+  cross-session, mixed-family, TCP, non-TURN relay, and provider/type drift
+  close that connection. A valid UDP TURN-relayed descriptor remains metadata:
+  it proves no allocation and grants no route authority;
 - receiving an authenticated candidate never changes the current route. A
   future connectivity-check/nomination layer must independently authenticate
   checks, limit amplification, prove consent, and retain exact-peer identity;

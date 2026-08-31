@@ -281,8 +281,13 @@ known-address failover, not ICE/TURN or an unauthenticated proxy. Optional
 `--stun-server <IP:PORT>` only discovers/logs one srflx address on that same
 socket. `--candidate-exchange-probe` can advertise the resulting bounded set
 inside the already authenticated product session, but the receiver stores it as
-untrusted connectivity metadata and does not add or switch a route. ICE checks,
-nomination, consent, and relay remain later gates.
+untrusted connectivity metadata and does not add or switch a route. The same
+versioned exchange now admits UDP TURN-relayed metadata only when the candidate
+type/provider pair is exactly `Relayed`/`Turn` and the RFC 8445 relay type
+preference is zero; TCP, DERP, mixed-family, and provider/type drift fail
+closed. Advertising a relay never proves an allocation or grants route
+authority. ICE checks, nomination, consent, and automatic relay selection
+remain later gates.
 
 ### 3.5 Isolated ICE connectivity probe
 

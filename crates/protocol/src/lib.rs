@@ -1684,6 +1684,15 @@ impl IceCandidate {
         if is_relayed != has_relay_provider {
             return Err(ProtocolError::InvalidCandidateRelayProvider);
         }
+        if is_relayed && self.transport != TransportProtocol::Udp {
+            return Err(ProtocolError::UnsupportedCandidateTransport);
+        }
+        if is_relayed {
+            let component_preference = (256 - u32::from(self.component)) & 0xff;
+            if self.priority >> 24 != 0 || self.priority & 0xff != component_preference {
+                return Err(ProtocolError::InvalidCandidatePriority);
+            }
+        }
         Ok(())
     }
 
@@ -1836,8 +1845,10 @@ impl IceCandidate {
 
 /// Version 1 candidate advertisement payload carried by `ControlKind::IceCandidate`.
 ///
-/// The payload is deliberately an advertisement only: TCP and relayed candidates
-/// are rejected until a later version defines their connectivity semantics. A
+/// The payload is deliberately an advertisement only: TCP and non-TURN relayed
+/// candidates are rejected. TURN relayed candidates carry no connectivity
+/// authority; they identify a bounded UDP relay endpoint for later authenticated
+/// route orchestration. A
 /// Duplicate detection uses a conservative endpoint key (component, transport,
 /// primary address, and port). This is stricter than full RFC 8445 redundancy
 /// until this descriptor grows an explicit base address, so changing foundation,
@@ -2312,8 +2323,13 @@ impl CandidateExchange {
             if candidate.transport == TransportProtocol::Tcp {
                 return Err(ProtocolError::UnsupportedCandidateTransport);
             }
-            if candidate.candidate_type == CandidateType::Relayed {
+            if candidate.candidate_type == CandidateType::PeerReflexive {
                 return Err(ProtocolError::UnsupportedCandidateType);
+            }
+            if candidate.candidate_type == CandidateType::Relayed
+                && candidate.relay_provider != RelayProvider::Turn
+            {
+                return Err(ProtocolError::InvalidCandidateRelayProvider);
             }
             if family(candidate.ip) != first_family {
                 return Err(ProtocolError::MixedCandidateAddressFamily);
@@ -2730,6 +2746,7 @@ pub enum ProtocolError {
     InvalidRelayProvider(u8),
     InvalidRelayHeader,
     InvalidCandidateRelayProvider,
+    InvalidCandidatePriority,
     InvalidCandidatePort,
     InvalidCandidateComponent,
     InvalidCandidateAddress,
@@ -3503,16 +3520,15 @@ mod tests {
         let mut relayed = exchange_candidate(WireIpAddr::V4([192, 0, 2, 1]), 4000);
         relayed.candidate_type = CandidateType::Relayed;
         relayed.relay_provider = RelayProvider::Turn;
-        assert_eq!(
-            CandidateExchange {
-                version: 1,
-                exchange_id: 1,
-                generation: 1,
-                candidates: vec![relayed]
-            }
-            .encode(),
-            Err(ProtocolError::UnsupportedCandidateType)
-        );
+        relayed.priority = compute_candidate_priority(CandidateType::Relayed, 100, 1);
+        assert!(CandidateExchange {
+            version: 1,
+            exchange_id: 1,
+            generation: 1,
+            candidates: vec![relayed]
+        }
+        .encode()
+        .is_ok());
         let mut related_family = exchange_candidate(WireIpAddr::V4([192, 0, 2, 1]), 4000);
         related_family.related_address = Some((WireIpAddr::V6([1; 16]), 4001));
         assert_eq!(
@@ -3544,6 +3560,74 @@ mod tests {
             CandidateExchange::decode(&bytes[..15]),
             Err(ProtocolError::Truncated { .. })
         ));
+    }
+
+    #[test]
+    fn candidate_exchange_accepts_turn_relayed_v4_v6_and_mixed_host() {
+        for ip in [
+            WireIpAddr::V4([198, 51, 100, 10]),
+            WireIpAddr::V6([0x20, 1, 0xdb, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10]),
+        ] {
+            let mut relay = exchange_candidate(ip, 3478);
+            relay.candidate_type = CandidateType::Relayed;
+            relay.relay_provider = RelayProvider::Turn;
+            relay.priority = compute_candidate_priority(CandidateType::Relayed, 100, 1);
+            let mut host = exchange_candidate(ip, 4000);
+            host.foundation[0] = 2;
+            let exchange = CandidateExchange {
+                version: 1,
+                exchange_id: 9,
+                generation: 1,
+                candidates: vec![host, relay],
+            };
+            assert_eq!(
+                CandidateExchange::decode(&exchange.encode().unwrap()).unwrap(),
+                exchange
+            );
+        }
+    }
+
+    #[test]
+    fn relayed_candidate_requires_udp_and_low_type_preference() {
+        let mut relay = exchange_candidate(WireIpAddr::V4([198, 51, 100, 10]), 3478);
+        relay.candidate_type = CandidateType::Relayed;
+        relay.relay_provider = RelayProvider::Derp;
+        relay.priority = compute_candidate_priority(CandidateType::Relayed, 100, 1);
+        assert!(relay.validate().is_ok());
+        relay.relay_provider = RelayProvider::Turn;
+        relay.transport = TransportProtocol::Tcp;
+        assert_eq!(
+            relay.validate(),
+            Err(ProtocolError::UnsupportedCandidateTransport)
+        );
+        relay.transport = TransportProtocol::Udp;
+        relay.priority = 0x0100_0000;
+        assert_eq!(
+            relay.validate(),
+            Err(ProtocolError::InvalidCandidatePriority)
+        );
+        relay.priority = 0;
+        assert_eq!(
+            relay.validate(),
+            Err(ProtocolError::InvalidCandidatePriority)
+        );
+    }
+
+    #[test]
+    fn candidate_exchange_rejects_peer_reflexive_metadata() {
+        let mut peer_reflexive = exchange_candidate(WireIpAddr::V4([198, 51, 100, 11]), 3479);
+        peer_reflexive.candidate_type = CandidateType::PeerReflexive;
+        peer_reflexive.priority = compute_candidate_priority(CandidateType::PeerReflexive, 100, 1);
+        assert_eq!(
+            CandidateExchange {
+                version: CandidateExchange::VERSION,
+                exchange_id: 9,
+                generation: 1,
+                candidates: vec![peer_reflexive],
+            }
+            .encode(),
+            Err(ProtocolError::UnsupportedCandidateType)
+        );
     }
 
     #[test]
@@ -4110,6 +4194,29 @@ mod tests {
             RendezvousRegistration::decode(&vec![0; RendezvousRegistration::MAX_ENCODED_LEN + 1]),
             Err(ProtocolError::RendezvousLength(_))
         ));
+    }
+
+    #[test]
+    fn rendezvous_registration_accepts_turn_relayed_candidate_without_authority() {
+        let mut registration = rendezvous_registration(RendezvousRole::Initiator);
+        let mut relay = exchange_candidate(WireIpAddr::V4([198, 51, 100, 10]), 3478);
+        relay.candidate_type = CandidateType::Relayed;
+        relay.relay_provider = RelayProvider::Turn;
+        relay.priority = compute_candidate_priority(CandidateType::Relayed, 100, 1);
+        registration.candidates.candidates = vec![relay];
+        let encoded = registration
+            .encode()
+            .expect("TURN candidate is valid metadata");
+        assert_eq!(
+            RendezvousRegistration::decode(&encoded).unwrap(),
+            registration
+        );
+
+        registration.candidates.candidates[0].relay_provider = RelayProvider::Derp;
+        assert_eq!(
+            registration.encode(),
+            Err(ProtocolError::InvalidCandidateRelayProvider)
+        );
     }
 
     #[test]

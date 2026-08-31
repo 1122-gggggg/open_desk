@@ -73,13 +73,17 @@ stream flag before either side sends `ControlKind::IceCandidate`. The v1 body
 contains an explicit version, an exchange ID equal to the active random session
 ID, a consecutive generation beginning at 1, and 1–8 length-delimited
 candidate descriptors. It accepts one IP family and UDP host/server-reflexive
-candidates only; zero/unusable addresses, TCP, relayed types, mixed families,
-conservative endpoint duplicates, truncation, trailing bytes, replay, gaps, and
-ID changes fail closed. Candidate records remain untrusted even though their
-transport is authenticated: v1 records are observable advertisements only and
-cannot alter the existing QUIC route, certificate identity, authorization, or
-reconnect policy. Connectivity checks, pair nomination, consent freshness,
-rendezvous, and relay are not implemented by this message.
+candidates plus UDP TURN-relayed metadata. A relayed entry requires the exact
+`Relayed`/`Turn` type/provider pair, RFC 8445 relay type preference, and a
+component-consistent priority byte. Zero/unusable addresses, TCP, DERP,
+peer-reflexive signaling, provider/type drift, mixed families, conservative
+endpoint duplicates, truncation, trailing bytes, replay, gaps, and ID changes
+fail closed. Candidate records remain untrusted even though their transport is
+authenticated: v1 records are observable advertisements only and cannot prove
+an allocation or alter the existing QUIC route, certificate identity,
+authorization, or reconnect policy. Connectivity checks, pair nomination,
+consent freshness, rendezvous matching, and automatic relay selection are not
+implemented by this message.
 
 The transport layer has a separate bounded Sans-I/O RFC 8445 adapter. It uses
 OS-CSPRNG short-term credentials and role tie-breakers, standard STUN
@@ -135,6 +139,13 @@ credential/candidate lengths, then one `IceCredentialExchange` and one
 agree, and the role fixes controlling/controlled ICE semantics. The rendezvous
 transport must supply the actual `DeviceId` from its mTLS client certificate;
 there is deliberately no self-identity claim in the payload.
+
+`CandidateExchange` may carry same-family UDP Host, server-reflexive, and
+TURN-relayed metadata. Relayed entries require the exact `Relayed`/`Turn`
+type/provider pair and an RFC 8445 relay type-preference byte of zero. TCP,
+DERP, provider/type mismatch, mixed address families, and duplicate endpoints
+fail closed. A relayed entry is not proof of a live allocation and cannot
+authorize or select a product route.
 
 The bounded broker matches only reciprocal exact fingerprints and complementary
 roles. Registrations are one-shot, replay/generation/role drift does not consume
