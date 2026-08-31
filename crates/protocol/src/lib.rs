@@ -252,6 +252,7 @@ pub enum ControlKind {
     Disconnect = 19,
     UnattendedAuth = 20,
     IceCredentials = 21,
+    IceProbe = 22,
 }
 
 impl TryFrom<u8> for ControlKind {
@@ -280,6 +281,7 @@ impl TryFrom<u8> for ControlKind {
             19 => Ok(Self::Disconnect),
             20 => Ok(Self::UnattendedAuth),
             21 => Ok(Self::IceCredentials),
+            22 => Ok(Self::IceProbe),
             other => Err(ProtocolError::UnknownControlKind(other)),
         }
     }
@@ -442,6 +444,8 @@ pub mod video_capability_flags {
     pub const AUTHENTICATED_CANDIDATE_EXCHANGE: u16 = 1 << 3;
     /// Authenticated ICE credentials for signaling only; no connectivity claim.
     pub const AUTHENTICATED_ICE_CREDENTIALS: u16 = 1 << 4;
+    /// Opt-in isolated connectivity probe; requires authenticated credentials.
+    pub const ICE_CONNECTIVITY_PROBE: u16 = 1 << 5;
 }
 
 /// Host capabilities attached to the selected secure stream configuration.
@@ -455,9 +459,13 @@ pub mod video_stream_flags {
     pub const AUTHENTICATED_CANDIDATE_EXCHANGE: u32 = 1 << 1;
     /// Authenticated ICE credentials for signaling only; no connectivity claim.
     pub const AUTHENTICATED_ICE_CREDENTIALS: u32 = 1 << 2;
+    /// Opt-in isolated connectivity probe; requires authenticated credentials.
+    pub const ICE_CONNECTIVITY_PROBE: u32 = 1 << 3;
 
-    pub(crate) const KNOWN: u32 =
-        INPUT_APPLIED_ACK | AUTHENTICATED_CANDIDATE_EXCHANGE | AUTHENTICATED_ICE_CREDENTIALS;
+    pub(crate) const KNOWN: u32 = INPUT_APPLIED_ACK
+        | AUTHENTICATED_CANDIDATE_EXCHANGE
+        | AUTHENTICATED_ICE_CREDENTIALS
+        | ICE_CONNECTIVITY_PROBE;
 }
 
 /// Fixed-size receiver codec offer carried by [`ControlKind::Capabilities`].
@@ -507,7 +515,8 @@ impl VideoCodecCapabilities {
             | video_capability_flags::RAW_NV12
             | video_capability_flags::INPUT_APPLIED_ACK
             | video_capability_flags::AUTHENTICATED_CANDIDATE_EXCHANGE
-            | video_capability_flags::AUTHENTICATED_ICE_CREDENTIALS;
+            | video_capability_flags::AUTHENTICATED_ICE_CREDENTIALS
+            | video_capability_flags::ICE_CONNECTIVITY_PROBE;
         if self.contract_version != VIDEO_CODEC_CONTRACT_VERSION {
             return Err(ProtocolError::UnsupportedCodecContract(
                 self.contract_version,
@@ -515,6 +524,10 @@ impl VideoCodecCapabilities {
         }
         if self.flags == 0 || self.flags & !known != 0 {
             return Err(ProtocolError::InvalidCodecCapabilities(self.flags));
+        }
+        if self.supports_ice_connectivity_probe() && !self.supports_authenticated_ice_credentials()
+        {
+            return Err(ProtocolError::IceProbeRequiresCredentials);
         }
         if self.max_width == 0
             || self.max_height == 0
@@ -550,6 +563,11 @@ impl VideoCodecCapabilities {
     #[must_use]
     pub const fn supports_authenticated_ice_credentials(self) -> bool {
         self.flags & video_capability_flags::AUTHENTICATED_ICE_CREDENTIALS != 0
+    }
+
+    #[must_use]
+    pub const fn supports_ice_connectivity_probe(self) -> bool {
+        self.flags & video_capability_flags::ICE_CONNECTIVITY_PROBE != 0
     }
 }
 
@@ -678,6 +696,11 @@ impl VideoStreamConfig {
         self.flags & video_stream_flags::AUTHENTICATED_ICE_CREDENTIALS != 0
     }
 
+    #[must_use]
+    pub const fn supports_ice_connectivity_probe(self) -> bool {
+        self.flags & video_stream_flags::ICE_CONNECTIVITY_PROBE != 0
+    }
+
     fn validate(self) -> Result<(), ProtocolError> {
         if self.contract_version != VIDEO_CODEC_CONTRACT_VERSION {
             return Err(ProtocolError::UnsupportedCodecContract(
@@ -700,6 +723,10 @@ impl VideoStreamConfig {
             && self.supports_authenticated_ice_credentials()
         {
             return Err(ProtocolError::ConflictingIceSignalingModes);
+        }
+        if self.supports_ice_connectivity_probe() && !self.supports_authenticated_ice_credentials()
+        {
+            return Err(ProtocolError::IceProbeRequiresCredentials);
         }
         if self.stream_id == 0
             || self.codec_epoch == 0
@@ -1127,6 +1154,134 @@ impl PingPongMessage {
             nonce: read_u64(bytes, 0),
             timestamp_ns: read_u64(bytes, 8),
         })
+    }
+}
+
+/// Ordered stage in the isolated ICE connectivity-probe transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum IceProbeStage {
+    ClientNominated = 1,
+    HostNominated = 2,
+    ClientReady = 3,
+    HostReady = 4,
+    ReadyAck = 5,
+    EchoRequest = 6,
+    EchoResponse = 7,
+    Complete = 8,
+}
+
+impl TryFrom<u8> for IceProbeStage {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::ClientNominated),
+            2 => Ok(Self::HostNominated),
+            3 => Ok(Self::ClientReady),
+            4 => Ok(Self::HostReady),
+            5 => Ok(Self::ReadyAck),
+            6 => Ok(Self::EchoRequest),
+            7 => Ok(Self::EchoResponse),
+            8 => Ok(Self::Complete),
+            other => Err(ProtocolError::InvalidIceProbeStage(other)),
+        }
+    }
+}
+
+/// Fixed-size transcript record shared by the authenticated readiness barrier
+/// and the isolated probe connection. It binds every stage to the full active
+/// session stamp, one ICE generation, and fresh nonces contributed by both
+/// peers. Nonces are correlation values; exact mTLS supplies authentication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IceProbeMessage {
+    pub version: u8,
+    pub stage: IceProbeStage,
+    pub ice_generation: u32,
+    pub stamp: quic::SessionStamp,
+    pub client_nonce: [u8; 16],
+    pub host_nonce: [u8; 16],
+    pub challenge: [u8; 32],
+}
+
+impl IceProbeMessage {
+    pub const VERSION: u8 = 1;
+    pub const ENCODED_LEN: usize = 100;
+
+    pub fn encode(self) -> Result<[u8; Self::ENCODED_LEN], ProtocolError> {
+        self.validate()?;
+        let mut out = [0_u8; Self::ENCODED_LEN];
+        out[0] = self.version;
+        out[1] = self.stage as u8;
+        out[4..8].copy_from_slice(&self.ice_generation.to_be_bytes());
+        out[8..16].copy_from_slice(&self.stamp.session_id.to_be_bytes());
+        out[16..24].copy_from_slice(&self.stamp.generation.to_be_bytes());
+        out[24..28].copy_from_slice(&self.stamp.authorization_epoch.to_be_bytes());
+        out[28..32].copy_from_slice(&self.stamp.display_epoch.to_be_bytes());
+        out[32..36].copy_from_slice(&self.stamp.codec_epoch.to_be_bytes());
+        out[36..52].copy_from_slice(&self.client_nonce);
+        out[52..68].copy_from_slice(&self.host_nonce);
+        out[68..100].copy_from_slice(&self.challenge);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        if bytes.len() != Self::ENCODED_LEN {
+            return Err(ProtocolError::PayloadLength {
+                expected: Self::ENCODED_LEN,
+                actual: bytes.len(),
+            });
+        }
+        if bytes[2..4] != [0, 0] {
+            return Err(ProtocolError::ReservedBits);
+        }
+        let mut client_nonce = [0_u8; 16];
+        client_nonce.copy_from_slice(&bytes[36..52]);
+        let mut host_nonce = [0_u8; 16];
+        host_nonce.copy_from_slice(&bytes[52..68]);
+        let mut challenge = [0_u8; 32];
+        challenge.copy_from_slice(&bytes[68..100]);
+        let message = Self {
+            version: bytes[0],
+            stage: IceProbeStage::try_from(bytes[1])?,
+            ice_generation: read_u32(bytes, 4),
+            stamp: quic::SessionStamp {
+                session_id: read_u64(bytes, 8),
+                generation: read_u64(bytes, 16),
+                authorization_epoch: read_u32(bytes, 24),
+                display_epoch: read_u32(bytes, 28),
+                codec_epoch: read_u32(bytes, 32),
+            },
+            client_nonce,
+            host_nonce,
+            challenge,
+        };
+        message.validate()?;
+        Ok(message)
+    }
+
+    fn validate(self) -> Result<(), ProtocolError> {
+        if self.version != Self::VERSION
+            || self.ice_generation == 0
+            || self.stamp.validate_pending().is_err()
+            || self.stamp.authorization_epoch == 0
+            || self.stamp.display_epoch == 0
+            || self.stamp.codec_epoch == 0
+            || self.client_nonce == [0; 16]
+            || (self.stage == IceProbeStage::ClientNominated && self.host_nonce != [0; 16])
+            || (self.stage != IceProbeStage::ClientNominated && self.host_nonce == [0; 16])
+            || (matches!(
+                self.stage,
+                IceProbeStage::EchoRequest | IceProbeStage::EchoResponse | IceProbeStage::Complete
+            ) && self.challenge == [0; 32])
+            || (!matches!(
+                self.stage,
+                IceProbeStage::EchoRequest | IceProbeStage::EchoResponse | IceProbeStage::Complete
+            ) && self.challenge != [0; 32])
+        {
+            return Err(ProtocolError::InvalidIceProbeMessage);
+        }
+        Ok(())
     }
 }
 
@@ -2237,6 +2392,7 @@ pub enum ProtocolError {
     UnknownInputAckStatus(u8),
     UnknownVideoStreamFlags(u32),
     ConflictingIceSignalingModes,
+    IceProbeRequiresCredentials,
     UnknownFlags(u16),
     UnknownControlFlags(u16),
     ReservedBits,
@@ -2307,6 +2463,8 @@ pub enum ProtocolError {
     InvalidIceCredentialUfrag,
     InvalidIceCredentialPassword,
     InvalidIceCredentialCharset,
+    InvalidIceProbeStage(u8),
+    InvalidIceProbeMessage,
     CandidateExchangeCount(usize),
     CandidateExchangeLength(usize),
     DuplicateCandidate,
@@ -3292,5 +3450,119 @@ mod tests {
             .encode(),
             Err(ProtocolError::ConflictingIceSignalingModes)
         ));
+    }
+
+    #[test]
+    fn ice_probe_capability_requires_authenticated_credentials() {
+        let offer = VideoCodecCapabilities {
+            contract_version: VIDEO_CODEC_CONTRACT_VERSION,
+            flags: video_capability_flags::RAW_NV12
+                | video_capability_flags::AUTHENTICATED_ICE_CREDENTIALS
+                | video_capability_flags::ICE_CONNECTIVITY_PROBE,
+            max_width: 2,
+            max_height: 2,
+            max_fps: 1,
+        };
+        assert!(offer.encode().is_ok());
+        assert!(offer.supports_ice_connectivity_probe());
+        assert!(matches!(
+            VideoCodecCapabilities {
+                flags: video_capability_flags::RAW_NV12
+                    | video_capability_flags::ICE_CONNECTIVITY_PROBE,
+                ..offer
+            }
+            .encode(),
+            Err(ProtocolError::IceProbeRequiresCredentials)
+        ));
+
+        let selected = VideoStreamConfig {
+            contract_version: VIDEO_CODEC_CONTRACT_VERSION,
+            codec: VideoCodec::RawNv12,
+            profile: VideoProfile::RawNv12,
+            pixel_format: u32::from_le_bytes(*b"NV12"),
+            stream_id: 1,
+            codec_epoch: 1,
+            width: 2,
+            height: 2,
+            fps: 1,
+            target_bitrate_bps: 1,
+            flags: video_stream_flags::AUTHENTICATED_ICE_CREDENTIALS
+                | video_stream_flags::ICE_CONNECTIVITY_PROBE,
+        };
+        assert!(selected.encode().is_ok());
+        assert!(selected.supports_ice_connectivity_probe());
+        assert!(matches!(
+            VideoStreamConfig {
+                flags: video_stream_flags::ICE_CONNECTIVITY_PROBE,
+                ..selected
+            }
+            .encode(),
+            Err(ProtocolError::IceProbeRequiresCredentials)
+        ));
+    }
+
+    #[test]
+    fn ice_probe_control_transcript_is_exact_and_stage_bound() {
+        let stamp = quic::SessionStamp {
+            session_id: 7,
+            generation: 8,
+            authorization_epoch: 9,
+            display_epoch: 10,
+            codec_epoch: 11,
+        };
+        let client_nonce = [0x11; 16];
+        let host_nonce = [0x22; 16];
+        let challenge = [0x33; 32];
+        for stage in [
+            IceProbeStage::ClientNominated,
+            IceProbeStage::HostNominated,
+            IceProbeStage::ClientReady,
+            IceProbeStage::HostReady,
+            IceProbeStage::ReadyAck,
+            IceProbeStage::EchoRequest,
+            IceProbeStage::EchoResponse,
+            IceProbeStage::Complete,
+        ] {
+            let message = IceProbeMessage {
+                version: IceProbeMessage::VERSION,
+                stage,
+                ice_generation: 1,
+                stamp,
+                client_nonce,
+                host_nonce: if stage == IceProbeStage::ClientNominated {
+                    [0; 16]
+                } else {
+                    host_nonce
+                },
+                challenge: if matches!(
+                    stage,
+                    IceProbeStage::EchoRequest
+                        | IceProbeStage::EchoResponse
+                        | IceProbeStage::Complete
+                ) {
+                    challenge
+                } else {
+                    [0; 32]
+                },
+            };
+            assert_eq!(
+                IceProbeMessage::decode(&message.encode().unwrap()).unwrap(),
+                message
+            );
+        }
+        let invalid = IceProbeMessage {
+            version: IceProbeMessage::VERSION,
+            stage: IceProbeStage::EchoRequest,
+            ice_generation: 1,
+            stamp,
+            client_nonce: [0; 16],
+            host_nonce,
+            challenge,
+        };
+        assert!(matches!(
+            invalid.encode(),
+            Err(ProtocolError::InvalidIceProbeMessage)
+        ));
+        assert!(IceProbeMessage::decode(&[0; 3]).is_err());
     }
 }
