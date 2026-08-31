@@ -77,7 +77,7 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
   the capability; Client/Host roles are fixed as controlling/controlled,
   active-session binding and consecutive generations are required; credentials
   precede candidates and cannot mix with advertisement-only mode per session.
-  typed send/receive cancellation closes fail-closed so a partial generation
+  Typed send/receive cancellation closes fail-closed so a partial generation
   cannot be retried or reinterpreted. Generic ICE control access is rejected;
   control-message Debug output never renders payload bytes. Values are bounded
   and debug-redacted; signaling-wrapper objects and encoded temporaries are
@@ -96,9 +96,28 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
   TURN/relay, Internet reachability, and latency/AnyDesk claims remain outside
   this control. Borrowed buffers and upstream ICE internal credential copies are
   not guaranteed zeroized;
-- the rendezvous state boundary never trusts a payload to name its sender. A
-  future mTLS transport must derive `DeviceId` from the authenticated client
-  certificate; a match requires reciprocal exact expected-peer fingerprints,
+- the local rendezvous daemon uses TLS 1.3 client authentication against a
+  bounded exact-leaf allowlist, then independently byte-checks the accepted leaf
+  and derives `DeviceId` from its SHA-256 fingerprint. Stranger and malformed
+  connections are rejected without terminating the listener before the fixed
+  rejection cap. Each connection gets one control lane/request and one-shot
+  delivery; no
+  product/input/media/relay lane is exposed. This is not yet a public trust,
+  account, availability, or abuse-control service. Owned outbound secret
+  buffers are zeroized, but inbound Quinn `Bytes` and decoder copies are only
+  debug-redacted and are not guaranteed zeroized;
+- route promotion is fail-closed and two-phase. A candidate needs nomination,
+  exact-mTLS, transcript, and consent proof; the old route remains authoritative
+  until authenticated prepare/commit. Commit and rollback each increment a
+  separate route epoch, while session and authorization/input epochs remain
+  fixed. Only the current `(route_epoch, path)` may carry application data, so
+  delayed old-route packets cannot regain authority. At the stability deadline,
+  candidate and prior-route proofs are freshly evaluated; an unverified prior
+  route cannot be restored, and if neither proof is complete all route authority
+  is revoked;
+- the underlying rendezvous state never trusts a payload to name its sender.
+  The daemon supplies `DeviceId` from the authenticated client certificate; a
+  match requires reciprocal exact expected-peer fingerprints,
   complementary roles, matching generation/exchange IDs, bounded TTL and
   one-shot delivery. Pending, per-device, delivery, expiry, and replay state is
   capped, and mismatch attempts do not consume a valid waiter. The broker sees

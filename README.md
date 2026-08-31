@@ -310,8 +310,10 @@ zeroized.
 
 ### 3.6 Authenticated rendezvous state boundary
 
-The `latencydesk-rendezvous` crate now provides a bounded in-memory matching
-boundary for a future mTLS rendezvous service. The caller supplies the device
+The `latencydesk-rendezvous` crate provides bounded matching state, and the
+opt-in `latencydesk-rendezvousd` process now exercises it over TLS 1.3 exact-mTLS
+QUIC. The server requires exactly two allowed client leaves for this evidence
+profile. It supplies the device
 identity obtained from the authenticated client certificate; registration
 payloads cannot claim or replace that identity. A match succeeds only when two
 different devices name each other's exact certificate fingerprint, use
@@ -320,10 +322,28 @@ TTL, credentials, and candidates. Registration bytes are capped at 4 KiB,
 pending matches at 1,024, and each device at four pending matches; delivery is
 one-shot and expired/replayed match IDs are tombstoned.
 
-This is a tested state/wire boundary, not a listening rendezvous service. It has
-no DNS/discovery, public endpoint, NAT matrix, relay, abuse operation, route
-selection, desktop payload access, Internet reachability, or AnyDesk parity
-claim.
+`scripts/rendezvous_process_test.py` first proves a stranger certificate cannot
+kill the listener, then proves both allowed clients receive the other's offer
+once. This remains a bounded local evidence service—not a supported public
+deployment. It has no DNS/discovery, dynamic account trust, NAT matrix, relay,
+abuse operation, route selection, desktop payload access, Internet reachability,
+or AnyDesk parity claim. Owned outbound secret buffers are zeroized; inbound
+Quinn buffers and decoder copies are debug-redacted but are not guaranteed
+zeroized.
+
+### 3.7 Two-phase route promotion state
+
+`RouteTransitionController` admits a candidate only after ICE nomination,
+exact-mTLS, transcript binding, and fresh consent are all present. The old route
+stays active through peer prepare; commit increments an independent
+`route_epoch` and retains the old route for a bounded rollback window. At the
+deadline, a fresh candidate proof finalizes it; otherwise only a fresh old-route
+proof may roll back with another epoch bump. If neither route remains verified,
+all application-route authority is revoked and a new transition is refused.
+Packets from the pre-promotion route remain stale even after returning to the
+same network path. The full `SessionStamp` and authorization/input epochs are
+never rewritten. This is a tested state machine, not yet wired into product
+media or input dispatch.
 
 ### 4. Open several exact-pinned Hosts concurrently
 

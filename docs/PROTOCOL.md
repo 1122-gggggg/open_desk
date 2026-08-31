@@ -143,6 +143,17 @@ bounded. The broker returns connectivity metadata only and never selects a
 route or handles desktop content. No network rendezvous service, NAT traversal,
 relay, or Internet-connectivity claim exists yet.
 
+The local evidence daemon transports a registration inside one canonical
+session-stamped control stream after TLS 1.3 client-certificate authentication.
+The server allowlist contains 1–16 unique exact leaves; every accepted leaf is
+checked byte-for-byte again after the handshake. A response is either bounded
+`Waiting` metadata or one peer registration. Each connection submits one
+request, delivery is one-shot, and the daemon exposes no product/input/media
+lane. The current CLI evidence profile intentionally allows exactly two clients
+and one match before exit. Owned outbound secret buffers are zeroized; inbound
+Quinn `Bytes` and decoder copies are only debug-redacted and are not guaranteed
+to be zeroized.
+
 ## 3. Capability negotiation
 
 Each peer advertises:
