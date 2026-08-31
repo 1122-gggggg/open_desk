@@ -149,6 +149,10 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
+    if env::args().nth(1).as_deref() == Some("--version") {
+        println!("latencydesk-turn-client {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let args = match parse_from(env::args()) {
         Ok(args) => args,
         Err(error) => {

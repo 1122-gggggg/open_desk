@@ -677,6 +677,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "latencydesk-product-probe"
+version = "0.1.0-alpha.2"
+dependencies = [
+ "getrandom 0.2.17",
+ "latencydesk-protocol",
+ "latencydesk-socket-transport",
+ "latencydesk-transport",
+ "quinn",
+ "sha2",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "latencydesk-protocol"
 version = "0.1.0-alpha.2"
 dependencies = [

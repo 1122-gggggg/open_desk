@@ -30,6 +30,7 @@ members = [
     "crates/turn-relay",
     "apps/turn-relayd",
     "apps/route-probe",
+    "apps/product-probe",
 ]
 
 [workspace.package]
