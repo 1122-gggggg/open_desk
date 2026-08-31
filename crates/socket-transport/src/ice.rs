@@ -15,13 +15,23 @@
 use ice_core::{Candidate, IceAgent, IceAgentEvent, IceConnectionState, IceCreds};
 use std::error::Error;
 use std::fmt;
+use std::net::UdpSocket;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
 pub const MAX_ICE_CANDIDATES: usize = 8;
 pub const MAX_ICE_PAIRS: usize = MAX_ICE_CANDIDATES * MAX_ICE_CANDIDATES;
 pub const MAX_ICE_DATAGRAM_BYTES: usize = 2_048;
+pub const MAX_ICE_IGNORED_DATAGRAMS: usize = 32;
+const MAX_ICE_OUTBOUND_DATAGRAMS: usize = 512;
+const MAX_ICE_INBOUND_DATAGRAMS: usize = 1024;
+const MAX_ICE_INBOUND_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ICE_DRAIN_DATAGRAMS: usize = 128;
 const ICE_TARGET_MTU: usize = 1_200;
 const ICE_WARN_MTU: usize = 1_500;
 const ICE_UFRAG_LEN: usize = 16;
@@ -83,6 +93,72 @@ impl IceCandidate {
             kind: IceCandidateKind::ServerReflexive,
         }
     }
+
+    pub fn from_protocol(candidate: latencydesk_protocol::IceCandidate) -> Result<Self, IceError> {
+        use latencydesk_protocol::{CandidateType, TransportProtocol, WireIpAddr};
+        candidate
+            .validate()
+            .map_err(|_| IceError::UnsupportedCandidate)?;
+        if candidate.transport != TransportProtocol::Udp || candidate.component != 1 {
+            return Err(IceError::UnsupportedCandidate);
+        }
+        let address = match candidate.ip {
+            WireIpAddr::V4(bytes) => SocketAddr::from((bytes, candidate.port)),
+            WireIpAddr::V6(bytes) => SocketAddr::from((bytes, candidate.port)),
+        };
+        let (kind, base) = match candidate.candidate_type {
+            CandidateType::Host if candidate.related_address.is_none() => {
+                (IceCandidateKind::Host, address)
+            }
+            CandidateType::ServerReflexive => {
+                let Some((related, port)) = candidate.related_address else {
+                    return Err(IceError::UnsupportedCandidate);
+                };
+                let base = match related {
+                    WireIpAddr::V4(bytes) => SocketAddr::from((bytes, port)),
+                    WireIpAddr::V6(bytes) => SocketAddr::from((bytes, port)),
+                };
+                (IceCandidateKind::ServerReflexive, base)
+            }
+            _ => return Err(IceError::UnsupportedCandidate),
+        };
+        let converted = Self {
+            address,
+            base,
+            kind,
+        };
+        validate_candidate(converted)?;
+        Ok(converted)
+    }
+
+    /// First application-probe profile: exactly one UDP component-1 Host
+    /// candidate. Server-reflexive support remains in the generic adapter but
+    /// is deliberately unavailable until a real NAT/STUN matrix is gated.
+    pub fn from_probe_protocol(
+        candidate: latencydesk_protocol::IceCandidate,
+    ) -> Result<Self, IceError> {
+        let converted = Self::from_protocol(candidate)?;
+        if converted.kind != IceCandidateKind::Host || !converted.address.is_ipv4() {
+            return Err(IceError::UnsupportedCandidate);
+        }
+        Ok(converted)
+    }
+
+    /// Validates the first probe profile's entire remote set: one IPv4 Host
+    /// candidate on the already-authenticated peer IP, but a fresh UDP port.
+    pub fn probe_remote_from_exchange(
+        exchange: &latencydesk_protocol::CandidateExchange,
+        active_peer: SocketAddr,
+    ) -> Result<Self, IceError> {
+        if exchange.candidates.len() != 1 || !active_peer.is_ipv4() {
+            return Err(IceError::InvalidProbeCandidateSet);
+        }
+        let candidate = Self::from_probe_protocol(exchange.candidates[0])?;
+        if candidate.address.ip() != active_peer.ip() || candidate.address == active_peer {
+            return Err(IceError::InvalidProbeCandidateSet);
+        }
+        Ok(candidate)
+    }
 }
 
 /// Short-term ICE credentials. Debug output always redacts both fields.
@@ -90,6 +166,26 @@ impl IceCandidate {
 pub struct IceCredentials {
     ufrag: String,
     password: String,
+}
+
+impl IceCredentials {
+    /// Convert credentials for authenticated, secret-safe protocol signaling.
+    pub fn to_signaling(
+        &self,
+        exchange_id: u64,
+        generation: u32,
+        role: IceRole,
+    ) -> Result<latencydesk_protocol::IceCredentialExchange, IceError> {
+        latencydesk_protocol::IceCredentialExchange::new(
+            latencydesk_protocol::IceCredentialExchange::VERSION,
+            exchange_id,
+            generation,
+            role.to_signaling(),
+            self.ufrag.clone(),
+            self.password.clone(),
+        )
+        .map_err(|_| IceError::InvalidCredentials)
+    }
 }
 
 impl IceCredentials {
@@ -224,6 +320,13 @@ pub enum IceError {
     OversizedTransmit(usize),
     AgentInvariant,
     EstablishmentDeadlineExceeded,
+    Cancelled,
+    Io(std::io::Error),
+    IgnoredDatagramLimit,
+    TrafficLimit,
+    InvalidProbeCandidateSet,
+    WorkerFailed,
+    WorkerTimeout,
     Agent(ice_core::IceError),
 }
 
@@ -237,6 +340,7 @@ impl Error for IceError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Agent(error) => Some(error),
+            Self::Io(error) => Some(error),
             _ => None,
         }
     }
@@ -618,6 +722,310 @@ impl Ice {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct IceRunControl {
+    cancelled: Arc<AtomicBool>,
+    nominated: Arc<AtomicBool>,
+    handoff: Arc<AtomicBool>,
+}
+
+impl Default for IceRunControl {
+    fn default() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            nominated: Arc::new(AtomicBool::new(false)),
+            handoff: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+impl IceRunControl {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+    pub fn request_handoff(&self) {
+        self.handoff.store(true, Ordering::Release);
+    }
+    pub fn handoff_requested(&self) -> bool {
+        self.handoff.load(Ordering::Acquire)
+    }
+    pub fn is_nominated(&self) -> bool {
+        self.nominated.load(Ordering::Acquire)
+    }
+}
+pub type IceCancellation = IceRunControl;
+
+/// Joinable owner for the one blocking raw-UDP ICE loop. Dropping the handle
+/// requests cancellation; successful socket handoff always joins the worker.
+#[derive(Debug)]
+pub struct IceSocketWorker {
+    control: IceRunControl,
+    task: Option<tokio::task::JoinHandle<Result<IceSocketHandoff, IceError>>>,
+}
+
+impl IceSocketWorker {
+    pub fn spawn(socket: UdpSocket, ice: Ice) -> Self {
+        let control = IceRunControl::new();
+        let worker_control = control.clone();
+        let task =
+            tokio::task::spawn_blocking(move || run_ice_on_socket(socket, ice, &worker_control));
+        Self {
+            control,
+            task: Some(task),
+        }
+    }
+
+    #[must_use]
+    pub fn control(&self) -> IceRunControl {
+        self.control.clone()
+    }
+
+    pub async fn wait_nominated(&mut self, timeout: Duration) -> Result<(), IceError> {
+        if timeout.is_zero() {
+            return Err(IceError::WorkerTimeout);
+        }
+        let wait = async {
+            loop {
+                if self.control.is_nominated() {
+                    return Ok(());
+                }
+                if self.task.as_ref().is_some_and(|task| task.is_finished()) {
+                    let task = self.task.take().ok_or(IceError::WorkerFailed)?;
+                    return match task.await {
+                        Ok(Err(error)) => Err(error),
+                        Ok(Ok(_)) | Err(_) => Err(IceError::WorkerFailed),
+                    };
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        };
+        tokio::time::timeout(timeout, wait)
+            .await
+            .map_err(|_| IceError::WorkerTimeout)?
+    }
+
+    pub async fn handoff(mut self, timeout: Duration) -> Result<IceSocketHandoff, IceError> {
+        self.control.request_handoff();
+        let mut task = self.task.take().ok_or(IceError::WorkerFailed)?;
+        let result = tokio::time::timeout(timeout, &mut task).await;
+        match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(IceError::WorkerFailed),
+            Err(_) => {
+                self.control.cancel();
+                let _ = tokio::time::timeout(Duration::from_secs(2), &mut task).await;
+                Err(IceError::WorkerTimeout)
+            }
+        }
+    }
+
+    pub async fn cancel(mut self, timeout: Duration) -> Result<(), IceError> {
+        self.control.cancel();
+        let Some(mut task) = self.task.take() else {
+            return Ok(());
+        };
+        match tokio::time::timeout(timeout, &mut task).await {
+            Ok(Ok(Err(IceError::Cancelled))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(error),
+            Ok(Ok(Ok(_))) | Ok(Err(_)) => Err(IceError::WorkerFailed),
+            Err(_) => Err(IceError::WorkerTimeout),
+        }
+    }
+}
+
+impl Drop for IceSocketWorker {
+    fn drop(&mut self) {
+        self.control.cancel();
+    }
+}
+
+pub struct IceSocketHandoff {
+    pub socket: UdpSocket,
+    pub local_candidates: Vec<IceCandidate>,
+    pub remote_candidates: Vec<IceCandidate>,
+    pub nominated: (SocketAddr, SocketAddr),
+    pub effective_role: IceRole,
+    pub stats: IceStats,
+    pub elapsed: Duration,
+}
+
+impl fmt::Debug for IceSocketHandoff {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IceSocketHandoff")
+            .field("local_candidates", &self.local_candidates.len())
+            .field("remote_candidates", &self.remote_candidates.len())
+            .field("nominated", &self.nominated)
+            .field("effective_role", &self.effective_role)
+            .field("stats", &self.stats)
+            .field("elapsed", &self.elapsed)
+            .finish()
+    }
+}
+
+/// Run the bounded ICE state machine on one exclusively-owned UDP socket.
+/// The socket is returned unchanged only after nomination; every other exit
+/// drops it, preventing accidental reuse after cancellation or timeout.
+pub fn run_ice_on_socket(
+    socket: UdpSocket,
+    mut ice: Ice,
+    cancellation: &IceRunControl,
+) -> Result<IceSocketHandoff, IceError> {
+    socket.set_nonblocking(true).map_err(IceError::Io)?;
+    let local = socket.local_addr().map_err(IceError::Io)?;
+    if ice.local_candidates.is_empty() {
+        return Err(IceError::AgentInvariant);
+    }
+    if !ice
+        .local_candidates
+        .iter()
+        .all(|candidate| candidate.base == local)
+    {
+        return Err(IceError::AgentInvariant);
+    }
+    let started = Instant::now();
+    let mut nominated = None;
+    let mut buffer = [0_u8; MAX_ICE_DATAGRAM_BYTES];
+    let mut ignored = 0_usize;
+    let mut outbound = 0_usize;
+    let mut inbound = 0_usize;
+    let mut inbound_bytes = 0_usize;
+    loop {
+        let now = Instant::now();
+        if cancellation.is_cancelled() {
+            return Err(IceError::Cancelled);
+        }
+        ice.advance(now)?;
+        while let Some(transmit) = ice.poll_transmit()? {
+            if transmit.source != local {
+                return Err(IceError::AgentInvariant);
+            }
+            let mut sent = false;
+            for _ in 0..4 {
+                match socket.send_to(&transmit.contents, transmit.destination) {
+                    Ok(sent_bytes) if sent_bytes == transmit.contents.len() => {
+                        sent = true;
+                        break;
+                    }
+                    Ok(_) => return Err(IceError::AgentInvariant),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::yield_now()
+                    }
+                    Err(error) => return Err(IceError::Io(error)),
+                }
+            }
+            if !sent {
+                return Err(IceError::Io(std::io::Error::from(
+                    std::io::ErrorKind::WouldBlock,
+                )));
+            }
+            outbound += 1;
+            if outbound > MAX_ICE_OUTBOUND_DATAGRAMS {
+                return Err(IceError::TrafficLimit);
+            }
+        }
+        let mut received_this_round = 0_usize;
+        loop {
+            if received_this_round >= MAX_ICE_INBOUND_DATAGRAMS {
+                return Err(IceError::TrafficLimit);
+            }
+            match socket.recv_from(&mut buffer) {
+                Ok((length, source)) => {
+                    received_this_round += 1;
+                    inbound += 1;
+                    inbound_bytes = inbound_bytes.saturating_add(length);
+                    if inbound > MAX_ICE_INBOUND_DATAGRAMS || inbound_bytes > MAX_ICE_INBOUND_BYTES
+                    {
+                        return Err(IceError::TrafficLimit);
+                    }
+                    match ice.handle_datagram(now, source, local, &buffer[..length]) {
+                        Ok(true) => {}
+                        Ok(false)
+                        | Err(IceError::InvalidDatagram)
+                        | Err(IceError::UnexpectedDatagramDestination) => {
+                            ignored += 1;
+                            if ignored > MAX_ICE_IGNORED_DATAGRAMS {
+                                return Err(IceError::IgnoredDatagramLimit);
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(IceError::Io(error)),
+            }
+        }
+        while let Some(event) = ice.poll_event() {
+            if let IceEvent::Nominated {
+                source,
+                destination,
+            } = event
+            {
+                if source != local || !is_usable_address(destination) {
+                    return Err(IceError::AgentInvariant);
+                }
+                nominated = Some((source, destination));
+                cancellation.nominated.store(true, Ordering::Release);
+            }
+        }
+        if cancellation.handoff_requested() && ice.state().is_connected() {
+            if let Some(nominated) = nominated {
+                if nominated.0 != local || !is_usable_address(nominated.1) {
+                    return Err(IceError::AgentInvariant);
+                }
+                // Consume already queued ICE datagrams before transferring ownership.
+                let mut drained = false;
+                for _ in 0..MAX_ICE_DRAIN_DATAGRAMS {
+                    match socket.recv_from(&mut buffer) {
+                        Ok(_) => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            drained = true;
+                            break;
+                        }
+                        Err(error) => return Err(IceError::Io(error)),
+                    }
+                }
+                if !drained {
+                    return Err(IceError::TrafficLimit);
+                }
+                let effective_role = ice.effective_role();
+                if effective_role != ice.configured_role() {
+                    return Err(IceError::AgentInvariant);
+                }
+                let stats = ice.stats();
+                return Ok(IceSocketHandoff {
+                    socket,
+                    local_candidates: ice.local_candidates,
+                    remote_candidates: ice.remote_candidates,
+                    nominated,
+                    effective_role,
+                    stats,
+                    elapsed: started.elapsed(),
+                });
+            }
+        }
+        if ice.expired(now) {
+            return Err(IceError::EstablishmentDeadlineExceeded);
+        }
+        let sleep_for = ice
+            .poll_timeout()
+            .map_or(Duration::from_millis(5), |deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(5))
+            });
+        if !sleep_for.is_zero() {
+            std::thread::sleep(sleep_for);
+        }
+    }
+}
+
 fn validate_candidate(candidate: IceCandidate) -> Result<(), IceError> {
     if !is_usable_address(candidate.address)
         || !is_usable_address(candidate.base)
@@ -662,7 +1070,6 @@ mod tests {
     use crate::quic::{bind_client_on_socket, bind_server_on_socket, QuicConnection};
     use rcgen::generate_simple_self_signed;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    use std::io;
     use std::net::{Ipv4Addr, UdpSocket};
     use std::sync::Arc;
     use std::thread;
@@ -868,6 +1275,88 @@ mod tests {
     }
 
     #[test]
+    fn protocol_candidates_convert_only_supported_udp_shapes() {
+        use latencydesk_protocol::{CandidateType, RelayProvider, TransportProtocol, WireIpAddr};
+        let host = latencydesk_protocol::IceCandidate {
+            foundation: [0; 8],
+            component: 1,
+            transport: TransportProtocol::Udp,
+            priority: 1,
+            candidate_type: CandidateType::Host,
+            relay_provider: RelayProvider::None,
+            ip: WireIpAddr::V4([127, 0, 0, 1]),
+            port: 5000,
+            related_address: None,
+        };
+        assert_eq!(
+            IceCandidate::from_protocol(host).unwrap(),
+            IceCandidate::host("127.0.0.1:5000".parse().unwrap())
+        );
+        let mut tcp = host;
+        tcp.transport = TransportProtocol::Tcp;
+        assert!(matches!(
+            IceCandidate::from_protocol(tcp),
+            Err(IceError::UnsupportedCandidate)
+        ));
+        let mut srflx = host;
+        srflx.candidate_type = CandidateType::ServerReflexive;
+        assert!(matches!(
+            IceCandidate::from_protocol(srflx),
+            Err(IceError::UnsupportedCandidate)
+        ));
+
+        let mut srflx = host;
+        srflx.candidate_type = CandidateType::ServerReflexive;
+        srflx.ip = WireIpAddr::V4([127, 0, 0, 2]);
+        srflx.related_address = Some((WireIpAddr::V4([127, 0, 0, 1]), 5000));
+        assert!(IceCandidate::from_protocol(srflx).is_ok());
+        assert!(matches!(
+            IceCandidate::from_probe_protocol(srflx),
+            Err(IceError::UnsupportedCandidate)
+        ));
+
+        let exchange = latencydesk_protocol::CandidateExchange {
+            version: latencydesk_protocol::CandidateExchange::VERSION,
+            exchange_id: 7,
+            generation: 1,
+            candidates: vec![host],
+        };
+        assert!(IceCandidate::probe_remote_from_exchange(
+            &exchange,
+            "127.0.0.1:4000".parse().unwrap()
+        )
+        .is_ok());
+        assert!(matches!(
+            IceCandidate::probe_remote_from_exchange(&exchange, "127.0.0.1:5000".parse().unwrap()),
+            Err(IceError::InvalidProbeCandidateSet)
+        ));
+        assert!(matches!(
+            IceCandidate::probe_remote_from_exchange(&exchange, "127.0.0.2:4000".parse().unwrap()),
+            Err(IceError::InvalidProbeCandidateSet)
+        ));
+        let multiple = latencydesk_protocol::CandidateExchange {
+            candidates: vec![host, host],
+            ..exchange.clone()
+        };
+        assert!(matches!(
+            IceCandidate::probe_remote_from_exchange(&multiple, "127.0.0.1:4000".parse().unwrap()),
+            Err(IceError::InvalidProbeCandidateSet)
+        ));
+        let ipv6 = latencydesk_protocol::CandidateExchange {
+            candidates: vec![latencydesk_protocol::IceCandidate {
+                ip: WireIpAddr::V6(std::net::Ipv6Addr::LOCALHOST.octets()),
+                port: 5000,
+                ..host
+            }],
+            ..exchange
+        };
+        assert!(matches!(
+            IceCandidate::probe_remote_from_exchange(&ipv6, "[::1]:4000".parse().unwrap()),
+            Err(IceError::InvalidProbeCandidateSet)
+        ));
+    }
+
+    #[test]
     fn candidate_and_policy_bounds_fail_closed() {
         let start = Instant::now();
         let credentials = credentials('a');
@@ -1003,75 +1492,6 @@ mod tests {
         );
     }
 
-    fn drive_udp_pair(socket_a: &UdpSocket, socket_b: &UdpSocket, a: &mut Ice, b: &mut Ice) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut nominated_a = false;
-        let mut nominated_b = false;
-        let mut buffer = [0_u8; MAX_ICE_DATAGRAM_BYTES];
-        while Instant::now() < deadline {
-            let now = Instant::now();
-            a.advance(now).expect("advance udp a");
-            b.advance(now).expect("advance udp b");
-            while let Some(transmit) = a.poll_transmit().expect("udp transmit a") {
-                assert_eq!(transmit.source, socket_a.local_addr().unwrap());
-                socket_a
-                    .send_to(&transmit.contents, transmit.destination)
-                    .expect("send ICE a");
-            }
-            while let Some(transmit) = b.poll_transmit().expect("udp transmit b") {
-                assert_eq!(transmit.source, socket_b.local_addr().unwrap());
-                socket_b
-                    .send_to(&transmit.contents, transmit.destination)
-                    .expect("send ICE b");
-            }
-            for (socket, agent) in [(socket_a, &mut *a), (socket_b, &mut *b)] {
-                loop {
-                    match socket.recv_from(&mut buffer) {
-                        Ok((length, source)) => {
-                            assert!(agent
-                                .handle_datagram(
-                                    now,
-                                    source,
-                                    socket.local_addr().unwrap(),
-                                    &buffer[..length],
-                                )
-                                .expect("receive ICE"));
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(error) => panic!("receive ICE failed: {error}"),
-                    }
-                }
-            }
-            while let Some(event) = a.poll_event() {
-                if let IceEvent::Nominated {
-                    source,
-                    destination,
-                } = event
-                {
-                    assert_eq!(source, socket_a.local_addr().unwrap());
-                    assert_eq!(destination, socket_b.local_addr().unwrap());
-                    nominated_a = true;
-                }
-            }
-            while let Some(event) = b.poll_event() {
-                if let IceEvent::Nominated {
-                    source,
-                    destination,
-                } = event
-                {
-                    assert_eq!(source, socket_b.local_addr().unwrap());
-                    assert_eq!(destination, socket_a.local_addr().unwrap());
-                    nominated_b = true;
-                }
-            }
-            if a.state().is_connected() && b.state().is_connected() && nominated_a && nominated_b {
-                return;
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-        panic!("real UDP ICE did not nominate");
-    }
-
     struct TestIdentity {
         certificate: CertificateDer<'static>,
         private_key: PrivateKeyDer<'static>,
@@ -1142,23 +1562,9 @@ mod tests {
         (server, client, server_certificate, client_certificate)
     }
 
-    fn drain_socket(socket: &UdpSocket) {
-        let mut buffer = [0_u8; MAX_ICE_DATAGRAM_BYTES];
-        loop {
-            match socket.recv_from(&mut buffer) {
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) => panic!("drain ICE socket failed: {error}"),
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn real_ice_nominated_sockets_hand_off_to_exact_mtls_quinn() {
+    fn real_udp_runner_handoffs() -> (IceSocketHandoff, IceSocketHandoff) {
         let socket_a = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("socket a");
         let socket_b = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("socket b");
-        socket_a.set_nonblocking(true).unwrap();
-        socket_b.set_nonblocking(true).unwrap();
         let address_a = socket_a.local_addr().unwrap();
         let address_b = socket_b.local_addr().unwrap();
         let start = Instant::now();
@@ -1182,14 +1588,176 @@ mod tests {
             .unwrap();
         b.add_remote_candidate(IceCandidate::host(address_a))
             .unwrap();
-        drive_udp_pair(&socket_a, &socket_b, &mut a, &mut b);
-        drain_socket(&socket_a);
-        drain_socket(&socket_b);
+
+        let control_a = IceRunControl::new();
+        let control_b = IceRunControl::new();
+        let worker_control_a = control_a.clone();
+        let worker_control_b = control_b.clone();
+        let worker_a = thread::spawn(move || run_ice_on_socket(socket_a, a, &worker_control_a));
+        let worker_b = thread::spawn(move || run_ice_on_socket(socket_b, b, &worker_control_b));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !(control_a.is_nominated() && control_b.is_nominated()) {
+            assert!(Instant::now() < deadline, "both ICE runners must nominate");
+            thread::sleep(Duration::from_millis(1));
+        }
+        control_a.request_handoff();
+        control_b.request_handoff();
+        let handoff_a = worker_a.join().unwrap().unwrap();
+        let handoff_b = worker_b.join().unwrap().unwrap();
+        assert_eq!(handoff_a.nominated, (address_a, address_b));
+        assert_eq!(handoff_b.nominated, (address_b, address_a));
+        assert_eq!(handoff_a.effective_role, IceRole::Controlling);
+        assert_eq!(handoff_b.effective_role, IceRole::Controlled);
+        assert!(handoff_a.stats.binding_requests_sent > 0);
+        assert!(handoff_b.stats.binding_requests_received > 0);
+        (handoff_a, handoff_b)
+    }
+
+    #[test]
+    fn real_socket_runners_require_two_phase_handoff_and_preserve_ports() {
+        let (handoff_a, handoff_b) = real_udp_runner_handoffs();
+        assert_eq!(
+            handoff_a.socket.local_addr().unwrap(),
+            handoff_a.nominated.0
+        );
+        assert_eq!(
+            handoff_b.socket.local_addr().unwrap(),
+            handoff_b.nominated.0
+        );
+    }
+
+    #[test]
+    fn socket_runner_cancellation_wrong_base_and_noise_fail_boundedly() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let local = socket.local_addr().unwrap();
+        let remote_port = if local.port() == u16::MAX {
+            u16::MAX - 1
+        } else {
+            local.port() + 1
+        };
+        let remote = SocketAddr::from((Ipv4Addr::LOCALHOST, remote_port));
+        let credentials_local = credentials('a');
+        let credentials_remote = credentials('b');
+        let mut cancelled = Ice::with_credentials_at(
+            IceRole::Controlling,
+            fast_config(),
+            Instant::now(),
+            &credentials_local,
+        )
+        .unwrap();
+        cancelled
+            .set_remote_credentials(&credentials_remote)
+            .unwrap();
+        cancelled
+            .add_local_candidate(IceCandidate::host(local))
+            .unwrap();
+        cancelled
+            .add_remote_candidate(IceCandidate::host(remote))
+            .unwrap();
+        let control = IceRunControl::new();
+        control.cancel();
+        assert!(matches!(
+            run_ice_on_socket(socket, cancelled, &control),
+            Err(IceError::Cancelled)
+        ));
+
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let actual = socket.local_addr().unwrap();
+        let wrong_port = if actual.port() == u16::MAX {
+            u16::MAX - 1
+        } else {
+            actual.port() + 1
+        };
+        let wrong = SocketAddr::new(actual.ip(), wrong_port);
+        let mut wrong_base = Ice::with_credentials_at(
+            IceRole::Controlling,
+            fast_config(),
+            Instant::now(),
+            &credentials_local,
+        )
+        .unwrap();
+        wrong_base
+            .set_remote_credentials(&credentials_remote)
+            .unwrap();
+        wrong_base
+            .add_local_candidate(IceCandidate::host(wrong))
+            .unwrap();
+        wrong_base
+            .add_remote_candidate(IceCandidate::host(remote))
+            .unwrap();
+        assert!(matches!(
+            run_ice_on_socket(socket, wrong_base, &IceRunControl::new()),
+            Err(IceError::AgentInvariant)
+        ));
+
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let local = socket.local_addr().unwrap();
+        let mut noisy = Ice::with_credentials_at(
+            IceRole::Controlling,
+            fast_config(),
+            Instant::now(),
+            &credentials_local,
+        )
+        .unwrap();
+        noisy.set_remote_credentials(&credentials_remote).unwrap();
+        noisy
+            .add_local_candidate(IceCandidate::host(local))
+            .unwrap();
+        noisy
+            .add_remote_candidate(IceCandidate::host(remote))
+            .unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        for _ in 0..=MAX_ICE_IGNORED_DATAGRAMS {
+            sender.send_to(&[1, 2, 3], local).unwrap();
+        }
+        assert!(matches!(
+            run_ice_on_socket(socket, noisy, &IceRunControl::new()),
+            Err(IceError::IgnoredDatagramLimit)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_worker_error_can_be_cleaned_without_polling_join_twice() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let actual = socket.local_addr().unwrap();
+        let wrong_port = if actual.port() == u16::MAX {
+            u16::MAX - 1
+        } else {
+            actual.port() + 1
+        };
+        let mut ice = Ice::with_credentials_at(
+            IceRole::Controlling,
+            fast_config(),
+            Instant::now(),
+            &credentials('a'),
+        )
+        .unwrap();
+        ice.set_remote_credentials(&credentials('b')).unwrap();
+        ice.add_local_candidate(IceCandidate::host(SocketAddr::new(actual.ip(), wrong_port)))
+            .unwrap();
+        ice.add_remote_candidate(IceCandidate::host(SocketAddr::new(
+            actual.ip(),
+            actual.port(),
+        )))
+        .unwrap();
+        let mut worker = IceSocketWorker::spawn(socket, ice);
+        assert!(matches!(
+            worker.wait_nominated(Duration::from_secs(1)).await,
+            Err(IceError::AgentInvariant)
+        ));
+        worker.cancel(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_ice_nominated_sockets_hand_off_to_exact_mtls_quinn() {
+        let (handoff_a, handoff_b) = real_udp_runner_handoffs();
+        let address_a = handoff_a.nominated.0;
+        let address_b = handoff_b.nominated.0;
 
         let (server_config, client_config, server_certificate, client_certificate) =
             test_tls_configs();
-        let server_endpoint = bind_server_on_socket(server_config, socket_b).unwrap();
-        let client_endpoint = bind_client_on_socket(client_config, socket_a).unwrap();
+        let server_endpoint = bind_server_on_socket(server_config, handoff_b.socket).unwrap();
+        let client_endpoint = bind_client_on_socket(client_config, handoff_a.socket).unwrap();
         assert_eq!(server_endpoint.local_addr().unwrap(), address_b);
         assert_eq!(client_endpoint.local_addr().unwrap(), address_a);
         let (server, client) = tokio::join!(

@@ -5,6 +5,7 @@
 //! and adaptive congestion control.
 
 pub mod ice;
+pub mod ice_probe;
 pub mod identity;
 pub mod product;
 pub mod quic;
