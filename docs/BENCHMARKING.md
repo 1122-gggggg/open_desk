@@ -123,9 +123,10 @@ For AnyDesk, RustDesk, Sunshine/Moonlight, Parsec, RDP, or another system:
 
 A valid conclusion is workload-specific, for example: “On the defined 1440p120 LAN IDE workload and reference hardware, LatencyDesk commit X had lower optical p95 input-to-photon than product Y version Z.” It is not “faster everywhere.”
 
-The machine gate requires at least one matched LAN profile (RTT <= 5 ms), one
-matched WAN profile (RTT >= 20 ms), a 20% p95 improvement by default,
-non-overlapping p95 bootstrap confidence intervals, and no p99 regression:
+The legacy structural comparator below checks matched LAN/WAN reports, p95
+margin, confidence intervals, and p99. It cannot authorize an AnyDesk
+superiority claim because it does not bind local binaries, a physical rig,
+paired crossover blocks, or retained misses:
 
 ```bash
 python3 scripts/optical_latency_benchmark.py superiority-gate \
@@ -136,9 +137,9 @@ python3 scripts/optical_latency_benchmark.py superiority-gate \
   --json
 ```
 
-A passing gate remains scoped to the exact hardware, workload, codec, quality,
-display, and network profiles in the reports. Independent reproduction is still
-required before a public superiority claim.
+A passing legacy gate is development feedback only. The physical crossover gate
+in Section 9 is the sole machine path for a claim, and independent reproduction
+is still required.
 
 ## 8. M6 desktop-refinement gates
 
@@ -153,3 +154,66 @@ Compare H.264 baseline and refinement mode using identical interaction traces. R
 - video workload suppression behavior.
 
 Refinement ships only when it improves clarity or bandwidth without exceeding the predefined latency/compute tolerance.
+
+## 9. Physical AnyDesk crossover gate v2
+
+`scripts/optical_crossover_gate.py` is fail-closed and verifies the installed
+AnyDesk binary/version, the supplied local LatencyDesk binary hash, and a
+locally opened/fingerprinted optical sensor. Photodiode/microcontroller rigs
+must sample at least 100 kHz; a high-speed-camera clock must be at least 1,000
+fps. Each
+matched LAN and WAN profile contains exactly 10 deterministic randomized paired
+blocks; each product/block retains exactly 20 warm-up events and 100 analyzed
+events. Missed responses remain samples and are right-censored at 2000 ms.
+
+Every event has a deterministic phase/index ID plus trigger/photon ticks from
+the declared single physical clock; missed-event deadlines must equal the
+2,000 ms censor. Block hashes include ID, AB/BA order, partition, and events;
+the pre-run schedule/config has a separate commitment. Route observations,
+settings, calibration, quality, packet capture, reliability, and block traces
+must also exist as local files matching their declared hashes.
+Both the pre-run commitment and final results manifest require signatures from
+a notary public key whose SHA-256 was committed to the repository before data
+collection. The trusted key constant is intentionally unset today, so even a
+machine with a sensor cannot produce a production PASS until that independent
+pre-registration step is reviewed and merged.
+
+Do not set that key merely because the parser tests pass. Activation also
+requires reviewed build provenance for the exact LatencyDesk binary, a trusted
+acquisition program that derives optical events and VMAF/SSIM/bandwidth/
+reliability values from the hashed raw artifacts, and an independently
+timestamped append-only record proving preregistration preceded capture. Until
+those controls and real sensor hardware exist, this file defines a dormant
+fail-closed evidence format—not a completed comparison.
+
+The gate performs a fixed 2,000-repeat, fixed-seed paired-block bootstrap; the
+production CLI exposes no repetition override. Both the observed p95
+improvement and the lower bound of its 95% interval must clear 20%; candidate
+p99, miss rate, completion/disconnect reliability, VMAF/SSIM quality, measured
+bandwidth, route class, workload, codec, display, hardware, and network shaping
+must not regress or differ. Every raw block is canonicalized and checked against
+its SHA-256 before analysis. There is no CLI synthetic-data bypass.
+
+```bash
+python3 scripts/optical_crossover_gate.py \
+  --candidate-binary target/release/latencydesk-client \
+  --pair artifacts/anydesk-lan-v2.json artifacts/latencydesk-lan-v2.json \
+  --pair artifacts/anydesk-wan-v2.json artifacts/latencydesk-wan-v2.json \
+  --output artifacts/optical-crossover-v2.json
+```
+
+Missing AnyDesk, sensor hardware, LAN/WAN coverage, raw events, or any matched
+condition returns exit code 2 and `blocked: true`. A pass remains scoped to the
+exact builds and rig, and still requires independent reproduction before a
+public superiority claim.
+
+For the AnyDesk arm, record the installed binary SHA-256/version and exact
+settings. A latency-oriented profile uses `ad.image.quality_preset=2` (optimize
+response time); record view/render mode and whether `ad.anynet.direct` is true
+or false, and require the same observed `route_class` in both product reports.
+These controls come from AnyDesk's official
+[advanced options](https://support.anydesk.com/advanced-options) and
+[display settings](https://support.anydesk.com/docs/display). The vendor notes
+that LAN sessions may otherwise traverse its public network, so a direct LAN
+run must also verify the direct-connection indicator described in its official
+[LAN troubleshooting guide](https://support.anydesk.com/anydesk-is-slow-despite-having-a-lan-connection).

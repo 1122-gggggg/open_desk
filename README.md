@@ -24,7 +24,7 @@ Windows client on a trusted, low-latency LAN.
 | Other clients | Portable software viewer with OpenH264/raw-NV12 presentation and input forwarding; headless receive and input probe remain available | Alpha implementation; cross-machine and native-UX evidence pending |
 | Windows host | Secure hosting is rejected before opening a socket because real capture/input providers are not connected | Unsupported |
 | Media | Raw NV12 fragmented across QUIC DATAGRAMs; no production H.264/AV1 encode/decode path | Low-resolution LAN preview only |
-| WAN connectivity | Direct IP plus a bounded race across four known exact-pinned addresses; opt-in RFC 8489 Binding and authenticated candidate advertisement; an explicit IPv4 loopback probe hands a nominated socket to exact-mTLS; separate local exact-mTLS rendezvous and bounded RFC 8656 UDP TURN processes | Each component is verified only in isolated/local evidence. No real NAT matrix, public rendezvous/TURN operation, automatic product route integration, Internet traversal, interactive recovery, or QUIC path migration |
+| WAN connectivity | Direct IP plus a bounded race across four known exact-pinned addresses; opt-in RFC 8489 Binding and authenticated candidate advertisement; an explicit IPv4 loopback probe hands a nominated socket to exact-mTLS; separate local exact-mTLS rendezvous and bounded RFC 8656 UDP TURN processes; rootless namespace NAT behavior matrix | Each component is verified only in isolated/local evidence. The matrix uses built-in UDP probes, not the product. No physical ISP/router matrix, public rendezvous/TURN operation, automatic product route integration, Internet traversal, interactive recovery, or QUIC path migration |
 | Distribution | No supported signed installer, updater, or production service | Not implemented |
 | Legacy transport | Plaintext custom UDP, available only with explicit `--unsafe-udp-lab` | Local compatibility test only |
 
@@ -361,8 +361,30 @@ separate daemon/client processes and a UDP echo peer. This is a local,
 SHA-256-preconfigured UDP subset—not a public or fully interoperable TURN
 service; the evidence daemon rejects non-loopback binds. Password-algorithm
 negotiation, FINGERPRINT, public abuse/capacity,
-TURN over TLS/DTLS, RFC 6062 TCP allocations, cross-family translation, NAT
-matrix, Internet reachability, and latency/AnyDesk claims remain unproven.
+TURN over TLS/DTLS, RFC 6062 TCP allocations, cross-family translation, product
+execution through the namespace matrix, Internet reachability, and
+latency/AnyDesk claims remain unproven.
+
+### 3.9 Isolated NAT/CGNAT/IPv6 behavior matrix
+
+`scripts/nat_netns_matrix.py run --allow-netns` starts an outer rootless
+user/mount/network/PID namespace; its PID-1 executor then self-creates a second
+network namespace before any mutation and builds real client/server/observer
+namespaces connected by veth and nftables. It observes LAN IPv4, RFC 4787
+endpoint-independent mapping, address/address-and-port-dependent filtering, APDM
+mapping to the same destination address at different ports, two-layer NAT, a
+`100.64/10` CGNAT path, native IPv6, broken IPv6, and UDP blocking. Double-NAT/CGNAT evidence requires nonzero NAT
+counters in both router namespaces. All ten profiles pass locally and cleanup
+leaves no named veth, nft table, or namespace process.
+
+The outer caller never invokes `ip`, `nft`, or `nsenter`. The internal executor
+requires mapped UID 0 and PID 1, calls `unshare(CLONE_NEWNET)` itself, and
+refuses to continue unless that syscall changes its network-namespace inode.
+The public runner also verifies host, outer, and executor inodes are distinct.
+A blocked required profile exits 2 and a
+behavior mismatch exits 1. This is emulator evidence using built-in UDP probes,
+not proof that LatencyDesk traverses a consumer router, carrier CGNAT, or public
+Internet.
 
 ### 4. Open several exact-pinned Hosts concurrently
 
@@ -421,10 +443,14 @@ network profile, repeated trials, raw data, and third-party reproducibility.
 Missing or zero metrics are not evidence. See the quantitative gates in
 [Product readiness](docs/PRODUCT_READINESS.md).
 
-`scripts/optical_latency_benchmark.py superiority-gate` is the only automated
-path that may mark the latency threshold as passed. It requires raw physical
-samples from matched LAN and WAN profiles, a 20% p95 improvement by default,
-non-overlapping p95 confidence intervals, and no p99 regression.
+`scripts/optical_crossover_gate.py` is the only automated path that may mark an
+AnyDesk latency threshold as passed. It requires the installed comparator and
+physical sensor, 10 randomized paired blocks per LAN/WAN profile, 1,000 analyzed
+events per product/profile, retained 2000 ms-censored misses, a paired-block 95%
+confidence interval wholly beyond the 20% p95 margin, no p99 regression, and
+matched quality/reliability/bandwidth/route guardrails. This workstation
+currently lacks the sensor, and no trusted notary key has yet been
+pre-registered, so the gate is blocked rather than passed.
 
 ## Security and license
 

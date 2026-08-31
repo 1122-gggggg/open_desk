@@ -131,6 +131,15 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
   output redacts credentials/payloads. This is not yet a public abuse-resistant
   or fully interoperable TURN deployment, and relay allocation alone grants no
   product route authority;
+- the NAT matrix never invokes network mutation tools in the caller namespace.
+  Its internal executor requires mapped root and PID 1, then calls
+  `unshare(CLONE_NEWNET)` itself before any mutation and verifies the inode
+  transition. The public runner independently verifies distinct host, outer,
+  and executor network namespaces. Every
+  veth, nft table, bridge, workload, and child namespace is explicitly owned,
+  bounded by an absolute deadline, and reaped in cleanup. A missing capability
+  is `blocked`, not success. The emulator executes only built-in fixed UDP
+  probes and grants no product/session authority;
 - rate limits before expensive parsing/decompression;
 - connection and incomplete-frame quotas.
 
