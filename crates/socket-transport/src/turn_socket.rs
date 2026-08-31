@@ -5,7 +5,10 @@
 //! ChannelBind. One task owns every read and demultiplexes STUN replies from
 //! ChannelData, so refreshes never race the application reader.
 
-use latencydesk_turn_relay::wire::{self, Attribute, Class, Header, Message, Method};
+use latencydesk_turn_relay::{
+    wire::{self, Attribute, Class, Header, Message, Method},
+    PERMISSION_LIFETIME,
+};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use quinn_udp::{RecvMeta, Transmit};
 use std::{
@@ -28,6 +31,7 @@ use zeroize::Zeroizing;
 const ALLOCATION_LIFETIME: u64 = 600;
 const MAX_QUEUE: usize = 64;
 const MAX_PAYLOAD: usize = wire::MAX_DATAGRAM_BYTES - 4;
+const AUTHORITY_REFRESH_MARGIN: Duration = Duration::from_secs(60);
 
 /// Configuration for one authenticated TURN allocation.
 pub struct TurnRouteConfig {
@@ -62,6 +66,35 @@ pub struct AuthenticatedTurnRoute {
     refresh: Option<JoinHandle<()>>,
 }
 
+struct EstablishGuard {
+    inner: Arc<Inner>,
+    reader: Option<JoinHandle<()>>,
+    armed: bool,
+}
+
+impl EstablishGuard {
+    fn complete(mut self, refresh: JoinHandle<()>) -> AuthenticatedTurnRoute {
+        self.armed = false;
+        AuthenticatedTurnRoute {
+            inner: Arc::clone(&self.inner),
+            reader: self.reader.take(),
+            refresh: Some(refresh),
+        }
+    }
+}
+
+impl Drop for EstablishGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.inner.revoke();
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
+        }
+    }
+}
+
 /// Compatibility name for the old adapter without preserving its raw API.
 pub type TurnChannelSocket = AuthenticatedTurnRoute;
 
@@ -92,6 +125,13 @@ struct RefreshCredentials {
     nonce: Zeroizing<Vec<u8>>,
     key: Zeroizing<[u8; 32]>,
 }
+
+type ClonedCredentials = (
+    Zeroizing<Vec<u8>>,
+    Zeroizing<Vec<u8>>,
+    Zeroizing<Vec<u8>>,
+    Zeroizing<[u8; 32]>,
+);
 
 impl AuthenticatedTurnRoute {
     /// Establish an authenticated allocation and bind exactly one peer and
@@ -125,16 +165,14 @@ impl AuthenticatedTurnRoute {
         });
         let reader_inner = inner.clone();
         let reader = tokio::spawn(read_loop(reader_inner));
+        let guard = EstablishGuard {
+            inner: Arc::clone(&inner),
+            reader: Some(reader),
+            armed: true,
+        };
 
         let (realm, nonce, key, relayed, expiry) =
-            match establish_transcript(&inner, server, peer, channel, &username, &password).await {
-                Ok(value) => value,
-                Err(error) => {
-                    inner.revoke();
-                    reader.abort();
-                    return Err(error);
-                }
-            };
+            establish_transcript(&inner, server, peer, channel, &username, &password).await?;
         {
             let mut state = inner.state.lock().expect("state mutex poisoned");
             if state.revoked {
@@ -159,11 +197,7 @@ impl AuthenticatedTurnRoute {
 
         let refresh_inner = inner.clone();
         let refresh = tokio::spawn(refresh_loop(refresh_inner));
-        Ok(Self {
-            inner,
-            reader: Some(reader),
-            refresh: Some(refresh),
-        })
+        Ok(guard.complete(refresh))
     }
 
     /// Build a Quinn endpoint around this route while retaining the caller's
@@ -304,7 +338,6 @@ impl AsyncUdpSocket for AuthenticatedTurnRoute {
             || transmit.contents.len() > MAX_PAYLOAD
             || transmit.segment_size.is_some()
             || transmit.src_ip.is_some()
-            || transmit.ecn.is_some()
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -381,7 +414,7 @@ impl AsyncUdpSocket for AuthenticatedTurnRoute {
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.socket.local_addr()
+        AuthenticatedTurnRoute::local_addr(self)
     }
     fn max_transmit_segments(&self) -> usize {
         1
@@ -585,7 +618,9 @@ async fn refresh_loop(inner: Arc<Inner>) {
             }
             (state.expiry, state.generation)
         };
-        let delay = expiry.saturating_duration_since(Instant::now()) / 2;
+        let permission_refresh =
+            Duration::from_secs(PERMISSION_LIFETIME).saturating_sub(AUTHORITY_REFRESH_MARGIN);
+        let delay = (expiry.saturating_duration_since(Instant::now()) / 2).min(permission_refresh);
         let timer = time::sleep(delay.max(Duration::from_millis(50)));
         tokio::pin!(timer);
         let mut stop = inner.stop.subscribe();
@@ -594,6 +629,10 @@ async fn refresh_loop(inner: Arc<Inner>) {
             return;
         }
         if let Ok(lifetime) = refresh_request(&inner, ALLOCATION_LIFETIME as u32).await {
+            if renew_peer_authority(&inner).await.is_err() {
+                inner.revoke();
+                return;
+            }
             let mut state = inner.state.lock().expect("state mutex poisoned");
             if !state.revoked && state.generation == generation {
                 state.generation = state.generation.saturating_add(1);
@@ -606,22 +645,56 @@ async fn refresh_loop(inner: Arc<Inner>) {
     }
 }
 
-async fn refresh_request(inner: &Arc<Inner>, lifetime: u32) -> io::Result<u64> {
-    let (username, realm, nonce, key) = {
-        let credentials = inner
-            .credentials
-            .lock()
-            .expect("credentials mutex poisoned");
-        let credentials = credentials
-            .as_ref()
-            .ok_or_else(|| protocol_error("TURN credentials unavailable"))?;
+async fn renew_peer_authority(inner: &Arc<Inner>) -> io::Result<()> {
+    let (username, realm, nonce, key) = cloned_credentials(inner)?;
+    for (method, attributes) in [
         (
-            credentials.username.clone(),
-            credentials.realm.clone(),
-            credentials.nonce.clone(),
-            credentials.key.clone(),
-        )
-    };
+            Method::CreatePermission,
+            vec![Attribute::XorPeerAddress(inner.peer)],
+        ),
+        (
+            Method::ChannelBind,
+            vec![
+                Attribute::ChannelNumber(inner.channel),
+                Attribute::XorPeerAddress(inner.peer),
+            ],
+        ),
+    ] {
+        let id = transaction_id()?;
+        let encoded = signed_request(
+            method,
+            id,
+            &username,
+            &realm,
+            &nonce,
+            attributes,
+            key.as_ref(),
+        )?;
+        let response = wire::verify_integrity(&request(inner, encoded, id).await?, key.as_ref())
+            .map_err(wire_error)?;
+        require_success(response.message(), method, id)?;
+    }
+    Ok(())
+}
+
+fn cloned_credentials(inner: &Inner) -> io::Result<ClonedCredentials> {
+    let credentials = inner
+        .credentials
+        .lock()
+        .expect("credentials mutex poisoned");
+    let credentials = credentials
+        .as_ref()
+        .ok_or_else(|| protocol_error("TURN credentials unavailable"))?;
+    Ok((
+        credentials.username.clone(),
+        credentials.realm.clone(),
+        credentials.nonce.clone(),
+        credentials.key.clone(),
+    ))
+}
+
+async fn refresh_request(inner: &Arc<Inner>, lifetime: u32) -> io::Result<u64> {
+    let (username, realm, nonce, key) = cloned_credentials(inner)?;
     let id = transaction_id()?;
     let encoded = signed_request(
         Method::Refresh,
@@ -823,7 +896,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn config_debug_redacts_secret_and_rejects_zero_bind_port() {
+    fn config_debug_redacts_secret_and_accepts_ephemeral_bind() {
         let config = TurnRouteConfig {
             server: "127.0.0.1:3478".parse().unwrap(),
             bind: "127.0.0.1:0".parse().unwrap(),
@@ -854,6 +927,8 @@ mod tests {
             let mut datagram = vec![0_u8; wire::MAX_DATAGRAM_BYTES];
             let realm = b"local.test".to_vec();
             let nonce = b"nonce-1".to_vec();
+            let mut permission_count = 0;
+            let mut channel_count = 0;
             let saw_refresh_zero = loop {
                 let (length, source) =
                     time::timeout(Duration::from_secs(3), server.recv_from(&mut datagram))
@@ -862,9 +937,7 @@ mod tests {
                         .unwrap();
                 if let Ok((channel, payload)) = wire::decode_channel_data(&datagram[..length]) {
                     if channel == 0x4000 {
-                        assert_eq!(payload, b"outbound");
-                        let echo = wire::encode_channel_data(channel, b"echo").unwrap();
-                        server.send_to(&echo, source).await.unwrap();
+                        assert!(matches!(payload, b"outbound" | b"ecn"));
                     }
                     continue;
                 }
@@ -899,6 +972,11 @@ mod tests {
                 let key = wire::derive_long_term_key_sha256(b"alice", &realm, &server_password);
                 let verified = wire::verify_integrity(&datagram[..length], key.as_ref()).unwrap();
                 let method = verified.message().header.method;
+                if method == Method::CreatePermission {
+                    permission_count += 1;
+                } else if method == Method::ChannelBind {
+                    channel_count += 1;
+                }
                 let response = Message {
                     header: Header {
                         class: Class::Success,
@@ -908,7 +986,7 @@ mod tests {
                     attributes: if method == Method::Allocate {
                         vec![
                             Attribute::XorRelayedAddress("127.0.0.1:49000".parse().unwrap()),
-                            Attribute::Lifetime(3),
+                            Attribute::Lifetime(1),
                         ]
                     } else if method == Method::Refresh
                         && verified
@@ -919,7 +997,7 @@ mod tests {
                     {
                         vec![Attribute::Lifetime(0)]
                     } else {
-                        vec![Attribute::Lifetime(3)]
+                        vec![Attribute::Lifetime(1)]
                     },
                 };
                 server
@@ -930,6 +1008,9 @@ mod tests {
                     .await
                     .unwrap();
                 if method == Method::ChannelBind {
+                    let wrong_channel =
+                        wire::encode_channel_data(0x4001, b"wrong-channel").unwrap();
+                    server.send_to(&wrong_channel, source).await.unwrap();
                     let inbound = wire::encode_channel_data(0x4000, b"inbound").unwrap();
                     server.send_to(&inbound, source).await.unwrap();
                 }
@@ -943,7 +1024,7 @@ mod tests {
                     break true;
                 }
             };
-            saw_refresh_zero
+            (saw_refresh_zero, permission_count, channel_count)
         });
         let route = Arc::new(
             AuthenticatedTurnRoute::establish(TurnRouteConfig {
@@ -961,6 +1042,10 @@ mod tests {
         assert_eq!(route.generation(), 1);
         assert_eq!(
             route.local_addr().unwrap(),
+            "127.0.0.1:49000".parse().unwrap()
+        );
+        assert_eq!(
+            AsyncUdpSocket::local_addr(route.as_ref()).unwrap(),
             "127.0.0.1:49000".parse().unwrap()
         );
         let forged = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1000,6 +1085,15 @@ mod tests {
             .try_send(&Transmit {
                 destination: peer_addr,
                 ecn: None,
+                contents: &vec![0_u8; MAX_PAYLOAD + 1],
+                segment_size: None,
+                src_ip: None,
+            })
+            .is_err());
+        assert!(route
+            .try_send(&Transmit {
+                destination: peer_addr,
+                ecn: None,
                 contents: b"x",
                 segment_size: None,
                 src_ip: Some("127.0.0.1".parse().unwrap()),
@@ -1019,7 +1113,50 @@ mod tests {
         assert_eq!(received, 1);
         assert_eq!(&output[..metadata[0].len], b"inbound");
         assert_eq!(metadata[0].addr, peer_addr);
+        route
+            .try_send(&Transmit {
+                destination: peer_addr,
+                ecn: Some(quinn_udp::EcnCodepoint::Ect0),
+                contents: b"ecn",
+                segment_size: None,
+                src_ip: None,
+            })
+            .expect("ECN metadata may be ignored like Quinn's fallback UDP adapter");
+        time::sleep(Duration::from_millis(700)).await;
+        assert!(route.generation() >= 2);
         route.shutdown().await.unwrap();
-        assert!(server_task.await.unwrap());
+        assert!(route.try_send(&transmit).is_err());
+        let (deallocated, permission_count, channel_count) = server_task.await.unwrap();
+        assert!(deallocated);
+        assert!(permission_count >= 2);
+        assert!(channel_count >= 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_establish_aborts_reader_and_releases_its_udp_port() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let task = tokio::spawn(AuthenticatedTurnRoute::establish(TurnRouteConfig {
+            server: server_addr,
+            bind: "127.0.0.1:0".parse().unwrap(),
+            username: b"alice".to_vec(),
+            password: b"0123456789abcdef-password".to_vec(),
+            peer: peer.local_addr().unwrap(),
+            channel: 0x4000,
+            timeout: Duration::from_secs(10),
+        }));
+        let mut request = vec![0_u8; wire::MAX_DATAGRAM_BYTES];
+        let (_, source) = time::timeout(Duration::from_secs(1), server.recv_from(&mut request))
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::task::yield_now().await;
+        let rebound = UdpSocket::bind(source)
+            .await
+            .expect("cancelled establish detached its reader/socket");
+        assert_eq!(rebound.local_addr().unwrap(), source);
     }
 }
