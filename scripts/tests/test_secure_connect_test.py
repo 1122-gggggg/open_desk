@@ -81,6 +81,26 @@ received: session_id=42 frames=3
             secure_connect_test.parse_received_all(client_output), [(41, 3), (42, 3)]
         )
 
+    def test_successor_lifecycle_advances_session_epochs_and_resets_route(self) -> None:
+        self.assertTrue(
+            secure_connect_test.successor_lifecycle_is_fresh(
+                (1, 1, 1, 1, 1),
+                (2, 2, 2, 2, 1),
+            )
+        )
+        self.assertFalse(
+            secure_connect_test.successor_lifecycle_is_fresh(
+                (1, 1, 1, 1, 1),
+                (2, 2, 1, 2, 1),
+            )
+        )
+        self.assertFalse(
+            secure_connect_test.successor_lifecycle_is_fresh(
+                (1, 1, 1, 1, 1),
+                (2, 2, 2, 2, 2),
+            )
+        )
+
     def test_counts_only_explicit_linux_desktop_stream_announcements(self) -> None:
         output = """stream: H.264 4:2:0 224x180 over QUIC DATAGRAM
 stream: explicit Raw NV12 320x180 over QUIC DATAGRAM

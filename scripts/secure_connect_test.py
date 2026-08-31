@@ -259,6 +259,18 @@ def parse_host_lifecycles(output: str) -> list[tuple[int, int, int, int, int]]:
     ]
 
 
+def successor_lifecycle_is_fresh(
+    previous: tuple[int, int, int, int, int],
+    current: tuple[int, int, int, int, int],
+) -> bool:
+    """Validate a new independent session, whose route state starts at epoch one."""
+    session_epochs_advanced = all(
+        current_value > previous_value
+        for previous_value, current_value in zip(previous[:4], current[:4])
+    )
+    return session_epochs_advanced and previous[4] == 1 and current[4] == 1
+
+
 def parse_client_session_id(output: str) -> int | None:
     match = CLIENT_SESSION_RE.search(output)
     return int(match.group(1)) if match else None
@@ -908,9 +920,8 @@ def run_secure_smoke(
         and first_received_frames >= args.frames
     )
     successor_client_session_id = observation["client_session_id"]
-    lifecycle_advanced = len(host_lifecycles) >= 2 and all(
-        current > previous
-        for previous, current in zip(host_lifecycles[-2], host_lifecycles[-1])
+    lifecycle_advanced = len(host_lifecycles) >= 2 and successor_lifecycle_is_fresh(
+        host_lifecycles[-2], host_lifecycles[-1]
     )
     observation["successor_session_distinct"] = (
         len(host_session_ids) >= 2
