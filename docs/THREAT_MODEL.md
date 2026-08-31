@@ -97,11 +97,15 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
   this control. Borrowed buffers and upstream ICE internal credential copies are
   not guaranteed zeroized;
 - the local rendezvous daemon uses TLS 1.3 client authentication against a
-  bounded exact-leaf allowlist, then independently byte-checks the accepted leaf
+  2–32-leaf exact allowlist, admits at most eight handshake/request tasks at
+  once, then independently byte-checks the accepted leaf
   and derives `DeviceId` from its SHA-256 fingerprint. Stranger and malformed
   connections are rejected without terminating the listener before the fixed
-  rejection cap. Each connection gets one control lane/request and one-shot
-  delivery; no
+  rejection cap. Each connection gets one control lane/request. Delivery is a
+  two-phase capability: both exact peers must acknowledge Delivery and Commit,
+  and neither caller returns success before the server sends Complete.
+  Disconnection, expiry, or an unconfirmed match refunds only its own reserved
+  registration capacity while retaining a replay tombstone. No
   product/input/media/relay lane is exposed. This is not yet a public trust,
   account, availability, or abuse-control service. Owned outbound secret
   buffers are zeroized, but inbound Quinn `Bytes` and decoder copies are only
@@ -132,7 +136,14 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
   opaque bounded bytes only. Passwords come from owner-only files and Debug
   output redacts credentials/payloads. This is not yet a public abuse-resistant
   or fully interoperable TURN deployment, and relay allocation alone grants no
-  product route authority;
+  product route authority. The product-side TURN module has no raw constructor:
+  it verifies Allocate/permission/channel transcripts before Quinn receives the
+  relayed socket, uses one bounded reader to demultiplex STUN and ChannelData,
+  refreshes allocation plus permission/channel before their independent
+  lifetimes, and locally revokes on cancellation, expiry, reader failure, or
+  failed renewal. Product traffic remains exact-mTLS QUIC ciphertext; current
+  evidence is loopback-only and does not prove public abuse resistance or
+  Internet availability;
 - the NAT matrix never invokes network mutation tools in the caller namespace.
   Its internal executor requires mapped root and PID 1, then calls
   `unshare(CLONE_NEWNET)` itself before any mutation and verifies the inode
@@ -142,6 +153,14 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
   bounded by an absolute deadline, and reaped in cleanup. A missing capability
   is `blocked`, not success. The emulator executes only built-in fixed UDP
   probes and grants no product/session authority;
+- the product NAT gate reuses that executor and resource ownership, but its
+  endpoint workloads are native exact-mTLS ProductSession probes. It validates
+  executable identity, certificate pairs, socket ownership, node/process netns
+  inodes, peer source tuples, session/challenge agreement, and double-NAT
+  counters. Native IPv6 route/neighbor warm-up uses repeated bounded 1,200-byte
+  opaque UDP before authentication and grants no authority. Only the subsequent
+  exact-mTLS ProductSession control/input/media exchange counts as product
+  success;
 - rate limits before expensive parsing/decompression;
 - connection and incomplete-frame quotas.
 

@@ -24,7 +24,7 @@ Windows client on a trusted, low-latency LAN.
 | Other clients | Portable software viewer with OpenH264/raw-NV12 presentation and input forwarding; headless receive and input probe remain available | Alpha implementation; cross-machine and native-UX evidence pending |
 | Windows host | Secure hosting is rejected before opening a socket because real capture/input providers are not connected | Unsupported |
 | Media | Raw NV12 fragmented across QUIC DATAGRAMs; no production H.264/AV1 encode/decode path | Low-resolution LAN preview only |
-| WAN connectivity | Direct IP plus a bounded race across four known exact-pinned addresses; opt-in RFC 8489 Binding and authenticated candidate advertisement; an explicit IPv4 loopback probe hands a nominated socket to exact-mTLS; separate local exact-mTLS rendezvous and bounded RFC 8656 UDP TURN processes; rootless namespace NAT behavior matrix | Each component is verified only in isolated/local evidence. The matrix uses built-in UDP probes, not the product. No physical ISP/router matrix, public rendezvous/TURN operation, automatic product route integration, Internet traversal, interactive recovery, or QUIC path migration |
+| WAN connectivity | Direct IP plus a bounded race across four known exact-pinned addresses; opt-in RFC 8489 Binding and authenticated candidate advertisement; an explicit IPv4 loopback probe hands a nominated socket to exact-mTLS; a concurrent local exact-mTLS rendezvous daemon; an authenticated RFC 8656 UDP TURN allocation that carries a real ProductSession; rootless namespace NAT behavior plus product-connectivity matrices | Each component is verified only in isolated/local evidence. ProductSession crosses LAN IPv4, EIM/EIF, double NAT, CGNAT, and native IPv6 emulation; mapping/filter classification retains separate built-in probes. No physical ISP/router matrix, public rendezvous/TURN operation, automatic desktop route integration, Internet traversal, interactive recovery, or QUIC path migration |
 | Distribution | No supported signed installer, updater, or production service | Not implemented |
 | Legacy transport | Plaintext custom UDP, available only with explicit `--unsafe-udp-lab` | Local compatibility test only |
 
@@ -312,19 +312,30 @@ zeroized.
 
 The `latencydesk-rendezvous` crate provides bounded matching state, and the
 opt-in `latencydesk-rendezvousd` process now exercises it over TLS 1.3 exact-mTLS
-QUIC. The server requires exactly two allowed client leaves for this evidence
-profile. It supplies the device
+QUIC. One daemon accepts 2–32 unique exact client leaves and admits at most
+eight TLS/request tasks concurrently. It supplies the device
 identity obtained from the authenticated client certificate; registration
 payloads cannot claim or replace that identity. A match succeeds only when two
 different devices name each other's exact certificate fingerprint, use
-complementary roles, and agree on the match ID, generation, ICE exchange ID,
-TTL, credentials, and candidates. Registration bytes are capped at 4 KiB,
-pending matches at 1,024, and each device at four pending matches; delivery is
-one-shot and expired/replayed match IDs are tombstoned.
+complementary roles, and agree on the match ID, generation, and ICE exchange
+ID. Each side retains its own bounded credentials/candidates; the shared
+delivery expiry is the earlier of the two bounded TTLs. Registration bytes are
+capped at 4 KiB,
+pending matches at 1,024, and each device at 16 pending matches in the daemon.
+Explicit registration and match caps are related by `matches × 2 ≤
+registrations`. Delivery is one-shot and does not become client-visible success
+until both exact-mTLS peers complete `DeliveryAck → CommitAck` and receive the
+server's final `Complete`; disconnected, expired, aborted, and replayed state is
+tombstoned, while uncommitted registration capacity is refunded.
 
 `scripts/rendezvous_process_test.py` first proves a stranger certificate cannot
 kill the listener, then proves both allowed clients receive the other's offer
-once. This remains a bounded local evidence service—not a supported public
+once. `scripts/rendezvous_multi_process_test.py` additionally proves two
+independent reciprocal matches complete through four native client processes
+while a stranger is rejected; it records exact binary versions/hashes, DER
+identity validation, and `/proc` ownership for the daemon and both pre-responder
+initiators' candidate/QUIC sockets. This remains a bounded local evidence
+service—not a supported public
 deployment. It has no DNS/discovery, dynamic account trust, NAT matrix, relay,
 abuse operation, route selection, desktop payload access, Internet reachability,
 or AnyDesk parity claim. Owned outbound secret buffers are zeroized; inbound
@@ -378,13 +389,31 @@ allocation and joins its task. Allocation, per-user, permission, channel,
 packet, byte, and absolute-deadline bounds fail closed. The relay handles
 opaque bytes only and owns no desktop or end-to-end encryption key.
 
+`AuthenticatedTurnRoute` is the product-side deep module. Its only public
+construction path completes the source-bound 401 challenge, verifies SHA-256
+message integrity and exact transaction transcripts, then creates the
+permission and channel before Quinn receives an abstract socket. A single UDP
+reader demultiplexes control responses and bounded ChannelData; bounded
+retransmission, monotonic allocation refresh, permission/channel renewal,
+expiry, local cancellation, and Refresh(0) all fail closed. The adapter exposes
+the relayed address to Quinn, conservatively disables MTU discovery, and
+forwards QUIC's encrypted packets without pretending the outer socket preserved
+ECN.
+
 `scripts/turn_relay_process_test.py` proves two exact-byte round trips with
-separate daemon/client processes and a UDP echo peer. This is a local,
+separate daemon/client processes and a UDP echo peer.
+`scripts/turn_product_process_test.py` forces `latencydesk-product-probe`
+through the allocation and proves exact-leaf mTLS plus ProductSession control,
+input, and media; the Host-observed QUIC source must equal the relayed address,
+the cross-process challenges and random session ID must agree, the relay must
+see traffic in both directions, and Refresh(0) must remove the allocation.
+This is a local,
 SHA-256-preconfigured UDP subset—not a public or fully interoperable TURN
 service; the evidence daemon rejects non-loopback binds. Password-algorithm
 negotiation, FINGERPRINT, public abuse/capacity,
 TURN over TLS/DTLS, RFC 6062 TCP allocations, cross-family translation, product
-execution through the namespace matrix, Internet reachability, and
+execution through the namespace matrix, automatic desktop route selection,
+Internet reachability, and
 latency/AnyDesk claims remain unproven.
 
 ### 3.9 Isolated NAT/CGNAT/IPv6 behavior matrix
@@ -407,6 +436,20 @@ A blocked required profile exits 2 and a
 behavior mismatch exits 1. This is emulator evidence using built-in UDP probes,
 not proof that LatencyDesk traverses a consumer router, carrier CGNAT, or public
 Internet.
+
+`scripts/nat_product_netns_test.py` reuses the same safe executor and topology
+ownership but replaces the echo payload with two native
+`latencydesk-product-probe` processes. Five profiles—LAN IPv4, EIM/EIF,
+double NAT, a private→`100.64/10`→public CGNAT path, and native IPv6—must
+complete exact-leaf mTLS plus ProductSession control/input/media on fixed UDP
+port 38765. Host-observed source tuples, process executable/socket ownership,
+per-process and per-node netns inodes, random challenge/session agreement, and
+both double-NAT counters are retained. Native IPv6 first runs a bounded repeated
+1,200-byte UDP path preflight, analogous only to route/neighbor warm-up; it
+grants no session authority and ProductSession mTLS must still pass afterward.
+This product subset does not replace the wider mapping/filter matrix and still
+does not prove physical router/carrier behavior, full ICE candidate nomination,
+NAT64, captive portals, or Internet success rates.
 
 ### 4. Open several exact-pinned Hosts concurrently
 
