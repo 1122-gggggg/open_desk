@@ -48,7 +48,7 @@ jobs:
           python3 -c 'import json, pathlib; data = json.loads(pathlib.Path("artifacts/ci/multisession-stress.json").read_text()); assert data["schema"] == 1; assert data["concurrent_sessions"] == 8; assert data["profile_runs"] == data["unique_session_profile_runs"] == 32; assert data["submitted_frames"] == data["completed_frames"] + data["incomplete_frames"] + data["exact_mismatches"]; assert data["exact_mismatches"] == 0; assert data["max_input_service_pops"] == 1'
       - name: Build secure process-smoke binaries
         if: matrix.os == 'ubuntu-latest'
-        run: cargo build --locked -p latencydesk-host -p latencydesk-client -p latencydesk-identity -p latencydesk-rendezvousd
+        run: cargo build --locked -p latencydesk-host -p latencydesk-client -p latencydesk-identity -p latencydesk-rendezvousd -p latencydesk-turn-relayd
       - name: Exact-mTLS rendezvous process smoke
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -64,6 +64,21 @@ jobs:
         with:
           name: rendezvous-process-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/ci/rendezvous-process.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Bounded RFC 8656 UDP TURN relay process smoke
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          python3 scripts/turn_relay_process_test.py \
+            --server-bin target/debug/latencydesk-turn-relayd \
+            --client-bin target/debug/latencydesk-turn-client \
+            --timeout 20 --output artifacts/ci/turn-relay-process.json
+      - name: Upload TURN relay process evidence
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v7
+        with:
+          name: turn-relay-process-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/ci/turn-relay-process.json
           if-no-files-found: error
           retention-days: 30
       - name: Secure QUIC/mTLS X11 process smoke
