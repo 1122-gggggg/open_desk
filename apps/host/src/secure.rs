@@ -1358,6 +1358,7 @@ mod linux {
             | IdentityError::Generation(_)
             | IdentityError::InvalidIdentity(_)
             | IdentityError::InvalidPeerCertificate(_)
+            | IdentityError::InvalidAllowedPeerSet
             | IdentityError::ClientVerifier(_)
             | IdentityError::QuicCrypto(_)
             | IdentityError::FileTooLarge { .. }
@@ -2506,6 +2507,7 @@ mod windows {
             | IdentityError::Generation(_)
             | IdentityError::InvalidIdentity(_)
             | IdentityError::InvalidPeerCertificate(_)
+            | IdentityError::InvalidAllowedPeerSet
             | IdentityError::ClientVerifier(_)
             | IdentityError::QuicCrypto(_)
             | IdentityError::FileTooLarge { .. }

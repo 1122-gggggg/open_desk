@@ -49,6 +49,8 @@ pub const QUIC_DATAGRAM_RECEIVE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 pub const QUIC_DATAGRAM_SEND_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum exact-pinned endpoints raced for one logical Host connection.
 pub const MAX_PARALLEL_CONNECT_CANDIDATES: usize = 4;
+/// Maximum exact client leaves trusted by one bounded rendezvous endpoint.
+pub const MAX_ALLOWED_EXACT_CLIENTS: usize = 16;
 /// Negotiated idle bound for detecting a dead authenticated network path.
 pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Keepalive cadence used while an interactive session would otherwise be idle.
@@ -123,6 +125,8 @@ pub enum IdentityError {
     MissingPeerCertificate,
     /// The authenticated leaf did not exactly equal the expected DER certificate.
     PeerCertificateMismatch,
+    /// An exact-client allowlist was empty, duplicated, or exceeded its bound.
+    InvalidAllowedPeerSet,
     /// A multi-endpoint connection attempt had no remote addresses.
     NoConnectionCandidates,
     /// A multi-endpoint connection attempt exceeded its fixed fan-out bound.
@@ -209,6 +213,9 @@ impl fmt::Display for IdentityError {
             Self::PeerCertificateMismatch => {
                 formatter.write_str("authenticated peer leaf did not match the exact certificate")
             }
+            Self::InvalidAllowedPeerSet => formatter.write_str(
+                "exact client certificate allowlist must contain 1..=16 unique leaves",
+            ),
             Self::NoConnectionCandidates => {
                 formatter.write_str("no connection candidates were supplied")
             }
@@ -294,6 +301,7 @@ impl Error for IdentityError {
             | Self::IdentityPathsMustDiffer
             | Self::MissingPeerCertificate
             | Self::PeerCertificateMismatch
+            | Self::InvalidAllowedPeerSet
             | Self::NoConnectionCandidates
             | Self::TooManyConnectionCandidates { .. }
             | Self::InvalidConnectionCandidate(_)
@@ -668,6 +676,40 @@ pub fn mtls_server_config(
     Ok(configuration)
 }
 
+/// Builds a TLS 1.3-only Quinn server configuration for a bounded set of
+/// exact client leaves. Rustls validates the client chain against the supplied
+/// roots; [`accept_allowed_exact_peer_with_timeout`] then independently checks
+/// exact DER equality before returning a device identity.
+///
+/// Source: https://docs.rs/rustls/0.23.43/rustls/server/struct.WebPkiClientVerifier.html#method.builder_with_provider
+pub fn mtls_server_config_for_exact_clients(
+    identity: &TlsIdentity,
+    exact_client_certificate_ders: &[Vec<u8>],
+) -> Result<quinn::ServerConfig, IdentityError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let client_roots = allowed_exact_root_store(exact_client_certificate_ders)?;
+    let client_verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(client_roots),
+        provider.clone(),
+    )
+    .build()
+    .map_err(IdentityError::ClientVerifier)?;
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(IdentityError::InvalidIdentity)?
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(identity.certificate_chain(), identity.private_key())
+        .map_err(IdentityError::InvalidIdentity)?;
+    tls.alpn_protocols = vec![TLS_ALPN_PROTOCOL.to_vec()];
+    tls.max_early_data_size = 0;
+
+    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls))
+        .map_err(IdentityError::QuicCrypto)?;
+    let mut configuration = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    configuration.transport = Arc::new(bounded_transport_config());
+    Ok(configuration)
+}
+
 /// Builds a TLS 1.3-only Quinn client config that presents its certificate and
 /// trusts the exact server certificate supplied as its sole root.
 pub fn mtls_client_config(
@@ -717,6 +759,14 @@ pub struct ExactPeerConnection {
     pub connection: QuicConnection,
     pub remote: SocketAddr,
     pub attempts_started: usize,
+}
+
+/// Fully authenticated connection whose exact client leaf belonged to the
+/// server's bounded allowlist.
+#[derive(Debug)]
+pub struct AllowedExactPeerConnection {
+    pub connection: QuicConnection,
+    pub peer_fingerprint: [u8; 32],
 }
 
 /// Races a small, caller-ordered set of addresses and returns the first fully
@@ -844,6 +894,25 @@ pub async fn accept_exact_peer_with_timeout(
     Ok(connection)
 }
 
+/// Accepts one bounded-handshake client, then requires its authenticated leaf
+/// to byte-match one of the configured exact certificates. Waiting for an
+/// Initial remains the caller's separate total-deadline responsibility.
+pub async fn accept_allowed_exact_peer_with_timeout(
+    endpoint: &quinn::Endpoint,
+    exact_client_certificate_ders: &[Vec<u8>],
+    handshake_timeout: Duration,
+) -> Result<AllowedExactPeerConnection, IdentityError> {
+    allowed_exact_root_store(exact_client_certificate_ders)?;
+    let connection = QuicConnection::accept_with_handshake_timeout(endpoint, handshake_timeout)
+        .await
+        .map_err(IdentityError::QuicTransport)?;
+    let peer_fingerprint = verify_allowed_exact_peer(&connection, exact_client_certificate_ders)?;
+    Ok(AllowedExactPeerConnection {
+        connection,
+        peer_fingerprint,
+    })
+}
+
 /// Returns the product QUIC transport policy with explicit flow-control,
 /// stream-count, crypto, MTU, and DATAGRAM buffer limits.
 #[must_use]
@@ -934,6 +1003,33 @@ fn exact_root_store(certificate_der: &[u8]) -> Result<rustls::RootCertStore, Ide
     Ok(roots)
 }
 
+fn allowed_exact_root_store(
+    certificate_ders: &[Vec<u8>],
+) -> Result<rustls::RootCertStore, IdentityError> {
+    if certificate_ders.is_empty() || certificate_ders.len() > MAX_ALLOWED_EXACT_CLIENTS {
+        return Err(IdentityError::InvalidAllowedPeerSet);
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    let mut fingerprints = Vec::with_capacity(certificate_ders.len());
+    for certificate_der in certificate_ders {
+        check_size(
+            "peer certificate",
+            None,
+            certificate_der.len(),
+            MAX_CERTIFICATE_DER_BYTES,
+        )?;
+        let fingerprint = certificate_fingerprint(certificate_der);
+        if fingerprints.contains(&fingerprint) {
+            return Err(IdentityError::InvalidAllowedPeerSet);
+        }
+        roots
+            .add(CertificateDer::from(certificate_der.clone()))
+            .map_err(IdentityError::InvalidPeerCertificate)?;
+        fingerprints.push(fingerprint);
+    }
+    Ok(roots)
+}
+
 fn verify_exact_peer(
     connection: &QuicConnection,
     expected_certificate_der: &[u8],
@@ -956,6 +1052,33 @@ fn verify_exact_peer(
         return Err(IdentityError::PeerCertificateMismatch);
     }
     Ok(())
+}
+
+fn verify_allowed_exact_peer(
+    connection: &QuicConnection,
+    expected_certificate_ders: &[Vec<u8>],
+) -> Result<[u8; 32], IdentityError> {
+    let chain = match connection.peer_certificate_chain() {
+        Ok(chain) => chain,
+        Err(error) => {
+            connection.close(PEER_IDENTITY_ERROR_CODE, PEER_IDENTITY_ERROR_REASON);
+            return Err(IdentityError::QuicTransport(error));
+        }
+    };
+    let Some(actual_certificate_der) = chain.first() else {
+        connection.close(PEER_IDENTITY_ERROR_CODE, PEER_IDENTITY_ERROR_REASON);
+        return Err(IdentityError::MissingPeerCertificate);
+    };
+    let actual_fingerprint = certificate_fingerprint(actual_certificate_der);
+    let exact_match = expected_certificate_ders.iter().any(|expected| {
+        certificate_fingerprint(expected) == actual_fingerprint
+            && expected.as_slice() == actual_certificate_der.as_slice()
+    });
+    if !exact_match {
+        connection.close(PEER_IDENTITY_ERROR_CODE, PEER_IDENTITY_ERROR_REASON);
+        return Err(IdentityError::PeerCertificateMismatch);
+    }
+    Ok(actual_fingerprint)
 }
 
 fn read_bounded(
@@ -1439,6 +1562,122 @@ mod tests {
             .expect("datagram timeout")
             .expect("receive datagram");
         assert_eq!(received, datagram);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_allowed_client_set_accepts_each_exact_leaf() {
+        let server_identity = TlsIdentity::generate("Rendezvous Server").unwrap();
+        let client_a = TlsIdentity::generate("Rendezvous Client A").unwrap();
+        let client_b = TlsIdentity::generate("Rendezvous Client B").unwrap();
+        let allowed = vec![
+            client_a.certificate_der().to_vec(),
+            client_b.certificate_der().to_vec(),
+        ];
+        let server_config = mtls_server_config_for_exact_clients(&server_identity, &allowed)
+            .expect("bounded allowed-client config");
+        let server_endpoint =
+            bind_server(server_config, SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let address = server_endpoint.local_addr().unwrap();
+
+        let stranger = TlsIdentity::generate("Rendezvous Stranger").unwrap();
+        let stranger_endpoint = bind_client(
+            mtls_client_config(&stranger, server_identity.certificate_der()).unwrap(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let (server_rejection, stranger_rejection) = tokio::join!(
+            timeout(
+                Duration::from_secs(2),
+                accept_allowed_exact_peer_with_timeout(
+                    &server_endpoint,
+                    &allowed,
+                    Duration::from_secs(1),
+                ),
+            ),
+            timeout(
+                Duration::from_secs(2),
+                connect_exact_peer(
+                    &stranger_endpoint,
+                    address,
+                    server_identity.certificate_der(),
+                ),
+            ),
+        );
+        assert!(!matches!(server_rejection, Ok(Ok(_))));
+        if let Ok(Ok(connection)) = stranger_rejection {
+            timeout(Duration::from_secs(2), connection.closed())
+                .await
+                .expect("rejected stranger did not observe server close");
+        }
+        stranger_endpoint.close(0_u32.into(), b"test complete");
+        stranger_endpoint.wait_idle().await;
+
+        for client_identity in [&client_a, &client_b] {
+            let client_endpoint = bind_client(
+                mtls_client_config(client_identity, server_identity.certificate_der()).unwrap(),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let (server, client) = tokio::join!(
+                timeout(
+                    Duration::from_secs(2),
+                    accept_allowed_exact_peer_with_timeout(
+                        &server_endpoint,
+                        &allowed,
+                        Duration::from_secs(1),
+                    ),
+                ),
+                timeout(
+                    Duration::from_secs(2),
+                    connect_exact_peer(
+                        &client_endpoint,
+                        address,
+                        server_identity.certificate_der(),
+                    ),
+                ),
+            );
+            let server = server.unwrap().unwrap();
+            let client = client.unwrap().unwrap();
+            assert_eq!(
+                server.peer_fingerprint,
+                certificate_fingerprint(client_identity.certificate_der())
+            );
+            assert_eq!(
+                server.connection.peer_certificate_chain().unwrap()[0],
+                client_identity.certificate_der()
+            );
+            client.close(0, b"allowed-client test complete");
+            let _ = server.connection.closed().await;
+            client_endpoint.close(0_u32.into(), b"test complete");
+            client_endpoint.wait_idle().await;
+        }
+        server_endpoint.close(0_u32.into(), b"test complete");
+        server_endpoint.wait_idle().await;
+    }
+
+    #[test]
+    fn allowed_client_set_rejects_empty_duplicate_and_unbounded_inputs() {
+        let server_identity = TlsIdentity::generate("Rendezvous Server").unwrap();
+        let client = TlsIdentity::generate("Rendezvous Client").unwrap();
+        assert!(matches!(
+            mtls_server_config_for_exact_clients(&server_identity, &[]),
+            Err(IdentityError::InvalidAllowedPeerSet)
+        ));
+        let duplicate = vec![
+            client.certificate_der().to_vec(),
+            client.certificate_der().to_vec(),
+        ];
+        assert!(matches!(
+            mtls_server_config_for_exact_clients(&server_identity, &duplicate),
+            Err(IdentityError::InvalidAllowedPeerSet)
+        ));
+        let too_many = (0..=MAX_ALLOWED_EXACT_CLIENTS)
+            .map(|_| client.certificate_der().to_vec())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            mtls_server_config_for_exact_clients(&server_identity, &too_many),
+            Err(IdentityError::InvalidAllowedPeerSet)
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
