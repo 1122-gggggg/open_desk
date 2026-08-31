@@ -105,6 +105,54 @@ pub struct AuthenticatedRequest {
     verified: wire::VerifiedMessage,
 }
 
+/// Redacted material for a signed stale-nonce challenge. The allocation owns
+/// this snapshot and callers can only ask it to encode the fixed 438 response;
+/// credential bytes and the integrity key never leave this module.
+pub struct StaleNonceChallenge {
+    realm: Zeroizing<Vec<u8>>,
+    nonce: Zeroizing<Vec<u8>>,
+    integrity_key: Zeroizing<[u8; 32]>,
+}
+
+impl StaleNonceChallenge {
+    pub fn encode_signed_438(
+        &self,
+        method: wire::Method,
+        transaction_id: [u8; 12],
+    ) -> Result<Vec<u8>, wire::WireError> {
+        if !matches!(
+            method,
+            wire::Method::Refresh | wire::Method::CreatePermission | wire::Method::ChannelBind
+        ) {
+            return Err(wire::WireError::InvalidMethodClass);
+        }
+        wire::encode_with_integrity(
+            &wire::Message {
+                header: wire::Header {
+                    class: wire::Class::Error,
+                    method,
+                    transaction_id,
+                },
+                attributes: vec![
+                    wire::Attribute::ErrorCode {
+                        code: 438,
+                        reason: "Stale Nonce".into(),
+                    },
+                    wire::Attribute::Realm(self.realm.to_vec()),
+                    wire::Attribute::Nonce(self.nonce.to_vec()),
+                ],
+            },
+            self.integrity_key.as_ref(),
+        )
+    }
+}
+
+impl fmt::Debug for StaleNonceChallenge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StaleNonceChallenge(<redacted>)")
+    }
+}
+
 impl AuthenticatedRequest {
     #[must_use]
     pub const fn method(&self) -> wire::Method {
@@ -406,6 +454,39 @@ impl RelayState {
         encoded_request: &[u8],
         now: u64,
     ) -> Result<AuthenticatedRequest, StateError> {
+        self.authenticate_request_inner(key, encoded_request, now, false)
+    }
+
+    /// Validate an authenticated stale-nonce request and return the current
+    /// nonce without mutating allocation state.  A stale challenge is
+    /// idempotent: retransmissions or a new transaction carrying the same old
+    /// nonce receive the same current nonce and cannot force nonce churn.
+    pub fn stale_nonce_challenge(
+        &mut self,
+        key: &UdpTuple,
+        encoded_request: &[u8],
+        now: u64,
+    ) -> Result<StaleNonceChallenge, StateError> {
+        let request = self.authenticate_request_inner(key, encoded_request, now, true)?;
+        let supplied_nonce = request_credentials(request.message())?.nonce;
+        let allocation = self.live_allocation_mut(key, now)?;
+        if constant_eq(allocation.credentials.nonce(), supplied_nonce) {
+            return Err(StateError::StaleNonce);
+        }
+        Ok(StaleNonceChallenge {
+            realm: allocation.credentials.realm.clone(),
+            nonce: allocation.credentials.nonce.clone(),
+            integrity_key: allocation.credentials.integrity_key.clone(),
+        })
+    }
+
+    fn authenticate_request_inner(
+        &mut self,
+        key: &UdpTuple,
+        encoded_request: &[u8],
+        now: u64,
+        allow_stale_nonce: bool,
+    ) -> Result<AuthenticatedRequest, StateError> {
         let integrity_key = {
             let allocation = self.live_allocation_mut(key, now)?;
             Zeroizing::new(*allocation.credentials.integrity_key)
@@ -425,7 +506,9 @@ impl RelayState {
         {
             return Err(StateError::WrongCredentials);
         }
-        if !constant_eq(allocation.credentials.nonce(), request_credentials.nonce) {
+        if !allow_stale_nonce
+            && !constant_eq(allocation.credentials.nonce(), request_credentials.nonce)
+        {
             return Err(StateError::StaleNonce);
         }
         Ok(AuthenticatedRequest {
@@ -437,6 +520,9 @@ impl RelayState {
         })
     }
 
+    /// Rotate credentials for callers that already hold an authenticated
+    /// request using the current nonce. Network stale-nonce recovery uses the
+    /// idempotent [`RelayState::stale_nonce_challenge`] path instead.
     pub fn rotate_nonce(
         &mut self,
         request: &AuthenticatedRequest,

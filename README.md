@@ -393,12 +393,22 @@ opaque bytes only and owns no desktop or end-to-end encryption key.
 construction path completes the source-bound 401 challenge, verifies SHA-256
 message integrity and exact transaction transcripts, then creates the
 permission and channel before Quinn receives an abstract socket. A single UDP
-reader demultiplexes control responses and bounded ChannelData; bounded
-retransmission, monotonic allocation refresh, permission/channel renewal,
-expiry, local cancellation, and Refresh(0) all fail closed. The adapter exposes
-the relayed address to Quinn, conservatively disables MTU discovery, and
-forwards QUIC's encrypted packets without pretending the outer socket preserved
-ECN.
+reader demultiplexes control responses and bounded ChannelData. Only the
+bootstrap Allocate/401 exchange may be unsigned; every later control response
+must pass SHA-256 message-integrity verification before it can consume its
+pending transaction. A signed 438 is verified with the old key and may rotate
+realm, nonce, and key once for Allocate, CreatePermission, ChannelBind, or
+Refresh; a second 438 fails closed. On the server, a stale request returns the
+allocation's current valid nonce without mutating allocation state, so replay
+under a new transaction cannot churn credentials. The sealed state object
+encodes the signed 438 itself; the server runtime cannot read or log its
+integrity key. Bit-identical requests use a 500-ms
+exponential RTO capped at 4 seconds, seven attempts, and one absolute deadline.
+Pending transactions and relay data are capped by both item count and bytes.
+Monotonic allocation refresh, permission/channel renewal, expiry, local
+cancellation, and Refresh(0) all fail closed. The adapter exposes the relayed
+address to Quinn, conservatively disables MTU discovery, and forwards QUIC's
+encrypted packets without pretending the outer socket preserved ECN.
 
 `scripts/turn_relay_process_test.py` proves two exact-byte round trips with
 separate daemon/client processes and a UDP echo peer.

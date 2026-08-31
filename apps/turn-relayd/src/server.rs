@@ -358,11 +358,17 @@ impl Runtime {
             let key = match self.authenticate_account(encoded, decoded, source) {
                 Ok(key) => key,
                 Err(AuthFailure::Stale) => {
-                    return self.issue_challenge(
+                    let key = wire::derive_long_term_key_sha256(
+                        self.config.username(),
+                        self.config.realm(),
+                        self.config.password(),
+                    );
+                    return self.issue_authenticated_challenge(
                         Method::Allocate,
                         decoded.header.transaction_id,
                         source,
                         438,
+                        key.as_ref(),
                     );
                 }
                 Err(AuthFailure::Unauthorized) => {
@@ -447,12 +453,18 @@ impl Runtime {
         let authenticated = match authentication {
             Ok(request) => request,
             Err(StateError::StaleNonce) => {
-                return self.issue_challenge(
+                if !matches!(
                     decoded.header.method,
-                    decoded.header.transaction_id,
-                    source,
-                    438,
-                );
+                    Method::Refresh | Method::CreatePermission | Method::ChannelBind
+                ) {
+                    return self.issue_challenge(
+                        decoded.header.method,
+                        decoded.header.transaction_id,
+                        source,
+                        438,
+                    );
+                }
+                return self.stale_nonce_response(tuple, encoded, decoded).await;
             }
             Err(StateError::Integrity | StateError::WrongCredentials) => {
                 return self.issue_challenge(
@@ -561,17 +573,7 @@ impl Runtime {
         source: SocketAddr,
         code: u16,
     ) -> Result<Vec<u8>, TurnServiceError> {
-        let nonce = random_nonce()?;
-        if self.challenges.len() >= MAX_CHALLENGES && !self.challenges.contains_key(&source) {
-            return Err(TurnServiceError::Protocol("challenge capacity reached"));
-        }
-        self.challenges.insert(
-            source,
-            Challenge {
-                nonce: Zeroizing::new(nonce.clone()),
-                expires_at: self.now().saturating_add(NONCE_LIFETIME_SECONDS),
-            },
-        );
+        let nonce = self.issue_new_challenge(source)?;
         wire::encode(&Message {
             header: Header {
                 class: Class::Error,
@@ -592,6 +594,72 @@ impl Runtime {
             ],
         })
         .map_err(Into::into)
+    }
+
+    fn issue_authenticated_challenge(
+        &mut self,
+        method: Method,
+        transaction_id: [u8; 12],
+        source: SocketAddr,
+        code: u16,
+        key: &[u8],
+    ) -> Result<Vec<u8>, TurnServiceError> {
+        let nonce = self.stale_challenge_nonce(source)?;
+        signed_error_with_attributes(
+            method,
+            transaction_id,
+            code,
+            if code == 438 {
+                "Stale Nonce"
+            } else {
+                "Unauthenticated"
+            },
+            vec![
+                Attribute::Realm(self.config.realm().to_vec()),
+                Attribute::Nonce(nonce),
+            ],
+            key,
+        )
+    }
+
+    fn issue_new_challenge(&mut self, source: SocketAddr) -> Result<Vec<u8>, TurnServiceError> {
+        let nonce = random_nonce()?;
+        if self.challenges.len() >= MAX_CHALLENGES && !self.challenges.contains_key(&source) {
+            return Err(TurnServiceError::Protocol("challenge capacity reached"));
+        }
+        self.challenges.insert(
+            source,
+            Challenge {
+                nonce: Zeroizing::new(nonce.clone()),
+                expires_at: self.now().saturating_add(NONCE_LIFETIME_SECONDS),
+            },
+        );
+        Ok(nonce)
+    }
+
+    fn stale_challenge_nonce(&mut self, source: SocketAddr) -> Result<Vec<u8>, TurnServiceError> {
+        if let Some(challenge) = self.challenges.get(&source) {
+            if self.now() < challenge.expires_at {
+                return Ok(challenge.nonce.to_vec());
+            }
+        }
+        self.issue_new_challenge(source)
+    }
+
+    async fn stale_nonce_response(
+        &mut self,
+        tuple: UdpTuple,
+        encoded: &[u8],
+        decoded: &Message,
+    ) -> Result<Vec<u8>, TurnServiceError> {
+        let challenge =
+            self.state
+                .lock()
+                .await
+                .stale_nonce_challenge(&tuple, encoded, self.now())?;
+        challenge
+            .encode_signed_438(decoded.header.method, decoded.header.transaction_id)
+            .map_err(Into::into)
     }
 
     fn spawn_peer_task(&mut self, tuple: UdpTuple, socket: Arc<UdpSocket>) {
@@ -788,6 +856,32 @@ fn signed_error(
                 code,
                 reason: reason.into(),
             }],
+        },
+        key,
+    )?)
+}
+
+fn signed_error_with_attributes(
+    method: Method,
+    transaction_id: [u8; 12],
+    code: u16,
+    reason: &str,
+    mut attributes: Vec<Attribute>,
+    key: &[u8],
+) -> Result<Vec<u8>, TurnServiceError> {
+    let mut error_attributes = vec![Attribute::ErrorCode {
+        code,
+        reason: reason.into(),
+    }];
+    error_attributes.append(&mut attributes);
+    Ok(wire::encode_with_integrity(
+        &Message {
+            header: Header {
+                class: Class::Error,
+                method,
+                transaction_id,
+            },
+            attributes: error_attributes,
         },
         key,
     )?)

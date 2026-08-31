@@ -42,7 +42,25 @@ fn signed_request(
     realm: &[u8],
     nonce: &[u8],
     method: Method,
+    attributes: Vec<Attribute>,
+) -> Vec<u8> {
+    signed_request_with_id(
+        user,
+        realm,
+        nonce,
+        method,
+        attributes,
+        [method as u8 + 1; 12],
+    )
+}
+
+fn signed_request_with_id(
+    user: &[u8],
+    realm: &[u8],
+    nonce: &[u8],
+    method: Method,
     mut attributes: Vec<Attribute>,
+    transaction_id: [u8; 12],
 ) -> Vec<u8> {
     let key = integrity_key(user);
     let mut credentials = vec![
@@ -56,7 +74,7 @@ fn signed_request(
             header: Header {
                 class: Class::Request,
                 method,
-                transaction_id: [method as u8 + 1; 12],
+                transaction_id,
             },
             attributes: credentials,
         },
@@ -103,6 +121,111 @@ fn quota() -> Quota {
 
 fn state() -> RelayState {
     RelayState::new(quota(), PeerPolicy::default()).unwrap()
+}
+
+#[test]
+fn stale_nonce_challenge_replay_cannot_rotate_state() {
+    let mut state = state();
+    let key = tuple(5000);
+    state
+        .create(key, credentials(b"alice"), relay(49000), 0, None)
+        .unwrap();
+    let mut invalid_bytes = signed_request(
+        b"alice",
+        b"turn.example",
+        b"nonce-1",
+        Method::Refresh,
+        vec![Attribute::Lifetime(1)],
+    );
+    *invalid_bytes.last_mut().unwrap() ^= 0xff;
+    assert!(matches!(
+        state.stale_nonce_challenge(&key, &invalid_bytes, 1),
+        Err(StateError::Integrity)
+    ));
+    let stale_bytes = signed_request(
+        b"alice",
+        b"turn.example",
+        b"nonce-0",
+        Method::Refresh,
+        vec![Attribute::Lifetime(1)],
+    );
+    let current = authenticate(
+        &mut state,
+        key,
+        b"alice",
+        b"nonce-1",
+        Method::Refresh,
+        vec![],
+        1,
+    );
+    state
+        .rotate_nonce(&current, b"nonce-2".to_vec(), 1)
+        .unwrap();
+    let current_challenge = state.stale_nonce_challenge(&key, &stale_bytes, 1).unwrap();
+    let encoded_challenge = current_challenge
+        .encode_signed_438(Method::Refresh, [0x66; 12])
+        .unwrap();
+    let verified_challenge =
+        wire::verify_integrity(&encoded_challenge, integrity_key(b"alice").as_ref()).unwrap();
+    assert_eq!(
+        verified_challenge
+            .message()
+            .attributes
+            .iter()
+            .find_map(|attribute| match attribute {
+                Attribute::Realm(value) => Some(value.as_slice()),
+                _ => None,
+            }),
+        Some(b"turn.example".as_slice())
+    );
+    assert_eq!(
+        verified_challenge
+            .message()
+            .attributes
+            .iter()
+            .find_map(|attribute| match attribute {
+                Attribute::Nonce(value) => Some(value.as_slice()),
+                _ => None,
+            }),
+        Some(b"nonce-2".as_slice())
+    );
+    let replay = signed_request_with_id(
+        b"alice",
+        b"turn.example",
+        b"nonce-0",
+        Method::Refresh,
+        vec![Attribute::Lifetime(1)],
+        [0x77; 12],
+    );
+    let replay_challenge = state.stale_nonce_challenge(&key, &replay, 1).unwrap();
+    let replay_response = replay_challenge
+        .encode_signed_438(Method::Refresh, [0x77; 12])
+        .unwrap();
+    let replay_response =
+        wire::verify_integrity(&replay_response, integrity_key(b"alice").as_ref()).unwrap();
+    assert_eq!(
+        replay_response
+            .message()
+            .attributes
+            .iter()
+            .find_map(|attribute| match attribute {
+                Attribute::Nonce(value) => Some(value.as_slice()),
+                _ => None,
+            }),
+        Some(b"nonce-2".as_slice())
+    );
+    assert!(matches!(
+        state.authenticate_request(&key, &stale_bytes, 1),
+        Err(StateError::StaleNonce)
+    ));
+    let fresh = signed_request(
+        b"alice",
+        b"turn.example",
+        b"nonce-2",
+        Method::Refresh,
+        vec![Attribute::Lifetime(1)],
+    );
+    assert!(state.authenticate_request(&key, &fresh, 1).is_ok());
 }
 
 #[test]

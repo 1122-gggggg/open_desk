@@ -26,11 +26,16 @@ use tokio::{
     task::JoinHandle,
     time::{self, Instant},
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const ALLOCATION_LIFETIME: u64 = 600;
 const MAX_QUEUE: usize = 64;
+const MAX_QUEUE_BYTES: usize = MAX_QUEUE * MAX_PAYLOAD;
 const MAX_PAYLOAD: usize = wire::MAX_DATAGRAM_BYTES - 4;
+const MAX_PENDING_RESPONSES: usize = 4;
+const INITIAL_RTO: Duration = Duration::from_millis(500);
+const MAX_RTO: Duration = Duration::from_secs(4);
+const MAX_REQUEST_ATTEMPTS: usize = 7;
 const AUTHORITY_REFRESH_MARGIN: Duration = Duration::from_secs(60);
 
 /// Configuration for one authenticated TURN allocation.
@@ -42,6 +47,13 @@ pub struct TurnRouteConfig {
     pub peer: SocketAddr,
     pub channel: u16,
     pub timeout: Duration,
+}
+
+impl Drop for TurnRouteConfig {
+    fn drop(&mut self) {
+        self.username.zeroize();
+        self.password.zeroize();
+    }
 }
 
 impl fmt::Debug for TurnRouteConfig {
@@ -105,12 +117,21 @@ struct Inner {
     channel: u16,
     relayed: Mutex<SocketAddr>,
     state: Mutex<LiveState>,
-    responses: Mutex<HashMap<[u8; 12], oneshot::Sender<Vec<u8>>>>,
+    responses: Mutex<HashMap<[u8; 12], PendingResponse>>,
     queue: Mutex<VecDeque<Vec<u8>>>,
+    queue_bytes: Mutex<usize>,
     queue_waker: Mutex<Option<Waker>>,
     stop: watch::Sender<bool>,
     credentials: Mutex<Option<RefreshCredentials>>,
+    password: Zeroizing<Vec<u8>>,
+    auth_lock: tokio::sync::Mutex<()>,
     timeout: Duration,
+}
+
+struct PendingResponse {
+    sender: oneshot::Sender<Vec<u8>>,
+    require_integrity: bool,
+    integrity_key: Option<Zeroizing<[u8; 32]>>,
 }
 
 struct LiveState {
@@ -133,15 +154,39 @@ type ClonedCredentials = (
     Zeroizing<[u8; 32]>,
 );
 
+struct PendingResponseGuard {
+    inner: Arc<Inner>,
+    id: [u8; 12],
+    armed: bool,
+}
+
+impl PendingResponseGuard {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingResponseGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.inner
+                .responses
+                .lock()
+                .expect("response mutex poisoned")
+                .remove(&self.id);
+        }
+    }
+}
+
 impl AuthenticatedTurnRoute {
     /// Establish an authenticated allocation and bind exactly one peer and
     /// channel. This is the only public construction path.
-    pub async fn establish(config: TurnRouteConfig) -> io::Result<Self> {
+    pub async fn establish(mut config: TurnRouteConfig) -> io::Result<Self> {
         validate_config(&config)?;
         let socket = Arc::new(UdpSocket::bind(config.bind).await?);
         let (stop, _) = watch::channel(false);
-        let username = Zeroizing::new(config.username);
-        let password = Zeroizing::new(config.password);
+        let username = Zeroizing::new(std::mem::take(&mut config.username));
+        let password = Zeroizing::new(std::mem::take(&mut config.password));
         let server = config.server;
         let peer = config.peer;
         let channel = config.channel;
@@ -158,9 +203,12 @@ impl AuthenticatedTurnRoute {
             }),
             responses: Mutex::new(HashMap::new()),
             queue: Mutex::new(VecDeque::new()),
+            queue_bytes: Mutex::new(0),
             queue_waker: Mutex::new(None),
             stop,
             credentials: Mutex::new(None),
+            password: password.clone(),
+            auth_lock: tokio::sync::Mutex::new(()),
             timeout: config.timeout,
         });
         let reader_inner = inner.clone();
@@ -171,7 +219,7 @@ impl AuthenticatedTurnRoute {
             armed: true,
         };
 
-        let (realm, nonce, key, relayed, expiry) =
+        let (relayed, expiry) =
             establish_transcript(&inner, server, peer, channel, &username, &password).await?;
         {
             let mut state = inner.state.lock().expect("state mutex poisoned");
@@ -185,15 +233,6 @@ impl AuthenticatedTurnRoute {
             state.generation = 1;
         }
         *inner.relayed.lock().expect("relayed mutex poisoned") = relayed;
-        *inner
-            .credentials
-            .lock()
-            .expect("credentials mutex poisoned") = Some(RefreshCredentials {
-            username,
-            realm,
-            nonce,
-            key,
-        });
 
         let refresh_inner = inner.clone();
         let refresh = tokio::spawn(refresh_loop(refresh_inner));
@@ -300,6 +339,8 @@ impl Inner {
             .lock()
             .expect("response mutex poisoned")
             .clear();
+        self.queue.lock().expect("queue mutex poisoned").clear();
+        *self.queue_bytes.lock().expect("queue byte mutex poisoned") = 0;
     }
 }
 
@@ -374,12 +415,21 @@ impl AsyncUdpSocket for AuthenticatedTurnRoute {
             return Poll::Ready(Err(error));
         }
         let mut queue = self.inner.queue.lock().expect("queue mutex poisoned");
-        if let Some(payload) = queue.pop_front() {
+        // A datagram that fits the TURN wire limit can still exceed the
+        // buffer Quinn supplied.  Drop only that bounded queue entry and
+        // continue so one peer cannot turn a malformed/oversize frame into a
+        // fatal endpoint error or permanently stall the receive path.
+        while let Some(payload) = queue.pop_front() {
+            let payload_len = payload.len();
+            let mut queued_bytes = self
+                .inner
+                .queue_bytes
+                .lock()
+                .expect("queue byte mutex poisoned");
+            *queued_bytes = queued_bytes.saturating_sub(payload_len);
+            drop(queued_bytes);
             if payload.len() > bufs[0].len() {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "receive buffer too small",
-                )));
+                continue;
             }
             bufs[0][..payload.len()].copy_from_slice(&payload);
             meta[0] = RecvMeta {
@@ -460,17 +510,53 @@ async fn read_loop(inner: Arc<Inner>) {
                 let datagram = &buffer[..length];
                 if let Ok((channel, payload)) = wire::decode_channel_data(datagram) {
                     if channel != inner.channel || payload.len() > MAX_PAYLOAD { continue; }
-                    let mut queue = inner.queue.lock().expect("queue mutex poisoned");
-                    if queue.len() < MAX_QUEUE { queue.push_back(payload.to_vec()); }
-                    drop(queue);
+                    enqueue_payload(&inner, payload);
                     if let Some(waker) = inner.queue_waker.lock().expect("queue waker poisoned").take() { waker.wake(); }
                     continue;
                 }
                 let Ok(message) = wire::decode(datagram) else { continue; };
                 if !matches!(message.header.class, Class::Success | Class::Error) { continue; }
-                if let Some(sender) = inner.responses.lock().expect("response mutex poisoned").remove(&message.header.transaction_id) { let _ = sender.send(datagram.to_vec()); }
+                let mut responses = inner.responses.lock().expect("response mutex poisoned");
+                let Some(pending) = responses.get(&message.header.transaction_id) else {
+                    continue;
+                };
+                let has_integrity = message.attributes.iter().any(|attribute| {
+                    matches!(attribute, Attribute::MessageIntegritySha256(_))
+                });
+                // 9.2.5: responses without MESSAGE-INTEGRITY are discarded,
+                // except the deliberately unauthenticated Allocate/401
+                // bootstrap challenge.  Authenticated transactions remain
+                // pending so their bounded retransmission schedule can run.
+                let bootstrap_unauthenticated_challenge = !pending.require_integrity
+                    && message.header.method == Method::Allocate
+                    && message.header.class == Class::Error
+                    && error_code(&message) == Some(401)
+                    && !has_integrity;
+                if bootstrap_unauthenticated_challenge {
+                    // This is the only intentionally unsigned response: the
+                    // initial Allocate/401 challenge has no key yet.
+                } else {
+                    let Some(key) = pending.integrity_key.as_ref() else {
+                        continue;
+                    };
+                    if wire::verify_integrity(datagram, key.as_ref()).is_err() {
+                        continue;
+                    }
+                }
+                if let Some(pending) = responses.remove(&message.header.transaction_id) {
+                    let _ = pending.sender.send(datagram.to_vec());
+                }
             }
         }
+    }
+}
+
+fn enqueue_payload(inner: &Inner, payload: &[u8]) {
+    let mut queue = inner.queue.lock().expect("queue mutex poisoned");
+    let mut queue_bytes = inner.queue_bytes.lock().expect("queue byte mutex poisoned");
+    if queue.len() < MAX_QUEUE && queue_bytes.saturating_add(payload.len()) <= MAX_QUEUE_BYTES {
+        queue.push_back(payload.to_vec());
+        *queue_bytes += payload.len();
     }
 }
 
@@ -481,13 +567,7 @@ async fn establish_transcript(
     channel: u16,
     username: &[u8],
     password: &[u8],
-) -> io::Result<(
-    Zeroizing<Vec<u8>>,
-    Zeroizing<Vec<u8>>,
-    Zeroizing<[u8; 32]>,
-    SocketAddr,
-    Instant,
-)> {
+) -> io::Result<(SocketAddr, Instant)> {
     let challenge_id = transaction_id()?;
     let challenge = Message {
         header: Header {
@@ -507,6 +587,14 @@ async fn establish_transcript(
     )
     .await?;
     let challenge = wire::decode(&challenge).map_err(wire_error)?;
+    if challenge.header.method == Method::Allocate
+        && challenge.header.transaction_id == challenge_id
+        && error_code(&challenge) == Some(438)
+    {
+        return Err(protocol_error(
+            "TURN Allocate returned stale nonce before authentication",
+        ));
+    }
     if challenge.header.class != Class::Error
         || challenge.header.method != Method::Allocate
         || error_code(&challenge) != Some(401)
@@ -519,25 +607,27 @@ async fn establish_transcript(
         username, &realm, password,
     ));
 
-    let allocation_id = transaction_id()?;
-    let allocation = signed_request(
+    // Install the bootstrap credentials before the authenticated Allocate so
+    // every post-401 transaction uses the same typed 438 recovery path.
+    *inner
+        .credentials
+        .lock()
+        .expect("credentials mutex poisoned") = Some(RefreshCredentials {
+        username: Zeroizing::new(username.to_vec()),
+        realm,
+        nonce,
+        key,
+    });
+
+    let allocation = authenticated_request(
+        inner,
         Method::Allocate,
-        allocation_id,
-        username,
-        &realm,
-        &nonce,
         vec![
             Attribute::RequestedTransport(17),
             Attribute::Lifetime(ALLOCATION_LIFETIME as u32),
         ],
-        key.as_ref(),
-    )?;
-    let allocation = wire::verify_integrity(
-        &request(inner, allocation, allocation_id).await?,
-        key.as_ref(),
     )
-    .map_err(wire_error)?;
-    require_success(allocation.message(), Method::Allocate, allocation_id)?;
+    .await?;
     let relayed = allocation
         .message()
         .attributes
@@ -564,46 +654,22 @@ async fn establish_transcript(
         return Err(protocol_error("TURN Allocate returned zero lifetime"));
     }
 
-    let permission_id = transaction_id()?;
-    let permission = signed_request(
+    let _permission = authenticated_request(
+        inner,
         Method::CreatePermission,
-        permission_id,
-        username,
-        &realm,
-        &nonce,
         vec![Attribute::XorPeerAddress(peer)],
-        key.as_ref(),
-    )?;
-    let permission = wire::verify_integrity(
-        &request(inner, permission, permission_id).await?,
-        key.as_ref(),
     )
-    .map_err(wire_error)?;
-    require_success(
-        permission.message(),
-        Method::CreatePermission,
-        permission_id,
-    )?;
-    let binding_id = transaction_id()?;
-    let binding = signed_request(
+    .await?;
+    let _binding = authenticated_request(
+        inner,
         Method::ChannelBind,
-        binding_id,
-        username,
-        &realm,
-        &nonce,
         vec![
             Attribute::ChannelNumber(channel),
             Attribute::XorPeerAddress(peer),
         ],
-        key.as_ref(),
-    )?;
-    let binding = wire::verify_integrity(&request(inner, binding, binding_id).await?, key.as_ref())
-        .map_err(wire_error)?;
-    require_success(binding.message(), Method::ChannelBind, binding_id)?;
+    )
+    .await?;
     Ok((
-        realm,
-        nonce,
-        key,
         relayed,
         Instant::now() + Duration::from_secs(lifetime.max(1)),
     ))
@@ -646,7 +712,6 @@ async fn refresh_loop(inner: Arc<Inner>) {
 }
 
 async fn renew_peer_authority(inner: &Arc<Inner>) -> io::Result<()> {
-    let (username, realm, nonce, key) = cloned_credentials(inner)?;
     for (method, attributes) in [
         (
             Method::CreatePermission,
@@ -660,19 +725,7 @@ async fn renew_peer_authority(inner: &Arc<Inner>) -> io::Result<()> {
             ],
         ),
     ] {
-        let id = transaction_id()?;
-        let encoded = signed_request(
-            method,
-            id,
-            &username,
-            &realm,
-            &nonce,
-            attributes,
-            key.as_ref(),
-        )?;
-        let response = wire::verify_integrity(&request(inner, encoded, id).await?, key.as_ref())
-            .map_err(wire_error)?;
-        require_success(response.message(), method, id)?;
+        let _ = authenticated_request(inner, method, attributes).await?;
     }
     Ok(())
 }
@@ -694,20 +747,8 @@ fn cloned_credentials(inner: &Inner) -> io::Result<ClonedCredentials> {
 }
 
 async fn refresh_request(inner: &Arc<Inner>, lifetime: u32) -> io::Result<u64> {
-    let (username, realm, nonce, key) = cloned_credentials(inner)?;
-    let id = transaction_id()?;
-    let encoded = signed_request(
-        Method::Refresh,
-        id,
-        &username,
-        &realm,
-        &nonce,
-        vec![Attribute::Lifetime(lifetime)],
-        key.as_ref(),
-    )?;
-    let response = wire::verify_integrity(&request(inner, encoded, id).await?, key.as_ref())
-        .map_err(wire_error)?;
-    require_success(response.message(), Method::Refresh, id)?;
+    let response =
+        authenticated_request(inner, Method::Refresh, vec![Attribute::Lifetime(lifetime)]).await?;
     let returned = response
         .message()
         .attributes
@@ -730,41 +771,179 @@ async fn refresh_request(inner: &Arc<Inner>, lifetime: u32) -> io::Result<u64> {
     Ok(returned)
 }
 
+struct StaleChallenge {
+    realm: Zeroizing<Vec<u8>>,
+    nonce: Zeroizing<Vec<u8>>,
+}
+
+/// Send one authenticated request.  A 438 challenge is accepted only when
+/// the demultiplexer has already proven the datagram came from the configured
+/// TURN server and the response's method/transaction/error tuple is exact.
+/// The new credentials are installed as one mutex operation and are used for
+/// at most one re-signed retry; 401 and a second 438 are terminal failures.
+async fn authenticated_request(
+    inner: &Arc<Inner>,
+    method: Method,
+    attributes: Vec<Attribute>,
+) -> io::Result<wire::VerifiedMessage> {
+    let _auth_guard = inner.auth_lock.lock().await;
+    let mut retried = false;
+    loop {
+        let (username, realm, nonce, key) = cloned_credentials(inner)?;
+        let id = transaction_id()?;
+        let encoded = signed_request(
+            method,
+            id,
+            &username,
+            &realm,
+            &nonce,
+            attributes.clone(),
+            key.as_ref(),
+        )?;
+        let response = request_with_policy(inner, encoded, id, true, Some(key.clone())).await?;
+        match verify_authenticated_response(&response, method, id, key.as_ref())? {
+            Ok(response) => return Ok(response),
+            Err(challenge) if !retried => {
+                replace_credentials(inner, &realm, &nonce, challenge.realm, challenge.nonce)?;
+                retried = true;
+            }
+            Err(_) => {
+                return Err(protocol_error("TURN stale nonce retry exhausted"));
+            }
+        }
+    }
+}
+
+fn verify_authenticated_response(
+    encoded: &[u8],
+    method: Method,
+    id: [u8; 12],
+    key: &[u8],
+) -> io::Result<Result<wire::VerifiedMessage, StaleChallenge>> {
+    let message = wire::decode(encoded).map_err(wire_error)?;
+    if message.header.method != method || message.header.transaction_id != id {
+        return Err(protocol_error(
+            "TURN response method or transaction mismatch",
+        ));
+    }
+    if message.header.class == Class::Error && error_code(&message) == Some(438) {
+        let realm = Zeroizing::new(required_bytes(&message, true)?.to_vec());
+        let nonce = Zeroizing::new(required_bytes(&message, false)?.to_vec());
+        if realm.is_empty() || nonce.is_empty() {
+            return Err(protocol_error("TURN stale nonce challenge is incomplete"));
+        }
+        // RFC 8489 9.2.5: an authenticated UDP response, including a 438
+        // challenge, must carry integrity verified with the old credentials.
+        wire::verify_integrity(encoded, key).map_err(wire_error)?;
+        return Ok(Err(StaleChallenge { realm, nonce }));
+    }
+    let response = wire::verify_integrity(encoded, key).map_err(wire_error)?;
+    require_success(response.message(), method, id)?;
+    Ok(Ok(response))
+}
+
+fn replace_credentials(
+    inner: &Arc<Inner>,
+    old_realm: &[u8],
+    old_nonce: &[u8],
+    realm: Zeroizing<Vec<u8>>,
+    nonce: Zeroizing<Vec<u8>>,
+) -> io::Result<()> {
+    let mut credentials = inner
+        .credentials
+        .lock()
+        .expect("credentials mutex poisoned");
+    let current = credentials
+        .as_ref()
+        .ok_or_else(|| protocol_error("TURN credentials unavailable"))?;
+    // A concurrent refresh may already have advanced the nonce.  Preserve
+    // that newer generation rather than rolling credentials backwards.
+    if current.realm.as_slice() != old_realm || current.nonce.as_slice() != old_nonce {
+        return Ok(());
+    }
+    let key = wire::derive_long_term_key_sha256(
+        current.username.as_ref(),
+        realm.as_ref(),
+        inner.password.as_ref(),
+    );
+    *credentials = Some(RefreshCredentials {
+        username: current.username.clone(),
+        realm,
+        nonce,
+        key,
+    });
+    Ok(())
+}
+
 async fn request(inner: &Arc<Inner>, encoded: Vec<u8>, id: [u8; 12]) -> io::Result<Vec<u8>> {
+    request_with_policy(inner, encoded, id, false, None).await
+}
+
+async fn request_with_policy(
+    inner: &Arc<Inner>,
+    encoded: Vec<u8>,
+    id: [u8; 12],
+    require_integrity: bool,
+    integrity_key: Option<Zeroizing<[u8; 32]>>,
+) -> io::Result<Vec<u8>> {
     inner.ensure_live()?;
     let (sender, receiver) = oneshot::channel();
-    inner
-        .responses
-        .lock()
-        .expect("response mutex poisoned")
-        .insert(id, sender);
+    {
+        let mut responses = inner.responses.lock().expect("response mutex poisoned");
+        if responses.len() >= MAX_PENDING_RESPONSES {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "TURN transaction capacity exhausted",
+            ));
+        }
+        if responses
+            .insert(
+                id,
+                PendingResponse {
+                    sender,
+                    require_integrity,
+                    integrity_key,
+                },
+            )
+            .is_some()
+        {
+            responses.remove(&id);
+            return Err(protocol_error("duplicate TURN transaction"));
+        }
+    }
+    let guard = PendingResponseGuard {
+        inner: Arc::clone(inner),
+        id,
+        armed: true,
+    };
     let deadline = Instant::now() + inner.timeout;
     let mut receiver = receiver;
-    for _ in 0..4 {
-        if let Err(error) = inner.socket.send_to(&encoded, inner.server).await {
-            inner
-                .responses
-                .lock()
-                .expect("response mutex poisoned")
-                .remove(&id);
-            return Err(error);
+    let mut rto = INITIAL_RTO;
+    for attempt in 0..MAX_REQUEST_ATTEMPTS {
+        if Instant::now() >= deadline {
+            break;
         }
+        time::timeout_at(deadline, inner.socket.send_to(&encoded, inner.server))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TURN transaction timeout"))??;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
-        let attempt = remaining.min(Duration::from_millis(200));
-        match time::timeout(attempt, &mut receiver).await {
-            Ok(Ok(response)) => return Ok(response),
+        let wait = remaining.min(rto);
+        match time::timeout(wait, &mut receiver).await {
+            Ok(Ok(response)) => {
+                guard.disarm();
+                return Ok(response);
+            }
             Ok(Err(_)) => break,
-            Err(_) => {}
+            Err(_) => {
+                if attempt + 1 < MAX_REQUEST_ATTEMPTS {
+                    rto = rto.saturating_mul(2).min(MAX_RTO);
+                }
+            }
         }
     }
-    inner
-        .responses
-        .lock()
-        .expect("response mutex poisoned")
-        .remove(&id);
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
         "TURN transaction timeout",
@@ -832,7 +1011,11 @@ fn unusable(address: SocketAddr) -> bool {
 }
 
 fn validate_relayed(relayed: SocketAddr, server: SocketAddr) -> io::Result<()> {
-    if relayed.port() == 0 || unusable(relayed) || relayed.is_ipv4() != server.is_ipv4() {
+    if relayed.port() == 0
+        || unusable(relayed)
+        || relayed == server
+        || relayed.is_ipv4() != server.is_ipv4()
+    {
         return Err(protocol_error("TURN returned an invalid relay address"));
     }
     Ok(())
@@ -895,6 +1078,30 @@ mod tests {
     use std::io::IoSliceMut;
     use std::sync::Arc;
 
+    fn bare_inner(socket: Arc<UdpSocket>, server: SocketAddr, timeout: Duration) -> Arc<Inner> {
+        Arc::new(Inner {
+            socket,
+            server,
+            peer: "127.0.0.1:4000".parse().unwrap(),
+            channel: 0x4000,
+            relayed: Mutex::new("127.0.0.1:49000".parse().unwrap()),
+            state: Mutex::new(LiveState {
+                expiry: Instant::now() + Duration::from_secs(10),
+                generation: 1,
+                revoked: false,
+            }),
+            responses: Mutex::new(HashMap::new()),
+            queue: Mutex::new(VecDeque::new()),
+            queue_bytes: Mutex::new(0),
+            queue_waker: Mutex::new(None),
+            stop: watch::channel(false).0,
+            credentials: Mutex::new(None),
+            password: Zeroizing::new(Vec::new()),
+            auth_lock: tokio::sync::Mutex::new(()),
+            timeout,
+        })
+    }
+
     #[test]
     fn config_debug_redacts_secret_and_accepts_ephemeral_bind() {
         let config = TurnRouteConfig {
@@ -915,6 +1122,161 @@ mod tests {
         assert_eq!(MAX_PAYLOAD + 4, wire::MAX_DATAGRAM_BYTES);
     }
 
+    #[test]
+    fn retransmission_schedule_is_bounded_exponential() {
+        let mut delay = INITIAL_RTO;
+        let mut schedule = Vec::new();
+        for _ in 0..MAX_REQUEST_ATTEMPTS {
+            schedule.push(delay);
+            delay = delay.saturating_mul(2).min(MAX_RTO);
+        }
+        assert_eq!(
+            schedule,
+            vec![
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(4),
+                Duration::from_secs(4),
+                Duration::from_secs(4),
+            ]
+        );
+        assert!(schedule.windows(2).all(|window| window[1] >= window[0]));
+        assert!(schedule.iter().all(|value| *value <= MAX_RTO));
+    }
+
+    #[test]
+    fn relayed_address_cannot_be_the_control_server() {
+        let server = "127.0.0.1:3478".parse().unwrap();
+        assert!(validate_relayed(server, server).is_err());
+    }
+
+    #[test]
+    fn authenticated_438_requires_exact_response_tuple_and_challenge() {
+        let id = [7_u8; 12];
+        let response_message = Message {
+            header: Header {
+                class: Class::Error,
+                method: Method::Refresh,
+                transaction_id: id,
+            },
+            attributes: vec![
+                Attribute::ErrorCode {
+                    code: 438,
+                    reason: "Stale Nonce".into(),
+                },
+                Attribute::Realm(b"new.realm".to_vec()),
+                Attribute::Nonce(b"new-nonce".to_vec()),
+            ],
+        };
+        let key = [0_u8; 32];
+        let response = wire::encode_with_integrity(&response_message, &key).unwrap();
+        let challenge = verify_authenticated_response(&response, Method::Refresh, id, &key)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(challenge.realm.as_slice(), b"new.realm");
+        assert_eq!(challenge.nonce.as_slice(), b"new-nonce");
+
+        let unsigned = wire::encode(&response_message).unwrap();
+        assert!(verify_authenticated_response(&unsigned, Method::Refresh, id, &key).is_err());
+
+        let wrong_method = wire::encode(&Message {
+            header: Header {
+                class: Class::Error,
+                method: Method::Allocate,
+                transaction_id: id,
+            },
+            attributes: vec![Attribute::ErrorCode {
+                code: 438,
+                reason: "Stale Nonce".into(),
+            }],
+        })
+        .unwrap();
+        assert!(
+            verify_authenticated_response(&wrong_method, Method::Refresh, id, &[0_u8; 32]).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_recv_drops_oversize_then_delivers_valid_payload() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (stop, _) = watch::channel(false);
+        let server = "127.0.0.1:3478".parse().unwrap();
+        let peer = "127.0.0.1:4000".parse().unwrap();
+        let inner = Arc::new(Inner {
+            socket,
+            server,
+            peer,
+            channel: 0x4000,
+            relayed: Mutex::new("127.0.0.1:49000".parse().unwrap()),
+            state: Mutex::new(LiveState {
+                expiry: Instant::now() + Duration::from_secs(5),
+                generation: 1,
+                revoked: false,
+            }),
+            responses: Mutex::new(HashMap::new()),
+            queue: Mutex::new(VecDeque::from([vec![0_u8; 32], b"valid".to_vec()])),
+            queue_bytes: Mutex::new(37),
+            queue_waker: Mutex::new(None),
+            stop,
+            credentials: Mutex::new(None),
+            password: Zeroizing::new(Vec::new()),
+            auth_lock: tokio::sync::Mutex::new(()),
+            timeout: Duration::from_secs(1),
+        });
+        let route = AuthenticatedTurnRoute {
+            inner,
+            reader: None,
+            refresh: None,
+        };
+        let mut output = [0_u8; 8];
+        let mut metadata = [RecvMeta::default()];
+        let received = std::future::poll_fn(|cx| {
+            let mut slices = [IoSliceMut::new(&mut output)];
+            route.poll_recv(cx, &mut slices, &mut metadata)
+        })
+        .await
+        .unwrap();
+        assert_eq!(received, 1);
+        assert_eq!(&output[..metadata[0].len], b"valid");
+        assert_eq!(*route.inner.queue_bytes.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn queue_enforces_item_and_byte_caps_and_accounts_pops() {
+        let inner = bare_inner(
+            Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            "127.0.0.1:3478".parse().unwrap(),
+            Duration::from_secs(1),
+        );
+        let payload = vec![0_u8; MAX_PAYLOAD];
+        for _ in 0..MAX_QUEUE {
+            enqueue_payload(&inner, &payload);
+        }
+        enqueue_payload(&inner, &[1_u8]);
+        assert_eq!(inner.queue.lock().unwrap().len(), MAX_QUEUE);
+        assert_eq!(*inner.queue_bytes.lock().unwrap(), MAX_QUEUE_BYTES);
+        let route = AuthenticatedTurnRoute {
+            inner,
+            reader: None,
+            refresh: None,
+        };
+        let mut output = vec![0_u8; MAX_PAYLOAD];
+        let mut metadata = [RecvMeta::default()];
+        let received = std::future::poll_fn(|cx| {
+            let mut slices = [IoSliceMut::new(&mut output)];
+            route.poll_recv(cx, &mut slices, &mut metadata)
+        })
+        .await
+        .unwrap();
+        assert_eq!(received, 1);
+        assert_eq!(
+            *route.inner.queue_bytes.lock().unwrap(),
+            MAX_QUEUE_BYTES - MAX_PAYLOAD
+        );
+    }
+
     #[tokio::test]
     async fn authenticated_establish_uses_one_reader_and_shutdown_refresh_zero() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -927,6 +1289,9 @@ mod tests {
             let mut datagram = vec![0_u8; wire::MAX_DATAGRAM_BYTES];
             let realm = b"local.test".to_vec();
             let nonce = b"nonce-1".to_vec();
+            let mut active_realm = realm.clone();
+            let mut active_nonce = nonce.clone();
+            let mut stale_methods = Vec::new();
             let mut permission_count = 0;
             let mut channel_count = 0;
             let saw_refresh_zero = loop {
@@ -969,9 +1334,40 @@ mod tests {
                         .unwrap();
                     continue;
                 }
-                let key = wire::derive_long_term_key_sha256(b"alice", &realm, &server_password);
+                let key =
+                    wire::derive_long_term_key_sha256(b"alice", &active_realm, &server_password);
                 let verified = wire::verify_integrity(&datagram[..length], key.as_ref()).unwrap();
                 let method = verified.message().header.method;
+                if !stale_methods.contains(&method) {
+                    stale_methods.push(method);
+                    let next_realm = [active_realm.as_slice(), b"-rotated"].concat();
+                    let next_nonce = [active_nonce.as_slice(), b"-rotated"].concat();
+                    let stale = Message {
+                        header: Header {
+                            class: Class::Error,
+                            method,
+                            transaction_id: verified.message().header.transaction_id,
+                        },
+                        attributes: vec![
+                            Attribute::ErrorCode {
+                                code: 438,
+                                reason: "Stale Nonce".into(),
+                            },
+                            Attribute::Realm(next_realm.clone()),
+                            Attribute::Nonce(next_nonce.clone()),
+                        ],
+                    };
+                    server
+                        .send_to(
+                            &wire::encode_with_integrity(&stale, key.as_ref()).unwrap(),
+                            source,
+                        )
+                        .await
+                        .unwrap();
+                    active_realm = next_realm;
+                    active_nonce = next_nonce;
+                    continue;
+                }
                 if method == Method::CreatePermission {
                     permission_count += 1;
                 } else if method == Method::ChannelBind {
@@ -1024,7 +1420,12 @@ mod tests {
                     break true;
                 }
             };
-            (saw_refresh_zero, permission_count, channel_count)
+            (
+                saw_refresh_zero,
+                permission_count,
+                channel_count,
+                stale_methods.len(),
+            )
         });
         let route = Arc::new(
             AuthenticatedTurnRoute::establish(TurnRouteConfig {
@@ -1126,10 +1527,12 @@ mod tests {
         assert!(route.generation() >= 2);
         route.shutdown().await.unwrap();
         assert!(route.try_send(&transmit).is_err());
-        let (deallocated, permission_count, channel_count) = server_task.await.unwrap();
+        let (deallocated, permission_count, channel_count, stale_count) =
+            server_task.await.unwrap();
         assert!(deallocated);
         assert!(permission_count >= 2);
         assert!(channel_count >= 2);
+        assert_eq!(stale_count, 4);
     }
 
     #[tokio::test]
@@ -1158,5 +1561,205 @@ mod tests {
             .await
             .expect("cancelled establish detached its reader/socket");
         assert_eq!(rebound.local_addr().unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_removes_pending_response() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let inner = Arc::new(Inner {
+            socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            server: server_addr,
+            peer: "127.0.0.1:4000".parse().unwrap(),
+            channel: 0x4000,
+            relayed: Mutex::new("127.0.0.1:49000".parse().unwrap()),
+            state: Mutex::new(LiveState {
+                expiry: Instant::now() + Duration::from_secs(10),
+                generation: 1,
+                revoked: false,
+            }),
+            responses: Mutex::new(HashMap::new()),
+            queue: Mutex::new(VecDeque::new()),
+            queue_bytes: Mutex::new(0),
+            queue_waker: Mutex::new(None),
+            stop: watch::channel(false).0,
+            credentials: Mutex::new(None),
+            password: Zeroizing::new(Vec::new()),
+            auth_lock: tokio::sync::Mutex::new(()),
+            timeout: Duration::from_secs(10),
+        });
+        let request_id = [9_u8; 12];
+        let request_inner = Arc::clone(&inner);
+        let task = tokio::spawn(async move {
+            request(
+                &request_inner,
+                wire::encode(&Message {
+                    header: Header {
+                        class: Class::Request,
+                        method: Method::Allocate,
+                        transaction_id: request_id,
+                    },
+                    attributes: vec![],
+                })
+                .unwrap(),
+                request_id,
+            )
+            .await
+        });
+        let mut datagram = [0_u8; wire::MAX_DATAGRAM_BYTES];
+        let _ = time::timeout(Duration::from_secs(1), server.recv_from(&mut datagram))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inner.responses.lock().unwrap().len(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(inner.responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_honors_total_deadline_without_post_deadline_retransmit() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let inner = bare_inner(
+            Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            server.local_addr().unwrap(),
+            Duration::from_millis(40),
+        );
+        let id = [8_u8; 12];
+        let request_inner = Arc::clone(&inner);
+        let started = Instant::now();
+        let task = tokio::spawn(async move {
+            request(
+                &request_inner,
+                wire::encode(&Message {
+                    header: Header {
+                        class: Class::Request,
+                        method: Method::Allocate,
+                        transaction_id: id,
+                    },
+                    attributes: vec![],
+                })
+                .unwrap(),
+                id,
+            )
+            .await
+        });
+        let mut datagram = [0_u8; wire::MAX_DATAGRAM_BYTES];
+        let mut received = 0;
+        while time::timeout(Duration::from_millis(80), server.recv_from(&mut datagram))
+            .await
+            .is_ok()
+        {
+            received += 1;
+        }
+        let result = task.await.unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(received, 1);
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[tokio::test]
+    async fn authenticated_request_retries_one_signed_438_then_fails_closed() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let mut inner = bare_inner(Arc::clone(&client), server_addr, Duration::from_secs(2));
+        let username = b"alice".to_vec();
+        let old_realm = b"old.realm".to_vec();
+        let old_nonce = b"old-nonce".to_vec();
+        let password = b"0123456789abcdef-password".to_vec();
+        Arc::get_mut(&mut inner).unwrap().password = Zeroizing::new(password.clone());
+        *inner.credentials.lock().unwrap() = Some(RefreshCredentials {
+            username: Zeroizing::new(username.clone()),
+            realm: Zeroizing::new(old_realm.clone()),
+            nonce: Zeroizing::new(old_nonce.clone()),
+            key: wire::derive_long_term_key_sha256(&username, &old_realm, &password),
+        });
+        let reader = tokio::spawn(read_loop(Arc::clone(&inner)));
+        let request_inner = Arc::clone(&inner);
+        let request_task = tokio::spawn(async move {
+            authenticated_request(
+                &request_inner,
+                Method::Refresh,
+                vec![Attribute::Lifetime(1)],
+            )
+            .await
+        });
+        let mut datagram = [0_u8; wire::MAX_DATAGRAM_BYTES];
+        let (length, source) = server.recv_from(&mut datagram).await.unwrap();
+        let old_key = wire::derive_long_term_key_sha256(&username, &old_realm, &password);
+        let first = wire::verify_integrity(&datagram[..length], old_key.as_ref()).unwrap();
+        let new_realm = b"new.realm".to_vec();
+        let new_nonce = b"new-nonce".to_vec();
+        let stale = Message {
+            header: Header {
+                class: Class::Error,
+                method: first.message().header.method,
+                transaction_id: first.message().header.transaction_id,
+            },
+            attributes: vec![
+                Attribute::ErrorCode {
+                    code: 438,
+                    reason: "Stale Nonce".into(),
+                },
+                Attribute::Realm(new_realm.clone()),
+                Attribute::Nonce(new_nonce.clone()),
+            ],
+        };
+        // Neither a forged MESSAGE-INTEGRITY nor an unsigned response may
+        // consume the pending transaction.  The valid old-key response below
+        // must still complete the same request.
+        let forged = [0xa5_u8; 32];
+        server
+            .send_to(
+                &wire::encode_with_integrity(&stale, &forged).unwrap(),
+                source,
+            )
+            .await
+            .unwrap();
+        server
+            .send_to(&wire::encode(&stale).unwrap(), source)
+            .await
+            .unwrap();
+        server
+            .send_to(
+                &wire::encode_with_integrity(&stale, old_key.as_ref()).unwrap(),
+                source,
+            )
+            .await
+            .unwrap();
+        let (length, source) = server.recv_from(&mut datagram).await.unwrap();
+        let new_key = wire::derive_long_term_key_sha256(&username, &new_realm, &password);
+        let retry = wire::verify_integrity(&datagram[..length], new_key.as_ref()).unwrap();
+        assert_eq!(retry.message().header.method, Method::Refresh);
+        assert_ne!(
+            retry.message().header.transaction_id,
+            first.message().header.transaction_id
+        );
+        let stale_again = Message {
+            header: Header {
+                class: Class::Error,
+                method: retry.message().header.method,
+                transaction_id: retry.message().header.transaction_id,
+            },
+            attributes: vec![
+                Attribute::ErrorCode {
+                    code: 438,
+                    reason: "Stale Nonce".into(),
+                },
+                Attribute::Realm(new_realm),
+                Attribute::Nonce(new_nonce),
+            ],
+        };
+        server
+            .send_to(
+                &wire::encode_with_integrity(&stale_again, new_key.as_ref()).unwrap(),
+                source,
+            )
+            .await
+            .unwrap();
+        assert!(request_task.await.unwrap().is_err());
+        inner.stop_tasks();
+        reader.abort();
     }
 }

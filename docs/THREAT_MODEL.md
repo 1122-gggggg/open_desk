@@ -139,11 +139,19 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
   product route authority. The product-side TURN module has no raw constructor:
   it verifies Allocate/permission/channel transcripts before Quinn receives the
   relayed socket, uses one bounded reader to demultiplex STUN and ChannelData,
-  refreshes allocation plus permission/channel before their independent
-  lifetimes, and locally revokes on cancellation, expiry, reader failure, or
-  failed renewal. Product traffic remains exact-mTLS QUIC ciphertext; current
-  evidence is loopback-only and does not prove public abuse resistance or
-  Internet availability;
+  and verifies authenticated response integrity before removing a pending
+  transaction. Only the initial Allocate/401 bootstrap may be unsigned. A
+  signed stale-nonce response must authenticate with the old key and can rotate
+  client realm, nonce, and key only once per control operation. The server
+  answers stale-request replay with the same current valid nonce without
+  mutating allocation state. Its sealed challenge object encodes the signed
+  response internally and exposes no integrity-key accessor. Request attempts,
+  deadlines, pending transactions, queued items, and queued bytes are bounded.
+  The route refreshes allocation plus permission/channel before their
+  independent lifetimes and locally revokes on cancellation, expiry, reader
+  failure, or failed renewal. Product traffic remains exact-mTLS QUIC
+  ciphertext; current evidence is loopback-only and does not prove public abuse
+  resistance or Internet availability;
 - the NAT matrix never invokes network mutation tools in the caller namespace.
   Its internal executor requires mapped root and PID 1, then calls
   `unshare(CLONE_NEWNET)` itself before any mutation and verifies the inode

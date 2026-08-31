@@ -113,7 +113,7 @@ fn bytes(message: &Message, realm: bool) -> Option<&[u8]> {
 async fn authenticated_tcp_request_is_442_and_stale_nonce_is_438() {
     let control = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let server = control.local_addr().unwrap();
-    let server_task = tokio::spawn(serve(control, server_config(Duration::from_millis(500), 0)));
+    let server_task = tokio::spawn(serve(control, server_config(Duration::from_secs(3), 1)));
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let (realm, first_nonce) = challenge(&client, server, 1).await;
     let tcp = signed(
@@ -146,24 +146,185 @@ async fn authenticated_tcp_request_is_442_and_stale_nonce_is_438() {
         Method::Allocate,
         4,
         &realm,
-        &first_nonce,
+        b"old-stale-nonce",
         vec![Attribute::RequestedTransport(17)],
     );
-    let stale_response = wire::decode(&transact(&client, server, &stale).await).unwrap();
-    assert_eq!(error_code(&stale_response), Some(438));
-    let current_nonce = bytes(&stale_response, false).unwrap().to_vec();
-    let wrong_password = signed_with_password(
+    let stale_response = transact(&client, server, &stale).await;
+    let stale_response = wire::verify_integrity(&stale_response, key.as_ref()).unwrap();
+    assert_eq!(error_code(stale_response.message()), Some(438));
+    let current_nonce = bytes(stale_response.message(), false).unwrap().to_vec();
+    let replay = signed(
         Method::Allocate,
-        6,
+        7,
+        &realm,
+        b"old-stale-nonce",
+        vec![Attribute::RequestedTransport(17)],
+    );
+    let replay = transact(&client, server, &replay).await;
+    let replay = wire::verify_integrity(&replay, key.as_ref()).unwrap();
+    assert_eq!(error_code(replay.message()), Some(438));
+    assert_eq!(bytes(replay.message(), false).unwrap(), current_nonce);
+    let allocate = signed(
+        Method::Allocate,
+        8,
         &realm,
         &current_nonce,
         vec![Attribute::RequestedTransport(17)],
-        b"definitely-the-wrong-password",
     );
-    let wrong_response = wire::decode(&transact(&client, server, &wrong_password).await).unwrap();
-    assert_eq!(error_code(&wrong_response), Some(401));
+    let allocate =
+        wire::verify_integrity(&transact(&client, server, &allocate).await, key.as_ref()).unwrap();
+    assert_eq!(allocate.message().header.class, Class::Success);
+    let delete = signed(
+        Method::Refresh,
+        9,
+        &realm,
+        &current_nonce,
+        vec![Attribute::Lifetime(0)],
+    );
+    let delete =
+        wire::verify_integrity(&transact(&client, server, &delete).await, key.as_ref()).unwrap();
+    assert!(delete
+        .message()
+        .attributes
+        .iter()
+        .any(|attribute| matches!(attribute, Attribute::Lifetime(0))));
     let report = server_task.await.unwrap().unwrap();
-    assert_eq!(report.allocations_created, 0);
+    assert_eq!(report.allocations_created, 1);
+    assert_eq!(report.deallocations, 1);
+}
+
+fn stale_nonce_from_response(
+    encoded: &[u8],
+    key: &[u8],
+    method: Method,
+    transaction_id: [u8; 12],
+) -> Vec<u8> {
+    let verified = wire::verify_integrity(encoded, key).unwrap();
+    assert_eq!(verified.message().header.class, Class::Error);
+    assert_eq!(verified.message().header.method, method);
+    assert_eq!(verified.message().header.transaction_id, transaction_id);
+    assert_eq!(error_code(verified.message()), Some(438));
+    bytes(verified.message(), false).unwrap().to_vec()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn active_allocation_replies_idempotent_signed_438_for_every_authenticated_method() {
+    let control = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server = control.local_addr().unwrap();
+    let server_task = tokio::spawn(serve(control, server_config(Duration::from_secs(5), 1)));
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_address = peer.local_addr().unwrap();
+    let (realm, mut nonce) = challenge(&client, server, 21).await;
+    let key = wire::derive_long_term_key_sha256(USER, &realm, PASSWORD);
+
+    let allocate = signed(
+        Method::Allocate,
+        22,
+        &realm,
+        &nonce,
+        vec![Attribute::RequestedTransport(17)],
+    );
+    let allocation =
+        wire::verify_integrity(&transact(&client, server, &allocate).await, key.as_ref()).unwrap();
+    assert_eq!(allocation.message().header.class, Class::Success);
+
+    let permission_attributes = vec![Attribute::XorPeerAddress(peer_address)];
+    let stale_permission = signed(
+        Method::CreatePermission,
+        23,
+        &realm,
+        b"stale-permission",
+        permission_attributes.clone(),
+    );
+    let rotated = transact(&client, server, &stale_permission).await;
+    nonce = stale_nonce_from_response(&rotated, key.as_ref(), Method::CreatePermission, [23; 12]);
+    let replay = signed(
+        Method::CreatePermission,
+        30,
+        &realm,
+        b"stale-permission",
+        vec![Attribute::XorPeerAddress(peer_address)],
+    );
+    let replay = transact(&client, server, &replay).await;
+    let replay_nonce =
+        stale_nonce_from_response(&replay, key.as_ref(), Method::CreatePermission, [30; 12]);
+    assert_eq!(replay_nonce, nonce);
+    let permission = signed(
+        Method::CreatePermission,
+        24,
+        &realm,
+        &nonce,
+        permission_attributes,
+    );
+    let permission =
+        wire::verify_integrity(&transact(&client, server, &permission).await, key.as_ref())
+            .unwrap();
+    assert_eq!(permission.message().header.class, Class::Success);
+
+    let stale_channel = signed(
+        Method::ChannelBind,
+        25,
+        &realm,
+        b"stale-channel",
+        vec![
+            Attribute::ChannelNumber(0x4000),
+            Attribute::XorPeerAddress(peer_address),
+        ],
+    );
+    let rotated = transact(&client, server, &stale_channel).await;
+    nonce = stale_nonce_from_response(&rotated, key.as_ref(), Method::ChannelBind, [25; 12]);
+    let channel = signed(
+        Method::ChannelBind,
+        26,
+        &realm,
+        &nonce,
+        vec![
+            Attribute::ChannelNumber(0x4000),
+            Attribute::XorPeerAddress(peer_address),
+        ],
+    );
+    let channel =
+        wire::verify_integrity(&transact(&client, server, &channel).await, key.as_ref()).unwrap();
+    assert_eq!(channel.message().header.class, Class::Success);
+
+    let stale_refresh = signed(
+        Method::Refresh,
+        27,
+        &realm,
+        b"stale-refresh",
+        vec![Attribute::Lifetime(1)],
+    );
+    let rotated = transact(&client, server, &stale_refresh).await;
+    nonce = stale_nonce_from_response(&rotated, key.as_ref(), Method::Refresh, [27; 12]);
+    let refresh = signed(
+        Method::Refresh,
+        28,
+        &realm,
+        &nonce,
+        vec![Attribute::Lifetime(1)],
+    );
+    let refresh =
+        wire::verify_integrity(&transact(&client, server, &refresh).await, key.as_ref()).unwrap();
+    assert_eq!(refresh.message().header.class, Class::Success);
+
+    let delete = signed(
+        Method::Refresh,
+        29,
+        &realm,
+        &nonce,
+        vec![Attribute::Lifetime(0)],
+    );
+    let deleted =
+        wire::verify_integrity(&transact(&client, server, &delete).await, key.as_ref()).unwrap();
+    assert!(deleted
+        .message()
+        .attributes
+        .iter()
+        .any(|attribute| matches!(attribute, Attribute::Lifetime(0))));
+    let report = server_task.await.unwrap().unwrap();
+    assert_eq!(report.allocations_created, 1);
+    assert_eq!(report.deallocations, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
