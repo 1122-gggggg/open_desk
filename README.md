@@ -308,6 +308,23 @@ reachability, latency superiority, and AnyDesk superiority remain unproven.
 Borrowed buffers and upstream ICE internal credential copies are not guaranteed
 zeroized.
 
+### 3.6 Authenticated rendezvous state boundary
+
+The `latencydesk-rendezvous` crate now provides a bounded in-memory matching
+boundary for a future mTLS rendezvous service. The caller supplies the device
+identity obtained from the authenticated client certificate; registration
+payloads cannot claim or replace that identity. A match succeeds only when two
+different devices name each other's exact certificate fingerprint, use
+complementary roles, and agree on the match ID, generation, ICE exchange ID,
+TTL, credentials, and candidates. Registration bytes are capped at 4 KiB,
+pending matches at 1,024, and each device at four pending matches; delivery is
+one-shot and expired/replayed match IDs are tombstoned.
+
+This is a tested state/wire boundary, not a listening rendezvous service. It has
+no DNS/discovery, public endpoint, NAT matrix, relay, abuse operation, route
+selection, desktop payload access, Internet reachability, or AnyDesk parity
+claim.
+
 ### 4. Open several exact-pinned Hosts concurrently
 
 Use one repeatable `--target` entry per Host. Each Host must trust the same

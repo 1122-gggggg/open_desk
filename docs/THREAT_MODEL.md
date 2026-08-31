@@ -96,6 +96,13 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
   TURN/relay, Internet reachability, and latency/AnyDesk claims remain outside
   this control. Borrowed buffers and upstream ICE internal credential copies are
   not guaranteed zeroized;
+- the rendezvous state boundary never trusts a payload to name its sender. A
+  future mTLS transport must derive `DeviceId` from the authenticated client
+  certificate; a match requires reciprocal exact expected-peer fingerprints,
+  complementary roles, matching generation/exchange IDs, bounded TTL and
+  one-shot delivery. Pending, per-device, delivery, expiry, and replay state is
+  capped, and mismatch attempts do not consume a valid waiter. The broker sees
+  short-term ICE metadata but never desktop content and has no route authority;
 - rate limits before expensive parsing/decompression;
 - connection and incomplete-frame quotas.
 

@@ -127,6 +127,22 @@ rendezvous, NAT/CGNAT/IPv6, TURN/relay, Internet reachability, latency, or
 AnyDesk superiority. Borrowed buffers and upstream ICE internal credential
 copies are not guaranteed zeroized.
 
+An authenticated rendezvous registration is a maximum 4 KiB exact-length
+record: version, initiator/responder role, reserved bytes, generation, 5–120
+second TTL, 128-bit match ID, expected peer certificate fingerprint, bounded
+credential/candidate lengths, then one `IceCredentialExchange` and one
+`CandidateExchange`. Credential and candidate exchange IDs/generations must
+agree, and the role fixes controlling/controlled ICE semantics. The rendezvous
+transport must supply the actual `DeviceId` from its mTLS client certificate;
+there is deliberately no self-identity claim in the payload.
+
+The bounded broker matches only reciprocal exact fingerprints and complementary
+roles. Registrations are one-shot, replay/generation/role drift does not consume
+the valid waiter, expired entries are tombstoned, and pending/delivery state is
+bounded. The broker returns connectivity metadata only and never selects a
+route or handles desktop content. No network rendezvous service, NAT traversal,
+relay, or Internet-connectivity claim exists yet.
+
 ## 3. Capability negotiation
 
 Each peer advertises:
