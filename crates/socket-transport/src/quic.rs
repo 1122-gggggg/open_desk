@@ -50,7 +50,7 @@ pub(crate) struct QuicPathStats {
 }
 
 /// One complete validated record read from a reliable application lane.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ReceivedStreamRecord {
     /// The lane that carried the record.
     pub kind: StreamKind,
@@ -58,6 +58,17 @@ pub struct ReceivedStreamRecord {
     pub stamp: SessionStamp,
     /// The exact bounded application payload.
     pub payload: Bytes,
+}
+
+impl fmt::Debug for ReceivedStreamRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReceivedStreamRecord")
+            .field("kind", &self.kind)
+            .field("stamp", &self.stamp)
+            .field("payload", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Failures surfaced by the QUIC lane adapter.
@@ -712,6 +723,18 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn received_stream_record_debug_redacts_payload_bytes() {
+        let record = ReceivedStreamRecord {
+            kind: StreamKind::Control,
+            stamp: active_stamp(),
+            payload: Bytes::from_static(b"ice-password-must-not-render"),
+        };
+        let rendered = format!("{record:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("ice-password-must-not-render"));
+    }
 
     struct TestIdentity {
         certificate: CertificateDer<'static>,
