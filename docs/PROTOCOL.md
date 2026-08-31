@@ -140,8 +140,8 @@ The bounded broker matches only reciprocal exact fingerprints and complementary
 roles. Registrations are one-shot, replay/generation/role drift does not consume
 the valid waiter, expired entries are tombstoned, and pending/delivery state is
 bounded. The broker returns connectivity metadata only and never selects a
-route or handles desktop content. No network rendezvous service, NAT traversal,
-relay, or Internet-connectivity claim exists yet.
+route or handles desktop content. No public rendezvous deployment, NAT matrix,
+public relay operation, or Internet-connectivity claim exists yet.
 
 The local evidence daemon transports a registration inside one canonical
 session-stamped control stream after TLS 1.3 client-certificate authentication.
@@ -155,6 +155,21 @@ Quinn `Bytes` and decoder copies are only debug-redacted and are not guaranteed
 to be zeroized.
 
 ## 3. Capability negotiation
+
+### Local UDP TURN evidence profile
+
+The local TURN process uses RFC 8489 STUN framing for RFC 8656 Allocate,
+Refresh, CreatePermission, ChannelBind, Send/Data, and ChannelData. It uses an
+out-of-band agreed SHA-256 long-term password algorithm and a full 32-byte
+`MESSAGE-INTEGRITY-SHA256`. Allocation state is bound to the UDP 5-tuple and
+stored integrity key; mutation APIs accept only a sealed request produced by
+state-owned verification. Permissions match peer IP only. Channel bindings
+match exact peer transport addresses and use `0x4000..=0x4fff`.
+
+This profile does not implement password-algorithm negotiation, FINGERPRINT,
+legacy SHA-1/MD5, TCP/TLS/DTLS client transports, RFC 6062 TCP allocations, or
+IPv4/IPv6 translation. TURN success allocates a candidate; it does not itself
+authorize route promotion, desktop, media, or input.
 
 Each peer advertises:
 

@@ -24,7 +24,7 @@ Windows client on a trusted, low-latency LAN.
 | Other clients | Portable software viewer with OpenH264/raw-NV12 presentation and input forwarding; headless receive and input probe remain available | Alpha implementation; cross-machine and native-UX evidence pending |
 | Windows host | Secure hosting is rejected before opening a socket because real capture/input providers are not connected | Unsupported |
 | Media | Raw NV12 fragmented across QUIC DATAGRAMs; no production H.264/AV1 encode/decode path | Low-resolution LAN preview only |
-| WAN connectivity | Direct IP plus a bounded race across four known exact-pinned addresses; opt-in RFC 8489 Binding and authenticated candidate advertisement; an explicit IPv4 loopback probe signals bounded ICE credentials/candidates, nominates a fresh path, and hands the unchanged socket to isolated Quinn exact-mTLS | Application signaling and same-socket ICE→Quinn are verified only as a non-promoting single-machine probe. No rendezvous, real NAT matrix, TURN/relay, automatic Internet traversal, interactive recovery, or QUIC path migration |
+| WAN connectivity | Direct IP plus a bounded race across four known exact-pinned addresses; opt-in RFC 8489 Binding and authenticated candidate advertisement; an explicit IPv4 loopback probe hands a nominated socket to exact-mTLS; separate local exact-mTLS rendezvous and bounded RFC 8656 UDP TURN processes | Each component is verified only in isolated/local evidence. No real NAT matrix, public rendezvous/TURN operation, automatic product route integration, Internet traversal, interactive recovery, or QUIC path migration |
 | Distribution | No supported signed installer, updater, or production service | Not implemented |
 | Legacy transport | Plaintext custom UDP, available only with explicit `--unsafe-udp-lab` | Local compatibility test only |
 
@@ -118,8 +118,8 @@ Wrong credentials, fingerprint mutation, oversized/mixed candidates, role
 conflict, and dropped liveness checks have negative tests. This proves a safe
 sequential ICE→QUIC seam on one machine. The isolated probe below now wires
 authenticated credential/candidate signaling to that seam without promoting
-the result; rendezvous, real NATs, TURN, route promotion, and cross-machine
-success remain unimplemented.
+the result; public rendezvous/TURN integration, real NATs, product route
+promotion, and cross-machine success remain unimplemented.
 
 The multi-target process gate starts two distinct-certificate Hosts, proves
 both are authenticated and streaming at the same time, then runs a second
@@ -344,6 +344,25 @@ Packets from the pre-promotion route remain stale even after returning to the
 same network path. The full `SessionStamp` and authorization/input epochs are
 never rewritten. This is a tested state machine, not yet wired into product
 media or input dispatch.
+
+### 3.8 Bounded UDP TURN relay process
+
+`latencydesk-turn-relayd` now exercises a real RFC 8656 UDP allocation and
+relay path. A client completes a 401 realm/nonce challenge and SHA-256
+long-term message-integrity check, then creates an allocation, IP-only
+permission, and channel binding. Send indications and ChannelData traverse the
+allocation's real UDP relay socket in both directions; Refresh(0) removes the
+allocation and joins its task. Allocation, per-user, permission, channel,
+packet, byte, and absolute-deadline bounds fail closed. The relay handles
+opaque bytes only and owns no desktop or end-to-end encryption key.
+
+`scripts/turn_relay_process_test.py` proves two exact-byte round trips with
+separate daemon/client processes and a UDP echo peer. This is a local,
+SHA-256-preconfigured UDP subset—not a public or fully interoperable TURN
+service; the evidence daemon rejects non-loopback binds. Password-algorithm
+negotiation, FINGERPRINT, public abuse/capacity,
+TURN over TLS/DTLS, RFC 6062 TCP allocations, cross-family translation, NAT
+matrix, Internet reachability, and latency/AnyDesk claims remain unproven.
 
 ### 4. Open several exact-pinned Hosts concurrently
 

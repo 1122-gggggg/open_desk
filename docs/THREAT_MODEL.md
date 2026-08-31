@@ -122,6 +122,15 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
   one-shot delivery. Pending, per-device, delivery, expiry, and replay state is
   capped, and mismatch attempts do not consume a valid waiter. The broker sees
   short-term ICE metadata but never desktop content and has no route authority;
+- the local UDP TURN daemon challenges allocation attempts, verifies full
+  SHA-256 message integrity, keys allocations by UDP 5-tuple, and requires
+  sealed verified-request tokens for Refresh, permission, and channel mutation.
+  Permissions are IP-only; channel bindings are exact-address and epoch-like
+  state/shard/incarnation fences reject delayed authority. The relay forwards
+  opaque bounded bytes only. Passwords come from owner-only files and Debug
+  output redacts credentials/payloads. This is not yet a public abuse-resistant
+  or fully interoperable TURN deployment, and relay allocation alone grants no
+  product route authority;
 - rate limits before expensive parsing/decompression;
 - connection and incomplete-frame quotas.
 
