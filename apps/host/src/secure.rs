@@ -1352,6 +1352,7 @@ mod linux {
                 | QuicTransportError::Write(_)
                 | QuicTransportError::ExpiryMismatch { .. }
                 | QuicTransportError::Protocol(_)
+                | QuicTransportError::ExportKeyingMaterial
                 | QuicTransportError::DuplicateInboundLane(_)
                 | QuicTransportError::StreamKindChanged { .. },
             )
@@ -1464,6 +1465,12 @@ mod linux {
             let closed = IdentityError::QuicTransport(QuicTransportError::EndpointClosed);
             assert_eq!(
                 classify_accept_failure(&closed),
+                AcceptFailureDisposition::Fatal
+            );
+            assert_eq!(
+                classify_accept_failure(&IdentityError::QuicTransport(
+                    QuicTransportError::ExportKeyingMaterial
+                )),
                 AcceptFailureDisposition::Fatal
             );
             assert_eq!(
@@ -2502,6 +2509,7 @@ mod windows {
                 | QuicTransportError::Write(_)
                 | QuicTransportError::ExpiryMismatch { .. }
                 | QuicTransportError::Protocol(_)
+                | QuicTransportError::ExportKeyingMaterial
                 | QuicTransportError::DuplicateInboundLane(_)
                 | QuicTransportError::StreamKindChanged { .. },
             )
@@ -2628,6 +2636,12 @@ mod windows {
             let closed = IdentityError::QuicTransport(QuicTransportError::EndpointClosed);
             assert_eq!(
                 classify_accept_failure(&closed),
+                AcceptFailureDisposition::Fatal
+            );
+            assert_eq!(
+                classify_accept_failure(&IdentityError::QuicTransport(
+                    QuicTransportError::ExportKeyingMaterial
+                )),
                 AcceptFailureDisposition::Fatal
             );
             assert_eq!(

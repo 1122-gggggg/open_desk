@@ -363,7 +363,13 @@ control/input record, media datagram, input-applied ACK, and ICE probe. A
 the candidate is unable to send application data before admission. Typed
 Prepare/Prepared/Commit runs on the current route, then `Activated`/`Confirmed`
 must cross the candidate route before the initiator switches authority. A
-cancelled or expired transition deauthorizes and closes both connections.
+cancelled or expired transition deauthorizes and closes both connections. Each
+immutable transcript digest is now derived internally from Quinn's TLS exporter
+using a fixed label and a canonical binary context containing the full
+`SessionStamp` plus route digest. Callers cannot inject a transcript digest;
+the 32-byte exporter secret is zeroized and never exposed. The route-probe's
+route digest is still harness-generated rather than a typed committed
+rendezvous/ICE nomination proof, so automatic route admission remains pending.
 
 The process gate below starts separate server/client processes on two distinct
 loopback UDP ports, promotes epoch 1→2, transfers exact control/input/media

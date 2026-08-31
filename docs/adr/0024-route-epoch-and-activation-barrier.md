@@ -22,6 +22,16 @@ route harness. Both must:
 - have immutable route/transcript bindings attached to those exact
   connections.
 
+The transcript half of each binding is not caller input. `ProductSession`
+constructs a 68-byte canonical big-endian context from the full `SessionStamp`
+and route digest, invokes Quinn's TLS exporter with a fixed LatencyDesk label,
+then hashes the zeroizing 32-byte exporter output and context into the public
+transition digest. Both exact-mTLS peers therefore derive the same digest for
+one connection/context, while a different connection, route digest, or stamp
+derives a different value. The exporter secret never leaves the transport
+module. The route digest itself remains supplied by the bounded route harness;
+a typed committed-rendezvous/ICE evidence constructor is still pending.
+
 Only one connection has application authority. The second is returned by an
 unauthorized candidate constructor and exposes no application send path before
 the route set consumes it.
@@ -48,7 +58,9 @@ again; it never reuses the old route number.
 two real OS processes, two distinct loopback UDP paths, TLS 1.3 exact-leaf
 mTLS, epoch 1→2 promotion, control/input/media transfer, injected active-path
 failure, retained-path rollback control, and epoch 2→3 recovery. CI retains the
-JSON artifact.
+JSON artifact. Unit tests additionally require matching exporter-derived
+bindings on both ends of one connection and separation across connections and
+contexts.
 
 This does not prove that the desktop apps automatically build the pair, that a
 TURN allocation survives path loss, that route evidence came from a physical

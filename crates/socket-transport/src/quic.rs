@@ -17,6 +17,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
 const PROTOCOL_VIOLATION_CODE: quinn::VarInt = quinn::VarInt::from_u32(0x100);
 const PROTOCOL_VIOLATION_REASON: &[u8] = b"invalid application record";
@@ -102,6 +103,8 @@ pub enum QuicTransportError {
     MissingPeerIdentity,
     /// Quinn exposed an identity type other than rustls certificates.
     UnexpectedPeerIdentity,
+    /// TLS exporter keying material could not be derived.
+    ExportKeyingMaterial,
     /// The peer attempted to open a second instance of an application lane.
     DuplicateInboundLane(StreamKind),
     /// A later record changed the kind assigned to its stream.
@@ -136,6 +139,7 @@ impl fmt::Display for QuicTransportError {
             Self::UnexpectedPeerIdentity => {
                 formatter.write_str("QUIC peer identity was not rustls certificates")
             }
+            Self::ExportKeyingMaterial => formatter.write_str("QUIC TLS exporter failed"),
             Self::DuplicateInboundLane(kind) => {
                 write!(formatter, "duplicate inbound {kind:?} application lane")
             }
@@ -163,6 +167,7 @@ impl Error for QuicTransportError {
             | Self::EndpointClosed
             | Self::MissingPeerIdentity
             | Self::UnexpectedPeerIdentity
+            | Self::ExportKeyingMaterial
             | Self::DuplicateInboundLane(_)
             | Self::StreamKindChanged { .. } => None,
         }
@@ -286,6 +291,22 @@ impl QuicInboundStream {
 }
 
 impl QuicConnection {
+    /// Derives the fixed, protocol-domain-separated TLS exporter binding.
+    /// The label is intentionally not caller-controlled.
+    pub(crate) fn route_exporter(
+        &self,
+        context: &[u8],
+    ) -> Result<Zeroizing<[u8; 32]>, QuicTransportError> {
+        let mut output = Zeroizing::new([0u8; 32]);
+        self.connection
+            .export_keying_material(
+                &mut output[..],
+                b"EXPORTER-LatencyDesk-Product-Route-v1",
+                context,
+            )
+            .map_err(|_| QuicTransportError::ExportKeyingMaterial)?;
+        Ok(output)
+    }
     #[must_use]
     pub(crate) fn stable_id(&self) -> usize {
         self.connection.stable_id()

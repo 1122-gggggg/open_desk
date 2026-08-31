@@ -156,24 +156,27 @@ fn route_material(
     session: SessionStamp,
     server_fingerprint: [u8; 32],
     client_fingerprint: [u8; 32],
-) -> ([u8; 32], [u8; 32]) {
+) -> [u8; 32] {
     let mut route = Sha256::new();
     route.update(b"latencydesk-route-probe-v2");
     route.update(label);
-    route.update(server_address.to_string().as_bytes());
+    match server_address.ip() {
+        IpAddr::V4(address) => {
+            route.update([4]);
+            route.update(address.octets());
+        }
+        IpAddr::V6(address) => {
+            route.update([6]);
+            route.update(address.octets());
+        }
+    }
+    route.update(server_address.port().to_be_bytes());
     route.update(session.session_id.to_be_bytes());
     route.update(session.generation.to_be_bytes());
     route.update(server_fingerprint);
     route.update(client_fingerprint);
     let route_digest: [u8; 32] = route.finalize().into();
-    let mut transcript = Sha256::new();
-    transcript.update(b"latencydesk-route-probe-exact-mtls-transcript-v2");
-    transcript.update(route_digest);
-    transcript.update(session.authorization_epoch.to_be_bytes());
-    transcript.update(session.display_epoch.to_be_bytes());
-    transcript.update(session.codec_epoch.to_be_bytes());
-    let transcript_digest = transcript.finalize().into();
-    (route_digest, transcript_digest)
+    route_digest
 }
 
 fn transition(
@@ -243,16 +246,22 @@ async fn server(args: &Args) -> Result<(), Box<dyn Error>> {
         server_fingerprint,
         client_fingerprint,
     );
-    let active_binding = active.bind_authenticated_route(first_material.0, first_material.1)?;
-    let candidate_binding =
-        candidate.bind_authenticated_route(second_material.0, second_material.1)?;
+    let active_binding = active.bind_authenticated_route(first_material)?;
+    let candidate_binding = candidate.bind_authenticated_route(second_material)?;
+    let candidate_transition_material = candidate_binding.transition_material();
+    let active_transition_material = active_binding.transition_material();
     let mut routes = ProductRouteSet::new(active, active_binding, candidate, candidate_binding)?;
     println!("route-probe-connected role=server connections=2");
     tokio::time::sleep(Duration::from_millis(750)).await;
     let mut first_control;
     let mut second_control;
 
-    let prepare = transition(RouteTransitionStage::Prepare, 1, 1, second_material);
+    let prepare = transition(
+        RouteTransitionStage::Prepare,
+        1,
+        1,
+        candidate_transition_material,
+    );
     routes.send_route_transition(prepare).await?;
     first_control = routes.accept_control_receiver().await?;
     routes.next_route_transition(&mut first_control).await?;
@@ -295,7 +304,12 @@ async fn server(args: &Args) -> Result<(), Box<dyn Error>> {
 
     routes.fail_active_route(0x104, b"route probe injected candidate failure");
     println!("route-probe-phase role=server name=active-failed");
-    let rollback = transition(RouteTransitionStage::Prepare, 2, 2, first_material);
+    let rollback = transition(
+        RouteTransitionStage::Prepare,
+        2,
+        2,
+        active_transition_material,
+    );
     routes.send_rollback_via_retained(rollback).await?;
     println!("route-probe-phase role=server name=rollback-prepared-send");
     routes.next_route_transition(&mut first_control).await?;
@@ -380,9 +394,8 @@ async fn client(args: &Args) -> Result<(), Box<dyn Error>> {
         server_fingerprint,
         client_fingerprint,
     );
-    let active_binding = active.bind_authenticated_route(first_material.0, first_material.1)?;
-    let candidate_binding =
-        candidate.bind_authenticated_route(second_material.0, second_material.1)?;
+    let active_binding = active.bind_authenticated_route(first_material)?;
+    let candidate_binding = candidate.bind_authenticated_route(second_material)?;
     let mut routes = ProductRouteSet::new(active, active_binding, candidate, candidate_binding)?;
     println!("route-probe-connected role=client connections=2");
     tokio::time::sleep(Duration::from_millis(750)).await;

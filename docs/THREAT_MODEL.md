@@ -121,8 +121,12 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
   cancellation guarded; failure or the fixed transition timeout deauthorizes
   and closes both connections. Old-epoch packets are rejected before control
   decoding, input dispatch, or media reassembly. Fresh health proofs must match
-  the stored candidate/prior transcript, and rollback creates another bounded
-  promotion token instead of changing authority unilaterally;
+  the stored candidate/prior transcript. That transcript digest is derived
+  internally from a fixed-label TLS exporter and canonical full-stamp/route
+  context; callers cannot supply it and the exporter secret is zeroized.
+  Rollback creates another bounded promotion token instead of changing
+  authority unilaterally. The current harness still supplies its route digest,
+  so committed rendezvous/ICE nomination provenance remains a separate gate;
 - the underlying rendezvous state never trusts a payload to name its sender.
   The daemon supplies `DeviceId` from the authenticated client certificate; a
   match requires reciprocal exact expected-peer fingerprints,

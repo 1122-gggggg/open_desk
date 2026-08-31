@@ -82,12 +82,13 @@ impl UnauthorizedCandidateSession {
         Self { session }
     }
 
+    /// Binds a higher-layer verified route digest to this exact TLS session.
+    /// The transcript half is derived internally from the TLS exporter.
     pub fn bind_authenticated_route(
         &self,
         route_digest: [u8; 32],
-        transcript_digest: [u8; 32],
     ) -> Result<VerifiedRouteBinding, ProductSessionError> {
-        route_binding_for_session(&self.session, route_digest, transcript_digest)
+        route_binding_for_session(&self.session, route_digest)
     }
 }
 
@@ -130,14 +131,25 @@ pub struct ProductRouteSet {
     transition_route: Option<usize>,
 }
 
-/// Route metadata already verified by ICE nomination, exact-mTLS transcript
-/// binding, and fresh consent before a parallel connection enters the set.
+/// Route metadata cryptographically bound to one exact-mTLS connection.
+/// The higher layer remains responsible for deriving `route_digest` from
+/// verified nomination/consent evidence; the transcript digest is derived
+/// internally from the TLS exporter and cannot be caller supplied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifiedRouteBinding {
     route_digest: [u8; 32],
     transcript_digest: [u8; 32],
     connection_id: usize,
     peer_fingerprint: [u8; 32],
+}
+
+impl VerifiedRouteBinding {
+    /// Returns the public material required to authenticate a route transition.
+    /// The exporter secret itself is never exposed.
+    #[must_use]
+    pub fn transition_material(&self) -> ([u8; 32], [u8; 32]) {
+        (self.route_digest, self.transcript_digest)
+    }
 }
 
 #[derive(Debug)]
@@ -1080,12 +1092,13 @@ impl ProductSession {
         self.connection.remote_address()
     }
 
+    /// Binds a higher-layer verified route digest to this exact TLS session.
+    /// The transcript half is derived internally from the TLS exporter.
     pub fn bind_authenticated_route(
         &self,
         route_digest: [u8; 32],
-        transcript_digest: [u8; 32],
     ) -> Result<VerifiedRouteBinding, ProductSessionError> {
-        route_binding_for_session(self, route_digest, transcript_digest)
+        route_binding_for_session(self, route_digest)
     }
 
     /// Enables authenticated ICE signaling only when both the validated offer
@@ -2501,9 +2514,8 @@ fn stamp_at_route_epoch(mut stamp: SessionStamp, route_epoch: u64) -> SessionSta
 fn route_binding_for_session(
     session: &ProductSession,
     route_digest: [u8; 32],
-    transcript_digest: [u8; 32],
 ) -> Result<VerifiedRouteBinding, ProductSessionError> {
-    if route_digest == [0; 32] || transcript_digest == [0; 32] {
+    if route_digest == [0; 32] {
         return Err(ProductSessionError::RouteTransition(
             RouteTransitionViolation::InvalidBinding,
         ));
@@ -2514,12 +2526,31 @@ fn route_binding_for_session(
         .ok_or(ProductSessionError::RouteTransition(
             RouteTransitionViolation::PeerIdentityMismatch,
         ))?;
+    let context = route_exporter_context(session.stamp, route_digest);
+    let exporter = session.connection.route_exporter(&context)?;
+    let mut transcript = Sha256::new();
+    transcript.update(b"latencydesk/product-route-transcript/v1");
+    transcript.update(&exporter[..]);
+    transcript.update(context);
+    let transcript_digest = transcript.finalize().into();
     Ok(VerifiedRouteBinding {
         route_digest,
         transcript_digest,
         connection_id: session.connection.stable_id(),
         peer_fingerprint: Sha256::digest(peer_leaf).into(),
     })
+}
+
+fn route_exporter_context(stamp: SessionStamp, route_digest: [u8; 32]) -> [u8; 68] {
+    let mut context = [0_u8; 68];
+    context[0..8].copy_from_slice(&stamp.session_id.to_be_bytes());
+    context[8..16].copy_from_slice(&stamp.generation.to_be_bytes());
+    context[16..20].copy_from_slice(&stamp.authorization_epoch.to_be_bytes());
+    context[20..24].copy_from_slice(&stamp.display_epoch.to_be_bytes());
+    context[24..28].copy_from_slice(&stamp.codec_epoch.to_be_bytes());
+    context[28..36].copy_from_slice(&stamp.route_epoch.to_be_bytes());
+    context[36..68].copy_from_slice(&route_digest);
+    context
 }
 
 fn is_route_control(kind: ControlKind) -> bool {
@@ -3754,19 +3785,35 @@ mod tests {
         }
     }
 
+    fn bound_route_message(
+        routes: &ProductRouteSet,
+        target_index: usize,
+        stage: RouteTransitionStage,
+        sequence: u64,
+        base_route_epoch: u64,
+    ) -> RouteTransitionMessage {
+        let (route_digest, transcript_digest) = routes.bindings[target_index].transition_material();
+        RouteTransitionMessage {
+            version: latencydesk_protocol::WIRE_VERSION,
+            stage,
+            sequence,
+            base_route_epoch,
+            next_route_epoch: base_route_epoch + 1,
+            expires_at_ns: 1_000_000,
+            route_digest,
+            transcript_digest,
+        }
+    }
+
     fn route_binding(session: &ProductSession, byte: u8) -> VerifiedRouteBinding {
-        session
-            .bind_authenticated_route([byte; 32], [byte.wrapping_add(0x70); 32])
-            .unwrap()
+        session.bind_authenticated_route([byte; 32]).unwrap()
     }
 
     fn candidate_route_binding(
         session: &UnauthorizedCandidateSession,
         byte: u8,
     ) -> VerifiedRouteBinding {
-        session
-            .bind_authenticated_route([byte; 32], [byte.wrapping_add(0x70); 32])
-            .unwrap()
+        session.bind_authenticated_route([byte; 32]).unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3802,6 +3849,73 @@ mod tests {
 
         assert_eq!(host.expect("host session").stamp(), stamp);
         assert_eq!(client.expect("client session").stamp(), stamp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn route_binding_transcript_is_tls_exporter_and_context_bound() {
+        let route_digest = [0x41; 32];
+        let (host, client) = product_pair(1_450).await;
+        let host_material = host
+            .bind_authenticated_route(route_digest)
+            .unwrap()
+            .transition_material();
+        let client_material = client
+            .bind_authenticated_route(route_digest)
+            .unwrap()
+            .transition_material();
+        assert_eq!(host_material, client_material);
+        assert_eq!(host_material.0, route_digest);
+        assert_ne!(host_material.1, [0; 32]);
+
+        let different_route = host
+            .bind_authenticated_route([0x42; 32])
+            .unwrap()
+            .transition_material();
+        assert_ne!(different_route.1, host_material.1);
+        assert!(matches!(
+            host.bind_authenticated_route([0; 32]),
+            Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InvalidBinding
+            ))
+        ));
+
+        let (other_host, _other_client) = product_pair(1_450).await;
+        let other_connection = other_host
+            .bind_authenticated_route(route_digest)
+            .unwrap()
+            .transition_material();
+        assert_ne!(other_connection.1, host_material.1);
+
+        let mut later_stamp = host.stamp();
+        later_stamp.generation += 1;
+        let current_context = route_exporter_context(host.stamp(), route_digest);
+        let later_context = route_exporter_context(later_stamp, route_digest);
+        assert_ne!(current_context, later_context);
+        let current_exporter = host.connection.route_exporter(&current_context).unwrap();
+        let later_exporter = host.connection.route_exporter(&later_context).unwrap();
+        assert_ne!(&current_exporter[..], &later_exporter[..]);
+    }
+
+    #[test]
+    fn route_exporter_context_has_a_fixed_big_endian_layout() {
+        let stamp = SessionStamp {
+            session_id: 0x0102_0304_0506_0708,
+            generation: 0x1112_1314_1516_1718,
+            authorization_epoch: 0x2122_2324,
+            display_epoch: 0x3132_3334,
+            codec_epoch: 0x4142_4344,
+            route_epoch: 0x5152_5354_5556_5758,
+        };
+        let context = route_exporter_context(stamp, [0x61; 32]);
+        assert_eq!(
+            &context[..36],
+            &[
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+                0x17, 0x18, 0x21, 0x22, 0x23, 0x24, 0x31, 0x32, 0x33, 0x34, 0x41, 0x42, 0x43, 0x44,
+                0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
+            ]
+        );
+        assert_eq!(&context[36..], &[0x61; 32]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4389,7 +4503,7 @@ mod tests {
         ));
         assert_eq!(host.active_index(), 0);
 
-        let prepare = route_message(RouteTransitionStage::Prepare, 1, 1, [0x31; 32]);
+        let prepare = bound_route_message(&host, 1, RouteTransitionStage::Prepare, 1, 1);
         host.send_route_transition(prepare).await.unwrap();
         client
             .next_route_transition(&mut client_control)
@@ -4449,7 +4563,7 @@ mod tests {
 
         // Roll back over the current route, advancing to epoch 3 and restoring
         // authority exclusively to the retained connection at index 0.
-        let rollback = route_message(RouteTransitionStage::Prepare, 2, 2, [0x21; 32]);
+        let rollback = bound_route_message(&host, 0, RouteTransitionStage::Prepare, 2, 2);
         host.send_route_transition(rollback).await.unwrap();
         client
             .next_route_transition(&mut client_candidate_control)
@@ -4498,7 +4612,7 @@ mod tests {
     async fn failed_active_candidate_rolls_back_over_the_retained_path() {
         let (mut host, mut client) = product_route_sets(1_450).await;
         let mut client_retained = client.accept_control_receiver().await.unwrap();
-        let prepare = route_message(RouteTransitionStage::Prepare, 1, 1, [0x31; 32]);
+        let prepare = bound_route_message(&host, 1, RouteTransitionStage::Prepare, 1, 1);
         host.send_route_transition(prepare).await.unwrap();
         client
             .next_route_transition(&mut client_retained)
@@ -4536,7 +4650,7 @@ mod tests {
             .unwrap();
         assert_eq!((host.active_index(), client.active_index()), (1, 1));
 
-        let rollback = route_message(RouteTransitionStage::Prepare, 2, 2, [0x21; 32]);
+        let rollback = bound_route_message(&host, 0, RouteTransitionStage::Prepare, 2, 2);
         assert!(matches!(
             host.send_rollback_via_retained(rollback).await,
             Err(ProductSessionError::RouteTransition(
@@ -4596,7 +4710,7 @@ mod tests {
             (3, 3)
         );
 
-        let repromote = route_message(RouteTransitionStage::Prepare, 3, 3, [0x31; 32]);
+        let repromote = bound_route_message(&host, 1, RouteTransitionStage::Prepare, 3, 3);
         host.send_route_transition(repromote).await.unwrap();
         client
             .next_route_transition(&mut client_retained)
@@ -4637,7 +4751,7 @@ mod tests {
 
         host.fail_active_route(0x104, b"injected active path failure");
         client.fail_active_route(0x104, b"injected active path failure");
-        let closed_rollback = route_message(RouteTransitionStage::Prepare, 4, 4, [0x21; 32]);
+        let closed_rollback = bound_route_message(&host, 0, RouteTransitionStage::Prepare, 4, 4);
         host.send_rollback_via_retained(closed_rollback)
             .await
             .unwrap();
@@ -4717,14 +4831,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn route_set_prepare_timeout_revokes_both_connections() {
         let (mut host, _client) = product_route_sets(1_450).await;
-        host.send_route_transition(route_message(
-            RouteTransitionStage::Prepare,
-            1,
-            1,
-            [0x31; 32],
-        ))
-        .await
-        .unwrap();
+        let prepare = bound_route_message(&host, 1, RouteTransitionStage::Prepare, 1, 1);
+        host.send_route_transition(prepare).await.unwrap();
         tokio::time::sleep(ROUTE_TRANSITION_TIMEOUT + Duration::from_millis(50)).await;
         assert!(matches!(
             host.send_input(b"after-expiry").await,
@@ -4740,7 +4848,7 @@ mod tests {
     async fn cancelling_commit_after_wire_write_revokes_the_whole_route_set() {
         let (mut host, mut client) = product_route_sets(1_450).await;
         let mut client_control = client.accept_control_receiver().await.unwrap();
-        let prepare = route_message(RouteTransitionStage::Prepare, 1, 1, [0x31; 32]);
+        let prepare = bound_route_message(&host, 1, RouteTransitionStage::Prepare, 1, 1);
         host.send_route_transition(prepare).await.unwrap();
         client
             .next_route_transition(&mut client_control)
@@ -4781,7 +4889,7 @@ mod tests {
     async fn cancelling_commit_receive_after_epoch_update_revokes_both_routes() {
         let (mut host, mut client) = product_route_sets(1_450).await;
         let mut client_control = client.accept_control_receiver().await.unwrap();
-        let prepare = route_message(RouteTransitionStage::Prepare, 1, 1, [0x31; 32]);
+        let prepare = bound_route_message(&host, 1, RouteTransitionStage::Prepare, 1, 1);
         host.send_route_transition(prepare).await.unwrap();
         client
             .next_route_transition(&mut client_control)
