@@ -7,6 +7,7 @@ pub mod disconnect;
 pub mod lifecycle;
 pub mod nat;
 pub mod pairing;
+pub mod route_transition;
 pub mod runtime;
 pub mod unattended;
 
