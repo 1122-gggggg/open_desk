@@ -329,6 +329,10 @@ async fn server(args: &Args) -> Result<(), Box<dyn Error>> {
     if input.next_input().await?.as_ref() != EPOCH3_INPUT {
         return Err("epoch-3 input mismatch".into());
     }
+    routes
+        .send_control(ControlKind::Pong, b"epoch-3-data-acked")
+        .await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     println!(
         "route-probe-result role=server exact_mtls=true paths=2 promoted_epoch=2 rollback_epoch=3 active_index=0 active_failure=true input=true media=true control=true clean=true peer_challenge_sha256={}",
         encode_hex(&Sha256::digest(observed_client_challenge))
@@ -447,6 +451,10 @@ async fn client(args: &Args) -> Result<(), Box<dyn Error>> {
         return Err("epoch-3 media mismatch".into());
     }
     routes.send_input(EPOCH3_INPUT).await?;
+    let final_ack = routes.next_control(&mut first_control).await?;
+    if final_ack.kind != ControlKind::Pong || final_ack.payload.as_ref() != b"epoch-3-data-acked" {
+        return Err("epoch-3 data acknowledgement mismatch".into());
+    }
     println!(
         "route-probe-result role=client exact_mtls=true paths=2 promoted_epoch=2 rollback_epoch=3 active_index=0 active_failure=true input=true media=true control=true clean=true peer_challenge_sha256={}",
         encode_hex(&Sha256::digest(observed_server_challenge))
