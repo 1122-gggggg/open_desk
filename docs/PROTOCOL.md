@@ -112,6 +112,21 @@ never be logged or retained. This slice does not prove connectivity checks,
 nomination, consent freshness, path selection/promotion, rollback, rendezvous,
 NAT/CGNAT, TURN/relay, Internet reachability, or AnyDesk superiority.
 
+An explicit `ICE_CONNECTIVITY_PROBE` capability is valid only with authenticated
+ICE credentials. The opt-in probe uses exactly one fresh IPv4 Host candidate
+per peer: the authenticated peer IP and a different UDP port. Fixed
+roles/generation and a two-phase `Nominated` → `HandoffReady`
+barrier while the raw runner remains alive. Bounded traffic, deadline, drain,
+cancellation, and join handling then hands the same socket/port to an isolated
+second Quinn endpoint. Exact-leaf mTLS binds its transcript to the full
+`SessionStamp`, generation, both control nonces, and a fresh 32-byte challenge.
+The probe has no `ProductSession` or desktop authority; the original frame and
+`ReleaseAll` route remains unchanged. This is single-machine IPv4 loopback
+evidence only, not STUN on the probe path, route promotion/rollback, consent,
+rendezvous, NAT/CGNAT/IPv6, TURN/relay, Internet reachability, latency, or
+AnyDesk superiority. Borrowed buffers and upstream ICE internal credential
+copies are not guaranteed zeroized.
+
 ## 3. Capability negotiation
 
 Each peer advertises:

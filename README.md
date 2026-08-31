@@ -24,7 +24,7 @@ Windows client on a trusted, low-latency LAN.
 | Other clients | Portable software viewer with OpenH264/raw-NV12 presentation and input forwarding; headless receive and input probe remain available | Alpha implementation; cross-machine and native-UX evidence pending |
 | Windows host | Secure hosting is rejected before opening a socket because real capture/input providers are not connected | Unsupported |
 | Media | Raw NV12 fragmented across QUIC DATAGRAMs; no production H.264/AV1 encode/decode path | Low-resolution LAN preview only |
-| WAN connectivity | Direct IP plus a bounded race across four known exact-pinned addresses; opt-in RFC 8489 Binding and authenticated candidate advertisement; an isolated bounded Sans-I/O ICE adapter performs real HMAC-authenticated checks/nomination before handing the nominated sockets unchanged to Quinn exact-mTLS | Same-socket ICE→Quinn loopback integration is verified but is not wired into application signaling or routing. No rendezvous, real NAT matrix, TURN/relay, automatic Internet traversal, interactive recovery, or QUIC path migration |
+| WAN connectivity | Direct IP plus a bounded race across four known exact-pinned addresses; opt-in RFC 8489 Binding and authenticated candidate advertisement; an explicit IPv4 loopback probe signals bounded ICE credentials/candidates, nominates a fresh path, and hands the unchanged socket to isolated Quinn exact-mTLS | Application signaling and same-socket ICE→Quinn are verified only as a non-promoting single-machine probe. No rendezvous, real NAT matrix, TURN/relay, automatic Internet traversal, interactive recovery, or QUIC path migration |
 | Distribution | No supported signed installer, updater, or production service | Not implemented |
 | Legacy transport | Plaintext custom UDP, available only with explicit `--unsafe-udp-lab` | Local compatibility test only |
 
@@ -116,9 +116,10 @@ stop and those exact sockets/ports are handed to Quinn, which must still finish
 TLS 1.3 mutual authentication and expose both expected certificate chains.
 Wrong credentials, fingerprint mutation, oversized/mixed candidates, role
 conflict, and dropped liveness checks have negative tests. This proves a safe
-sequential ICE→QUIC seam on one machine; candidate/credential signaling,
-rendezvous, real NATs, TURN, route promotion, and cross-machine success remain
-unimplemented.
+sequential ICE→QUIC seam on one machine. The isolated probe below now wires
+authenticated credential/candidate signaling to that seam without promoting
+the result; rendezvous, real NATs, TURN, route promotion, and cross-machine
+success remain unimplemented.
 
 The multi-target process gate starts two distinct-certificate Hosts, proves
 both are authenticated and streaming at the same time, then runs a second
@@ -282,6 +283,30 @@ socket. `--candidate-exchange-probe` can advertise the resulting bounded set
 inside the already authenticated product session, but the receiver stores it as
 untrusted connectivity metadata and does not add or switch a route. ICE checks,
 nomination, consent, and relay remain later gates.
+
+### 3.5 Isolated ICE connectivity probe
+
+`--ice-connectivity-probe` requires the negotiated `ICE_CONNECTIVITY_PROBE`
+capability and authenticated ICE credentials. It uses exactly one fresh IPv4
+Host candidate per peer: the authenticated peer IP with a different UDP port.
+Roles/generation are fixed, followed by a `Nominated` then
+`HandoffReady` barrier while raw ICE continues. The exact socket/port is drained
+and handed to an isolated Quinn endpoint for exact-leaf mTLS; the transcript
+binds the full `SessionStamp`, generation, two control nonces, and a 32-byte
+challenge. The probe has no desktop or `ProductSession` authority, and the
+original frame plus `ReleaseAll` route remains unchanged.
+
+Evidence command:
+
+```bash
+xvfb-run -a python3 scripts/ice_connectivity_probe_test.py --host-bin target/debug/latencydesk-host --client-bin target/debug/latencydesk-client --identity-bin target/debug/latencydesk-identity --frames 3 --timeout 45 --output artifacts/ice-connectivity-probe.json
+```
+
+This proves only single-machine IPv4 loopback. STUN on the probe, route
+promotion/rollback, consent, rendezvous, NAT/CGNAT/IPv6, TURN/relay, Internet
+reachability, latency superiority, and AnyDesk superiority remain unproven.
+Borrowed buffers and upstream ICE internal credential copies are not guaranteed
+zeroized.
 
 ### 4. Open several exact-pinned Hosts concurrently
 

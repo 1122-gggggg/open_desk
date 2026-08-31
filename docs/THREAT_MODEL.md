@@ -86,6 +86,16 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
   This boundary does not prove
   connectivity, consent, route choice, NAT/TURN/Internet reachability, or
   AnyDesk superiority;
+- the opt-in `ICE_CONNECTIVITY_PROBE` additionally requires the authenticated
+  credential capability, fixed roles/generation, and `Nominated` → `HandoffReady`
+  barriers before handing one fresh IPv4 socket to an isolated Quinn endpoint.
+  The only remote candidate is the authenticated peer IP on a fresh UDP port;
+  its full-stamp/nonces/challenge transcript has no ProductSession or desktop
+  authority, and the original route is never promoted by this probe. Evidence
+  is loopback-only; STUN-on-probe, consent, NAT/CGNAT/IPv6, rendezvous,
+  TURN/relay, Internet reachability, and latency/AnyDesk claims remain outside
+  this control. Borrowed buffers and upstream ICE internal credential copies are
+  not guaranteed zeroized;
 - rate limits before expensive parsing/decompression;
 - connection and incomplete-frame quotas.
 
