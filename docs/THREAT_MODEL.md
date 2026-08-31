@@ -107,14 +107,16 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
   buffers are zeroized, but inbound Quinn `Bytes` and decoder copies are only
   debug-redacted and are not guaranteed zeroized;
 - route promotion is fail-closed and two-phase. A candidate needs nomination,
-  exact-mTLS, transcript, and consent proof; the old route remains authoritative
-  until authenticated prepare/commit. Commit and rollback each increment a
-  separate route epoch, while session and authorization/input epochs remain
-  fixed. Only the current `(route_epoch, path)` may carry application data, so
-  delayed old-route packets cannot regain authority. At the stability deadline,
-  candidate and prior-route proofs are freshly evaluated; an unverified prior
-  route cannot be restored, and if neither proof is complete all route authority
-  is revoked;
+  exact-mTLS, transcript, and consent proof. Protocol v2 binds every product
+  lane to a nonzero route epoch. Prepare/Prepared/Commit stays on the current
+  route; the initiator cannot switch until Activated/Confirmed crosses the
+  exact-pinned candidate connection. Only one connection in `ProductRouteSet`
+  has application authority. Commit, promotion, and rollback operations are
+  cancellation guarded; failure or the fixed transition timeout deauthorizes
+  and closes both connections. Old-epoch packets are rejected before control
+  decoding, input dispatch, or media reassembly. Fresh health proofs must match
+  the stored candidate/prior transcript, and rollback creates another bounded
+  promotion token instead of changing authority unilaterally;
 - the underlying rendezvous state never trusts a payload to name its sender.
   The daemon supplies `DeviceId` from the authenticated client certificate; a
   match requires reciprocal exact expected-peer fingerprints,

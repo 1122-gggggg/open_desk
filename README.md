@@ -331,7 +331,7 @@ or AnyDesk parity claim. Owned outbound secret buffers are zeroized; inbound
 Quinn buffers and decoder copies are debug-redacted but are not guaranteed
 zeroized.
 
-### 3.7 Two-phase route promotion state
+### 3.7 Protocol-v2 route promotion and bounded rollback
 
 `RouteTransitionController` admits a candidate only after ICE nomination,
 exact-mTLS, transcript binding, and fresh consent are all present. The old route
@@ -341,9 +341,31 @@ deadline, a fresh candidate proof finalizes it; otherwise only a fresh old-route
 proof may roll back with another epoch bump. If neither route remains verified,
 all application-route authority is revoked and a new transition is refused.
 Packets from the pre-promotion route remain stale even after returning to the
-same network path. The full `SessionStamp` and authorization/input epochs are
-never rewritten. This is a tested state machine, not yet wired into product
-media or input dispatch.
+same network path. Protocol v2 carries a nonzero `route_epoch` on every reliable
+control/input record, media datagram, input-applied ACK, and ICE probe. A
+`ProductRouteSet` owns two distinct connections to the same exact certificate;
+the candidate is unable to send application data before admission. Typed
+Prepare/Prepared/Commit runs on the current route, then `Activated`/`Confirmed`
+must cross the candidate route before the initiator switches authority. A
+cancelled or expired transition deauthorizes and closes both connections.
+
+The process gate below starts separate server/client processes on two distinct
+loopback UDP ports, promotes epoch 1→2, transfers exact control/input/media
+payloads, injects active-candidate failure, then rolls back over the retained
+connection through the same authenticated barrier at epoch 3:
+
+```bash
+cargo build --locked -p latencydesk-route-probe -p latencydesk-identity
+python3 scripts/route_promotion_process_test.py \
+  --binary target/debug/latencydesk-route-probe \
+  --identity-bin target/debug/latencydesk-identity \
+  --timeout 20 --output artifacts/route-promotion-process.json
+```
+
+This is real two-process exact-mTLS product-lane evidence, but only on one
+machine and two loopback paths. The normal desktop Host/Client still does not
+automatically create this route set from rendezvous/ICE/TURN, and physical
+router, CGNAT, relay-failure, inter-network, and latency claims remain pending.
 
 ### 3.8 Bounded UDP TURN relay process
 
