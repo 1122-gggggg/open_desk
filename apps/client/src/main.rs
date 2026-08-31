@@ -66,6 +66,7 @@ pub struct ClientArgs {
     pub reconnect_attempts: u32,
     pub input_latency_probes: u32,
     pub candidate_exchange_probe: bool,
+    pub ice_connectivity_probe: bool,
     pub width: u32,
     pub height: u32,
     pub auto_approve: bool,
@@ -94,6 +95,7 @@ impl Default for ClientArgs {
             reconnect_attempts: 0,
             input_latency_probes: 0,
             candidate_exchange_probe: false,
+            ice_connectivity_probe: false,
             width: 1280,
             height: 720,
             auto_approve: false,
@@ -222,6 +224,10 @@ where
                 config.candidate_exchange_probe = true;
                 i += 1;
             }
+            "--ice-connectivity-probe" => {
+                config.ice_connectivity_probe = true;
+                i += 1;
+            }
             "--width" => {
                 if i + 1 >= args.len() {
                     return Err("missing value for --width".into());
@@ -315,6 +321,7 @@ where
                        --reconnect-attempts <N>  Retry 0..=8 recoverable headless path losses (default 0)\n  \
                        --input-latency-probes <N> Measure 1..=1024 ACK RTTs per secure target (Linux Host)\n  \
                        --candidate-exchange-probe Advertise bounded candidates after exact mTLS without changing route\n  \
+                       --ice-connectivity-probe Run one bounded fresh-socket IPv4 ICE probe for a secure target\n  \
                        --inject-probe            Send one pointer move and ReleaseAll, wait 3 frames, exit\n  \
                        --role client             Explicit role assertion\n  \
                        --version, -V             Show version information\n  \
@@ -485,6 +492,29 @@ where
     {
         return Err(
             "--candidate-exchange-probe requires one secure --connect/--peer-cert target, an explicit unicast --bind address, and no other headless/probe/multi-target mode"
+                .into(),
+        );
+    }
+    let ice_probe_bind_invalid = !config.bind_addr.is_ipv4()
+        || config.bind_addr.ip().is_unspecified()
+        || config.bind_addr.ip().is_multicast()
+        || matches!(config.bind_addr.ip(), std::net::IpAddr::V4(ip) if ip.is_broadcast());
+    if config.ice_connectivity_probe
+        && (!config.connect_addr.is_ipv4()
+            || ice_probe_bind_invalid
+            || config.max_frames.is_some()
+            || config.session_count > 1
+            || config.reconnect_attempts > 0
+            || config.input_latency_probes > 0
+            || config.candidate_exchange_probe
+            || config.inject_probe
+            || config.unsafe_udp_lab
+            || !config.targets.is_empty()
+            || !config.fallback_addresses.is_empty()
+            || config.stun_server.is_some())
+    {
+        return Err(
+            "--ice-connectivity-probe requires one secure --connect/--peer-cert target, an explicit unicast IPv4 --bind address, and no other headless/probe/multi-target mode or STUN"
                 .into(),
         );
     }
@@ -859,6 +889,9 @@ fn receive_completed_frames_for(
 }
 
 fn plan_target_child_args(args: &ClientArgs) -> Result<Vec<TargetChildPlan>, Box<dyn Error>> {
+    if args.ice_connectivity_probe {
+        return Err("--ice-connectivity-probe cannot be forwarded into multi-target mode".into());
+    }
     if args.targets.len() < 2 {
         return Err("multi-target planning requires at least two targets".into());
     }
@@ -1735,6 +1768,167 @@ mod tests {
             ],
         ] {
             assert!(parse_client_args_from(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn client_parser_scopes_ice_connectivity_probe_to_one_fresh_socket_target() {
+        let args = parse_client_args_from([
+            "latencydesk-client",
+            "--identity-cert",
+            "client.der",
+            "--identity-key",
+            "key.der",
+            "--peer-cert",
+            "host.der",
+            "--connect",
+            "127.0.0.1:9000",
+            "--bind",
+            "127.0.0.1:0",
+            "--ice-connectivity-probe",
+        ])
+        .expect("secure ICE connectivity probe");
+        assert!(args.ice_connectivity_probe);
+        assert_eq!(args.bind_addr, "127.0.0.1:0".parse().unwrap());
+        assert!(!ClientArgs::default().ice_connectivity_probe);
+
+        let incompatible = [
+            vec!["--unsafe-udp-lab", "--ice-connectivity-probe"],
+            vec!["--ice-connectivity-probe"],
+            vec![
+                "--identity-cert",
+                "client.der",
+                "--identity-key",
+                "key.der",
+                "--peer-cert",
+                "host.der",
+                "--bind",
+                "0.0.0.0:0",
+                "--ice-connectivity-probe",
+            ],
+            vec![
+                "--identity-cert",
+                "client.der",
+                "--identity-key",
+                "key.der",
+                "--peer-cert",
+                "host.der",
+                "--connect",
+                "[::1]:9000",
+                "--bind",
+                "127.0.0.1:0",
+                "--ice-connectivity-probe",
+            ],
+            vec![
+                "--identity-cert",
+                "client.der",
+                "--identity-key",
+                "key.der",
+                "--peer-cert",
+                "host.der",
+                "--bind",
+                "[::1]:0",
+                "--ice-connectivity-probe",
+            ],
+            vec![
+                "--identity-cert",
+                "client.der",
+                "--identity-key",
+                "key.der",
+                "--peer-cert",
+                "host.der",
+                "--bind",
+                "127.0.0.1:0",
+                "--frames",
+                "1",
+                "--ice-connectivity-probe",
+            ],
+            vec![
+                "--identity-cert",
+                "client.der",
+                "--identity-key",
+                "key.der",
+                "--peer-cert",
+                "host.der",
+                "--bind",
+                "127.0.0.1:0",
+                "--session-count",
+                "2",
+                "--frames",
+                "1",
+                "--ice-connectivity-probe",
+            ],
+            vec![
+                "--identity-cert",
+                "client.der",
+                "--identity-key",
+                "key.der",
+                "--peer-cert",
+                "host.der",
+                "--bind",
+                "127.0.0.1:0",
+                "--reconnect-attempts",
+                "1",
+                "--frames",
+                "1",
+                "--ice-connectivity-probe",
+            ],
+            vec![
+                "--identity-cert",
+                "client.der",
+                "--identity-key",
+                "key.der",
+                "--peer-cert",
+                "host.der",
+                "--bind",
+                "127.0.0.1:0",
+                "--input-latency-probes",
+                "1",
+                "--ice-connectivity-probe",
+            ],
+            vec![
+                "--identity-cert",
+                "client.der",
+                "--identity-key",
+                "key.der",
+                "--peer-cert",
+                "host.der",
+                "--bind",
+                "127.0.0.1:0",
+                "--candidate-exchange-probe",
+                "--ice-connectivity-probe",
+            ],
+            vec![
+                "--identity-cert",
+                "client.der",
+                "--identity-key",
+                "key.der",
+                "--peer-cert",
+                "host.der",
+                "--bind",
+                "127.0.0.1:0",
+                "--fallback-address",
+                "127.0.0.1:9001",
+                "--ice-connectivity-probe",
+            ],
+            vec![
+                "--identity-cert",
+                "client.der",
+                "--identity-key",
+                "key.der",
+                "--peer-cert",
+                "host.der",
+                "--bind",
+                "127.0.0.1:0",
+                "--stun-server",
+                "127.0.0.1:3478",
+                "--ice-connectivity-probe",
+            ],
+        ];
+        for options in incompatible {
+            let mut argv = vec!["latencydesk-client".to_string()];
+            argv.extend(options.into_iter().map(String::from));
+            assert!(parse_client_args_from(argv).is_err());
         }
     }
 

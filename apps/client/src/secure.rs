@@ -6,6 +6,10 @@ use latencydesk_protocol::quic::SessionStamp;
 use latencydesk_protocol::{InputAckStatus, InputAppliedAck};
 use latencydesk_session::lifecycle::ReconnectPolicy;
 use latencydesk_session::nat::{candidate_exchange_sha256, gather_candidate_exchange_v1};
+use latencydesk_socket_transport::ice::{
+    Ice, IceCandidate as SocketIceCandidate, IceConfig, IceCredentials, IceRole, IceSocketWorker,
+};
+use latencydesk_socket_transport::ice_probe::{connect_echo, generate_control_nonce};
 #[cfg(test)]
 use latencydesk_socket_transport::identity::connect_exact_peer;
 use latencydesk_socket_transport::identity::{
@@ -36,6 +40,10 @@ const CLIENT_INPUT_PROBE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_STUN_TOTAL_BUDGET: Duration = Duration::from_secs(5);
 const CLIENT_STUN_INITIAL_RTO: Duration = Duration::from_millis(500);
 const CLIENT_STUN_MAX_REQUESTS: u8 = 4;
+const CLIENT_ICE_PROBE_TOTAL_BUDGET: Duration = Duration::from_secs(15);
+const CLIENT_ICE_PROBE_PHASE_BUDGET: Duration = Duration::from_secs(8);
+const CLIENT_ICE_PROBE_QUIC_BUDGET: Duration = Duration::from_secs(3);
+const CLIENT_ICE_PROBE_CLEANUP_BUDGET: Duration = Duration::from_secs(2);
 #[cfg(any(windows, test))]
 const CLIENT_CLEANUP_SCHEDULER_ALLOWANCE: Duration = Duration::from_millis(250);
 #[cfg(any(windows, test))]
@@ -347,6 +355,8 @@ fn stream_config_is_offered(config: latencydesk_protocol::VideoStreamConfig, fla
         && (!config.supports_authenticated_ice_credentials()
             || flags & latencydesk_protocol::video_capability_flags::AUTHENTICATED_ICE_CREDENTIALS
                 != 0)
+        && (!config.supports_ice_connectivity_probe()
+            || flags & latencydesk_protocol::video_capability_flags::ICE_CONNECTIVITY_PROBE != 0)
 }
 
 fn require_input_ack_capability(
@@ -368,6 +378,24 @@ pub(crate) async fn negotiate_video_stream(
     Ok((config, receiver))
 }
 
+enum ConnectivityOffer {
+    None,
+    Advertisement(latencydesk_protocol::CandidateExchange),
+    IceProbe {
+        credentials: latencydesk_protocol::IceCredentialExchange,
+        candidates: latencydesk_protocol::CandidateExchange,
+    },
+}
+
+enum ConnectivityNegotiation {
+    None,
+    Advertisement(latencydesk_protocol::CandidateExchange),
+    IceProbe {
+        credentials: latencydesk_protocol::IceCredentialExchange,
+        candidates: latencydesk_protocol::CandidateExchange,
+    },
+}
+
 async fn negotiate_video_stream_with_candidates(
     session: &ProductSession,
     timeout: Duration,
@@ -380,6 +408,34 @@ async fn negotiate_video_stream_with_candidates(
     ),
     Box<dyn Error>,
 > {
+    let offer = match local_candidate_exchange {
+        Some(exchange) => ConnectivityOffer::Advertisement(exchange),
+        None => ConnectivityOffer::None,
+    };
+    let (config, receiver, connectivity) =
+        negotiate_video_stream_with_connectivity(session, timeout, offer).await?;
+    let peer = match connectivity {
+        ConnectivityNegotiation::None => None,
+        ConnectivityNegotiation::Advertisement(exchange) => Some(exchange),
+        ConnectivityNegotiation::IceProbe { .. } => {
+            return Err("ICE probe returned through candidate-advertisement negotiation".into())
+        }
+    };
+    Ok((config, receiver, peer))
+}
+
+async fn negotiate_video_stream_with_connectivity(
+    session: &ProductSession,
+    timeout: Duration,
+    offer: ConnectivityOffer,
+) -> Result<
+    (
+        latencydesk_protocol::VideoStreamConfig,
+        ControlReceiver,
+        ConnectivityNegotiation,
+    ),
+    Box<dyn Error>,
+> {
     use latencydesk_protocol::{
         video_capability_flags, ControlKind, VideoCodecCapabilities, VideoStreamConfig,
         VIDEO_CODEC_CONTRACT_VERSION,
@@ -387,8 +443,15 @@ async fn negotiate_video_stream_with_candidates(
 
     tokio::time::timeout(timeout, async {
         let mut flags = platform_capability_flags();
-        if local_candidate_exchange.is_some() {
-            flags |= video_capability_flags::AUTHENTICATED_CANDIDATE_EXCHANGE;
+        match &offer {
+            ConnectivityOffer::None => {}
+            ConnectivityOffer::Advertisement(_) => {
+                flags |= video_capability_flags::AUTHENTICATED_CANDIDATE_EXCHANGE;
+            }
+            ConnectivityOffer::IceProbe { .. } => {
+                flags |= video_capability_flags::AUTHENTICATED_ICE_CREDENTIALS
+                    | video_capability_flags::ICE_CONNECTIVITY_PROBE;
+            }
         }
         let capabilities = VideoCodecCapabilities {
             contract_version: VIDEO_CODEC_CONTRACT_VERSION,
@@ -417,18 +480,46 @@ async fn negotiate_video_stream_with_candidates(
             )
             .into());
         }
-        let peer_candidate_exchange = if config.supports_authenticated_candidate_exchange() {
-            let local = local_candidate_exchange
-                .ok_or("Host selected candidate advertisement without a Client candidate set")?;
-            session.send_candidate_exchange(local).await?;
-            Some(receiver.next_candidate_exchange().await?)
-        } else {
-            if local_candidate_exchange.is_some() {
-                return Err("Host did not negotiate authenticated candidate advertisement".into());
+        let connectivity = match offer {
+            ConnectivityOffer::None => {
+                if config.supports_authenticated_candidate_exchange()
+                    || config.supports_authenticated_ice_credentials()
+                    || config.supports_ice_connectivity_probe()
+                {
+                    return Err("Host selected unoffered connectivity signaling".into());
+                }
+                ConnectivityNegotiation::None
             }
-            None
+            ConnectivityOffer::Advertisement(local) => {
+                if !config.supports_authenticated_candidate_exchange() {
+                    return Err(
+                        "Host did not negotiate authenticated candidate advertisement".into(),
+                    );
+                }
+                session.send_candidate_exchange(local).await?;
+                ConnectivityNegotiation::Advertisement(receiver.next_candidate_exchange().await?)
+            }
+            ConnectivityOffer::IceProbe {
+                credentials,
+                candidates,
+            } => {
+                if !config.supports_authenticated_ice_credentials()
+                    || !config.supports_ice_connectivity_probe()
+                {
+                    return Err("Host did not negotiate the ICE connectivity probe".into());
+                }
+                session
+                    .enable_authenticated_ice_signaling(capabilities, config)
+                    .await?;
+                session.send_ice_generation(credentials, candidates).await?;
+                let (credentials, candidates) = receiver.next_ice_generation().await?;
+                ConnectivityNegotiation::IceProbe {
+                    credentials,
+                    candidates,
+                }
+            }
         };
-        Ok::<_, Box<dyn Error>>((config, receiver, peer_candidate_exchange))
+        Ok::<_, Box<dyn Error>>((config, receiver, connectivity))
     })
     .await
     .map_err(|_| format!("codec negotiation timed out after {timeout:?}"))?
@@ -524,7 +615,17 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
     log_active_session(&session, selected_remote, attempts_started);
 
     let reconnect_policy = ReconnectPolicy::new(args.reconnect_attempts)?;
-    let result = if args.candidate_exchange_probe {
+    let result = if args.ice_connectivity_probe {
+        run_ice_connectivity_probe(
+            &runtime,
+            &session,
+            &identity,
+            &exact_peer_certificate,
+            endpoint.local_addr()?,
+            selected_remote,
+            operation_timeout,
+        )
+    } else if args.candidate_exchange_probe {
         let local_address = endpoint.local_addr()?;
         let exchange = gather_candidate_exchange_v1(
             local_address,
@@ -642,6 +743,341 @@ fn run_candidate_exchange_probe(
         session.stamp().session_id
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_ice_connectivity_probe(
+    runtime: &tokio::runtime::Runtime,
+    session: &ProductSession,
+    identity: &TlsIdentity,
+    exact_peer_certificate: &[u8],
+    active_local: SocketAddr,
+    selected_remote: SocketAddr,
+    operation_timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    const ICE_GENERATION: u32 = 1;
+    let active_stamp = session.stamp();
+    let active_remote = session.remote_address();
+    if active_remote != selected_remote {
+        return Err("active QUIC route changed before ICE probe".into());
+    }
+    let probe_socket = UdpSocket::bind(SocketAddr::new(active_local.ip(), 0))?;
+    let probe_local = probe_socket.local_addr()?;
+    if probe_local == active_local {
+        return Err("fresh ICE probe socket reused the active QUIC address".into());
+    }
+    let ice_config = IceConfig {
+        timing_advance: Duration::from_millis(50),
+        initial_rto: Duration::from_millis(250),
+        max_rto: Duration::from_secs(1),
+        max_retransmits: 4,
+        establishment_deadline: CLIENT_ICE_PROBE_PHASE_BUDGET,
+    };
+    let (mut ice, local_credentials) = Ice::new(IceRole::Controlling, ice_config)?;
+    ice.add_local_candidate(SocketIceCandidate::host(probe_local))?;
+    let local_credentials = local_credentials.to_signaling(
+        active_stamp.session_id,
+        ICE_GENERATION,
+        IceRole::Controlling,
+    )?;
+    let local_candidates =
+        gather_candidate_exchange_v1(probe_local, None, active_stamp.session_id, ICE_GENERATION)?;
+    let budget = operation_timeout.min(CLIENT_ICE_PROBE_TOTAL_BUDGET);
+
+    let probe_result = runtime.block_on(async {
+        let deadline = tokio::time::Instant::now() + budget;
+        let (config, mut receiver, connectivity) = negotiate_video_stream_with_connectivity(
+            session,
+            probe_remaining(deadline)?,
+            ConnectivityOffer::IceProbe {
+                credentials: local_credentials,
+                candidates: local_candidates,
+            },
+        )
+        .await?;
+        let (remote_credentials, remote_candidates) = match connectivity {
+            ConnectivityNegotiation::IceProbe {
+                credentials,
+                candidates,
+            } => (credentials, candidates),
+            _ => return Err("Host did not complete ICE probe signaling".into()),
+        };
+        ice.set_remote_credentials(&IceCredentials::from_signaling(&remote_credentials)?)?;
+        let remote_candidate =
+            match SocketIceCandidate::probe_remote_from_exchange(&remote_candidates, active_remote)
+            {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    session.close(0x121, b"unsupported ICE probe candidate");
+                    return Err(error.into());
+                }
+            };
+        ice.add_remote_candidate(remote_candidate)?;
+
+        let mut worker = IceSocketWorker::spawn(probe_socket, ice);
+        let nomination_wait = probe_remaining(deadline)?.min(CLIENT_ICE_PROBE_PHASE_BUDGET);
+        if let Err(error) = worker.wait_nominated(nomination_wait).await {
+            let _ = worker.cancel(CLIENT_ICE_PROBE_CLEANUP_BUDGET).await;
+            return Err(Box::<dyn Error>::from(error));
+        }
+        let client_nonce = generate_control_nonce()?;
+        let client_nominated = ice_probe_barrier_message(
+            latencydesk_protocol::IceProbeStage::ClientNominated,
+            active_stamp,
+            ICE_GENERATION,
+            client_nonce,
+            [0; 16],
+        );
+        if let Err(error) =
+            send_ice_probe_barrier(session, client_nominated, probe_remaining(deadline)?).await
+        {
+            let _ = worker.cancel(CLIENT_ICE_PROBE_CLEANUP_BUDGET).await;
+            return Err(error);
+        }
+        let host_nominated = match receive_ice_probe_barrier(
+            session,
+            &mut receiver,
+            latencydesk_protocol::IceProbeStage::HostNominated,
+            active_stamp,
+            ICE_GENERATION,
+            client_nonce,
+            None,
+            probe_remaining(deadline)?,
+        )
+        .await
+        {
+            Ok(message) => message,
+            Err(error) => {
+                let _ = worker.cancel(CLIENT_ICE_PROBE_CLEANUP_BUDGET).await;
+                return Err(error);
+            }
+        };
+        let host_nonce = host_nominated.host_nonce;
+        let handoff = worker
+            .handoff(probe_remaining(deadline)?.min(CLIENT_ICE_PROBE_CLEANUP_BUDGET))
+            .await?;
+        let ice_stats = handoff.stats;
+        let ice_elapsed = handoff.elapsed;
+        let nominated = handoff.nominated;
+
+        send_ice_probe_barrier(
+            session,
+            ice_probe_barrier_message(
+                latencydesk_protocol::IceProbeStage::ClientReady,
+                active_stamp,
+                ICE_GENERATION,
+                client_nonce,
+                host_nonce,
+            ),
+            probe_remaining(deadline)?,
+        )
+        .await?;
+        receive_ice_probe_barrier(
+            session,
+            &mut receiver,
+            latencydesk_protocol::IceProbeStage::HostReady,
+            active_stamp,
+            ICE_GENERATION,
+            client_nonce,
+            Some(host_nonce),
+            probe_remaining(deadline)?,
+        )
+        .await?;
+        send_ice_probe_barrier(
+            session,
+            ice_probe_barrier_message(
+                latencydesk_protocol::IceProbeStage::ReadyAck,
+                active_stamp,
+                ICE_GENERATION,
+                client_nonce,
+                host_nonce,
+            ),
+            probe_remaining(deadline)?,
+        )
+        .await?;
+
+        let probe_report = connect_echo(
+            handoff,
+            identity,
+            exact_peer_certificate,
+            nominated.1,
+            active_stamp,
+            ICE_GENERATION,
+            client_nonce,
+            host_nonce,
+            probe_remaining(deadline)?.min(CLIENT_ICE_PROBE_QUIC_BUDGET),
+        )
+        .await?;
+        if (probe_report.local, probe_report.remote) != nominated {
+            return Err("probe Quinn endpoint did not preserve the nominated socket pair".into());
+        }
+        Ok::<_, Box<dyn Error>>((
+            config,
+            receiver,
+            nominated,
+            ice_stats,
+            ice_elapsed,
+            probe_report,
+            client_nonce,
+            host_nonce,
+        ))
+    });
+    let (
+        config,
+        _receiver,
+        nominated,
+        ice_stats,
+        ice_elapsed,
+        probe_report,
+        client_nonce,
+        host_nonce,
+    ) = match probe_result {
+        Ok(success) => success,
+        Err(probe_error) => {
+            let isolation_result = runtime.block_on(async {
+                tokio::time::timeout(budget, session.receive_media_frame())
+                    .await
+                    .map_err(|_| "active route did not deliver a frame after probe failure")??;
+                send_input_event(
+                    session,
+                    1,
+                    InputEvent::ReleaseAll,
+                    reliable_operation_timeout(budget),
+                )
+                .await?;
+                Ok::<_, Box<dyn Error>>(())
+            });
+            if let Err(isolation_error) = isolation_result {
+                return Err(format!(
+                    "ICE probe failed ({probe_error}); active-route isolation check also failed: {isolation_error}"
+                )
+                .into());
+            }
+            if session.stamp() != active_stamp || session.remote_address() != active_remote {
+                return Err(format!(
+                    "ICE probe failed ({probe_error}) and changed the active route or stamp"
+                )
+                .into());
+            }
+            println!(
+                "ice-connectivity-probe: authenticated=true session_id={} generation={ICE_GENERATION} success=false route_changed=false active_route={} post_failure_frame=true release_all=true",
+                active_stamp.session_id,
+                active_remote,
+            );
+            return Err(format!(
+                "ICE connectivity probe failed without changing the active route: {probe_error}"
+            )
+            .into());
+        }
+    };
+
+    let received = runtime.block_on(receive_frames_with_timeout(session, 1, budget, config))?;
+    runtime.block_on(send_input_event(
+        session,
+        1,
+        InputEvent::ReleaseAll,
+        reliable_operation_timeout(budget),
+    ))?;
+    if session.stamp() != active_stamp || session.remote_address() != active_remote {
+        return Err("ICE probe changed the active desktop route or session stamp".into());
+    }
+    println!(
+        "ice-connectivity-probe: authenticated=true success=true role=controlling session_id={} generation={ICE_GENERATION} local={} remote={} requests_sent={} successes_received={} requests_received={} nominations_sent={} ice_elapsed_ms={} quic_echo_elapsed_ms={} exact_mtls=true full_stamp_bound=true control_nonces_bound=true route_changed=false active_route={} frames_after_probe={received}",
+        active_stamp.session_id,
+        nominated.0,
+        nominated.1,
+        ice_stats.binding_requests_sent,
+        ice_stats.binding_successes_received,
+        ice_stats.binding_requests_received,
+        ice_stats.nominations_sent,
+        ice_elapsed.as_millis(),
+        probe_report.elapsed.as_millis(),
+        active_remote,
+    );
+    println!(
+        "ice-connectivity-probe-scope: fresh_socket=true same_socket_handoff=true client_nonce_nonzero={} host_nonce_nonzero={} connectivity_checks=true nomination=true route_promotion=false nat_traversal_claim=false internet_claim=false",
+        client_nonce != [0; 16],
+        host_nonce != [0; 16],
+    );
+    Ok(())
+}
+
+fn probe_remaining(deadline: tokio::time::Instant) -> Result<Duration, Box<dyn Error>> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        Err("ICE connectivity probe exceeded its absolute deadline".into())
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn ice_probe_barrier_message(
+    stage: latencydesk_protocol::IceProbeStage,
+    stamp: SessionStamp,
+    ice_generation: u32,
+    client_nonce: [u8; 16],
+    host_nonce: [u8; 16],
+) -> latencydesk_protocol::IceProbeMessage {
+    latencydesk_protocol::IceProbeMessage {
+        version: latencydesk_protocol::IceProbeMessage::VERSION,
+        stage,
+        ice_generation,
+        stamp,
+        client_nonce,
+        host_nonce,
+        challenge: [0; 32],
+    }
+}
+
+async fn send_ice_probe_barrier(
+    session: &ProductSession,
+    message: latencydesk_protocol::IceProbeMessage,
+    timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    tokio::time::timeout(
+        timeout,
+        session.send_control(
+            latencydesk_protocol::ControlKind::IceProbe,
+            &message.encode()?,
+        ),
+    )
+    .await
+    .map_err(|_| "timed out sending ICE probe barrier")??;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn receive_ice_probe_barrier(
+    session: &ProductSession,
+    receiver: &mut ControlReceiver,
+    stage: latencydesk_protocol::IceProbeStage,
+    stamp: SessionStamp,
+    ice_generation: u32,
+    client_nonce: [u8; 16],
+    host_nonce: Option<[u8; 16]>,
+    timeout: Duration,
+) -> Result<latencydesk_protocol::IceProbeMessage, Box<dyn Error>> {
+    let control = tokio::time::timeout(timeout, receiver.next_control())
+        .await
+        .map_err(|_| "timed out receiving ICE probe barrier")??;
+    let message = if control.kind == latencydesk_protocol::ControlKind::IceProbe {
+        latencydesk_protocol::IceProbeMessage::decode(&control.payload)?
+    } else {
+        session.close(0x121, b"unexpected ICE probe control kind");
+        return Err(format!("expected ICE probe barrier, received {:?}", control.kind).into());
+    };
+    let host_matches = host_nonce.is_none_or(|expected| message.host_nonce == expected);
+    if message.stage != stage
+        || message.stamp != stamp
+        || message.ice_generation != ice_generation
+        || message.client_nonce != client_nonce
+        || !host_matches
+        || message.challenge != [0; 32]
+    {
+        session.close(0x121, b"invalid ICE probe barrier");
+        return Err("ICE probe barrier was not bound to the active transcript".into());
+    }
+    Ok(message)
 }
 
 fn run_input_latency_probes(
@@ -2210,6 +2646,18 @@ mod tests {
             config,
             codec_only
                 | latencydesk_protocol::video_capability_flags::AUTHENTICATED_ICE_CREDENTIALS
+        ));
+        let probe = latencydesk_protocol::VideoStreamConfig {
+            flags: latencydesk_protocol::video_stream_flags::AUTHENTICATED_ICE_CREDENTIALS
+                | latencydesk_protocol::video_stream_flags::ICE_CONNECTIVITY_PROBE,
+            ..config
+        };
+        let credentials_only = codec_only
+            | latencydesk_protocol::video_capability_flags::AUTHENTICATED_ICE_CREDENTIALS;
+        assert!(!stream_config_is_offered(probe, credentials_only));
+        assert!(stream_config_is_offered(
+            probe,
+            credentials_only | latencydesk_protocol::video_capability_flags::ICE_CONNECTIVITY_PROBE
         ));
     }
 

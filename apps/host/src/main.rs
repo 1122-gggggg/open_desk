@@ -48,6 +48,7 @@ Options:\n  \
   --fps <FPS>               Secure capture frame rate, 1..=240 (default 60)\n  \
   --frames <COUNT>          Stop streaming after N frames\n  \
   --max-sessions <COUNT>    Accept 1..=16 sequential secure sessions (Linux X11; default 1)\n  \
+  --ice-connectivity-probe  One authenticated IPv4 ICE probe (secure Linux X11 Host)\n  \
   --role host               Explicit role assertion\n  \
   --unsafe-udp-lab          Opt in to unauthenticated-server, plaintext legacy UDP\n  \
   --version, -V             Show the host version\n  \
@@ -86,6 +87,7 @@ pub struct HostArgs {
     pub identity_key: Option<PathBuf>,
     pub peer_cert: Option<PathBuf>,
     pub unsafe_udp_lab: bool,
+    pub ice_connectivity_probe: bool,
     pub show_version: bool,
     synthetic_geometry_explicit: bool,
     max_sessions_explicit: bool,
@@ -113,6 +115,7 @@ impl Default for HostArgs {
             identity_key: None,
             peer_cert: None,
             unsafe_udp_lab: false,
+            ice_connectivity_probe: false,
             show_version: false,
             synthetic_geometry_explicit: false,
             max_sessions_explicit: false,
@@ -248,6 +251,10 @@ where
                 config.unsafe_udp_lab = true;
                 i += 1;
             }
+            "--ice-connectivity-probe" => {
+                config.ice_connectivity_probe = true;
+                i += 1;
+            }
             "--version" | "-V" => {
                 config.show_version = true;
                 i += 1;
@@ -323,9 +330,33 @@ where
         return Err("--max-sessions is available only for secure Host mode".into());
     }
 
-    let has_identity_flag = config.identity_cert.is_some()
-        || config.identity_key.is_some()
-        || config.peer_cert.is_some();
+    if config.ice_connectivity_probe {
+        if config.unsafe_udp_lab {
+            return Err("--ice-connectivity-probe requires secure Host mode and cannot be combined with --unsafe-udp-lab".into());
+        }
+        if config.max_sessions != 1 {
+            return Err("--ice-connectivity-probe currently requires --max-sessions 1".into());
+        }
+        let ip = config.listen_addr.ip();
+        if !ip.is_ipv4()
+            || ip.is_unspecified()
+            || ip.is_multicast()
+            || matches!(ip, std::net::IpAddr::V4(v4) if v4.is_broadcast())
+        {
+            return Err("--ice-connectivity-probe requires a specific unicast IPv4 --listen IP (not unspecified, multicast, or broadcast)".into());
+        }
+        if config.listen_addr.port() == 0 {
+            return Err("--ice-connectivity-probe requires a nonzero --listen port".into());
+        }
+        if config.identity_cert.is_none()
+            || config.identity_key.is_none()
+            || config.peer_cert.is_none()
+        {
+            return Err("--ice-connectivity-probe requires --identity-cert, --identity-key, and --peer-cert".into());
+        }
+    }
+
+    let has_identity_flag = has_identity_flag(&config);
     if config.unsafe_udp_lab && has_identity_flag {
         return Err(
             "--identity-cert, --identity-key, and --peer-cert cannot be combined with --unsafe-udp-lab"
@@ -345,6 +376,10 @@ where
     }
 
     Ok(config)
+}
+
+fn has_identity_flag(config: &HostArgs) -> bool {
+    config.identity_cert.is_some() || config.identity_key.is_some() || config.peer_cert.is_some()
 }
 
 #[allow(dead_code)]
@@ -1060,9 +1095,97 @@ mod tests {
     fn host_defaults_to_secure_mode() {
         let args = parse_host_args_from(["latencydesk-host"]).expect("secure defaults parse");
         assert!(!args.unsafe_udp_lab);
+        assert!(!args.ice_connectivity_probe);
         assert!(args.identity_cert.is_none());
         assert!(args.identity_key.is_none());
         assert!(args.peer_cert.is_none());
+    }
+
+    #[test]
+    fn secure_loopback_ice_probe_requires_and_accepts_complete_identity() {
+        let args = parse_host_args_from([
+            "latencydesk-host",
+            "--listen",
+            "127.0.0.1:0",
+            "--identity-cert",
+            "host.der",
+            "--identity-key",
+            "host-key.der",
+            "--peer-cert",
+            "client.der",
+            "--ice-connectivity-probe",
+        ]);
+        assert!(args.is_err(), "probe must reject an ephemeral zero port");
+
+        let args = parse_host_args_from([
+            "latencydesk-host",
+            "--listen",
+            "127.0.0.1:9001",
+            "--identity-cert",
+            "host.der",
+            "--identity-key",
+            "host-key.der",
+            "--peer-cert",
+            "client.der",
+            "--ice-connectivity-probe",
+        ])
+        .expect("secure loopback probe configuration");
+        assert!(args.ice_connectivity_probe);
+        assert_eq!(args.max_sessions, 1);
+    }
+
+    #[test]
+    fn ice_probe_rejects_unsafe_legacy_and_non_unicast_listeners() {
+        let identity = [
+            "--identity-cert",
+            "host.der",
+            "--identity-key",
+            "host-key.der",
+            "--peer-cert",
+            "client.der",
+        ];
+        for listen in [
+            "0.0.0.0:9001",
+            "224.0.0.1:9001",
+            "255.255.255.255:9001",
+            "[::]:9001",
+            "[::1]:9001",
+        ] {
+            let mut args = vec![
+                "latencydesk-host",
+                "--listen",
+                listen,
+                "--ice-connectivity-probe",
+            ];
+            args.extend(identity);
+            assert!(
+                parse_host_args_from(args).is_err(),
+                "listener {listen} must be rejected"
+            );
+        }
+        assert!(parse_host_args_from([
+            "latencydesk-host",
+            "--unsafe-udp-lab",
+            "--ice-connectivity-probe",
+            "--listen",
+            "127.0.0.1:9001"
+        ])
+        .is_err());
+        assert!(parse_host_args_from([
+            "latencydesk-host",
+            "--ice-connectivity-probe",
+            "--listen",
+            "127.0.0.1:9001",
+            "--identity-cert",
+            "host.der",
+            "--identity-key",
+            "host-key.der",
+            "--peer-cert",
+            "client.der",
+            "--max-sessions",
+            "2"
+        ])
+        .is_err());
     }
 
     #[test]
