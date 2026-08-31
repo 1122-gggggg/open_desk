@@ -17,6 +17,7 @@ members = [
     "crates/platform-linux",
     "crates/protocol",
     "crates/runtime",
+    "crates/rendezvous",
     "crates/scheduler",
     "crates/session",
     "crates/socket-transport",
