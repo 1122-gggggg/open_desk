@@ -2230,6 +2230,7 @@ pub mod relay_flags {
     pub const FALLBACK_ACTIVE: u16 = 1 << 1;
     pub const HEARTBEAT: u16 = 1 << 2;
     pub const UPGRADE_ACK: u16 = 1 << 3;
+    pub(crate) const KNOWN: u16 = DIRECT_PROBE | FALLBACK_ACTIVE | HEARTBEAT | UPGRADE_ACK;
 }
 
 /// Fixed header for end-to-end encrypted relay packet framing.
@@ -2248,6 +2249,15 @@ impl RelayHeader {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.version != WIRE_VERSION {
             return Err(ProtocolError::UnsupportedVersion(self.version));
+        }
+        if self.provider == RelayProvider::None
+            || self.flags & !relay_flags::KNOWN != 0
+            || self.relay_session_id == 0
+            || self.source_peer_id == [0; 16]
+            || self.target_peer_id == [0; 16]
+            || self.source_peer_id == self.target_peer_id
+        {
+            return Err(ProtocolError::InvalidRelayHeader);
         }
         if self.payload_len > MAX_RELAY_PAYLOAD_BYTES {
             return Err(ProtocolError::ControlLength(self.payload_len));
@@ -2589,6 +2599,7 @@ pub enum ProtocolError {
     InvalidCandidateType(u8),
     InvalidTransportProtocol(u8),
     InvalidRelayProvider(u8),
+    InvalidRelayHeader,
     InvalidCandidateRelayProvider,
     InvalidCandidatePort,
     InvalidCandidateComponent,
@@ -3354,6 +3365,51 @@ mod tests {
         let decoded = RelayPacket::decode(&encoded).expect("decode");
         assert_eq!(decoded.header, header);
         assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn relay_header_rejects_zero_cross_peer_and_unknown_authority_fields() {
+        let valid = RelayHeader {
+            version: WIRE_VERSION,
+            provider: RelayProvider::Turn,
+            flags: relay_flags::FALLBACK_ACTIVE,
+            relay_session_id: 7,
+            source_peer_id: [1; 16],
+            target_peer_id: [2; 16],
+            payload_len: 1_200,
+        };
+        assert!(valid.encode().is_ok());
+        for invalid in [
+            RelayHeader {
+                relay_session_id: 0,
+                ..valid
+            },
+            RelayHeader {
+                provider: RelayProvider::None,
+                ..valid
+            },
+            RelayHeader {
+                source_peer_id: [0; 16],
+                ..valid
+            },
+            RelayHeader {
+                target_peer_id: [0; 16],
+                ..valid
+            },
+            RelayHeader {
+                target_peer_id: valid.source_peer_id,
+                ..valid
+            },
+            RelayHeader {
+                flags: 1 << 15,
+                ..valid
+            },
+        ] {
+            assert!(matches!(
+                invalid.encode(),
+                Err(ProtocolError::InvalidRelayHeader)
+            ));
+        }
     }
 
     #[test]
