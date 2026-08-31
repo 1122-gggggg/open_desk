@@ -35,7 +35,7 @@ jobs:
           components: rustfmt, clippy
       - name: Install Linux build and process-smoke dependencies
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y xvfb libx11-dev libxtst-dev
+        run: sudo apt-get update && sudo apt-get install -y xvfb libx11-dev libxtst-dev iproute2 nftables util-linux
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-targets --locked
@@ -48,7 +48,7 @@ jobs:
           python3 -c 'import json, pathlib; data = json.loads(pathlib.Path("artifacts/ci/multisession-stress.json").read_text()); assert data["schema"] == 1; assert data["concurrent_sessions"] == 8; assert data["profile_runs"] == data["unique_session_profile_runs"] == 32; assert data["submitted_frames"] == data["completed_frames"] + data["incomplete_frames"] + data["exact_mismatches"]; assert data["exact_mismatches"] == 0; assert data["max_input_service_pops"] == 1'
       - name: Build secure process-smoke binaries
         if: matrix.os == 'ubuntu-latest'
-        run: cargo build --locked -p latencydesk-host -p latencydesk-client -p latencydesk-identity -p latencydesk-rendezvousd -p latencydesk-turn-relayd -p latencydesk-route-probe
+        run: cargo build --locked -p latencydesk-host -p latencydesk-client -p latencydesk-identity -p latencydesk-rendezvousd -p latencydesk-turn-relayd -p latencydesk-route-probe -p latencydesk-product-probe
       - name: Two-path exact-mTLS promotion and rollback process smoke
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -82,6 +82,22 @@ jobs:
           path: artifacts/ci/rendezvous-process.json
           if-no-files-found: error
           retention-days: 30
+      - name: Concurrent exact-mTLS rendezvous multi-match smoke
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          python3 scripts/rendezvous_multi_process_test.py \
+            --server-bin target/debug/latencydesk-rendezvousd \
+            --client-bin target/debug/latencydesk-rendezvous-client \
+            --identity-bin target/debug/latencydesk-identity \
+            --timeout 20 --output artifacts/ci/rendezvous-multi-process.json
+      - name: Upload concurrent rendezvous evidence
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v7
+        with:
+          name: rendezvous-multi-process-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/ci/rendezvous-multi-process.json
+          if-no-files-found: error
+          retention-days: 30
       - name: Bounded RFC 8656 UDP TURN relay process smoke
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -95,6 +111,42 @@ jobs:
         with:
           name: turn-relay-process-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/ci/turn-relay-process.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Forced TURN exact-mTLS ProductSession smoke
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          python3 scripts/turn_product_process_test.py \
+            --relay-bin target/debug/latencydesk-turn-relayd \
+            --probe-bin target/debug/latencydesk-product-probe \
+            --identity-bin target/debug/latencydesk-identity \
+            --timeout 20 --output artifacts/ci/turn-product-process.json
+      - name: Upload forced TURN product evidence
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v7
+        with:
+          name: turn-product-process-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/ci/turn-product-process.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Isolated NAT behavior and exact-mTLS ProductSession matrices
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          python3 scripts/nat_netns_matrix.py run --allow-netns \
+            --output artifacts/ci/nat-behavior-matrix.json
+          python3 scripts/nat_product_netns_test.py --allow-netns \
+            --probe-bin target/debug/latencydesk-product-probe \
+            --identity-bin target/debug/latencydesk-identity \
+            --profiles lan-v4 eim-eif double-nat cgnat native-v6 \
+            --output artifacts/ci/nat-product-matrix.json
+      - name: Upload isolated NAT product evidence
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v7
+        with:
+          name: nat-product-matrix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            artifacts/ci/nat-behavior-matrix.json
+            artifacts/ci/nat-product-matrix.json
           if-no-files-found: error
           retention-days: 30
       - name: Secure QUIC/mTLS X11 process smoke
