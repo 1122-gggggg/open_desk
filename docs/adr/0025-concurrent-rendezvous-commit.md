@@ -30,6 +30,17 @@ A disconnected or expired waiter refunds exactly one registration and leaves a
 replay tombstone. After both CommitAck messages, Complete delivery failure does
 not roll back a match both peers already committed.
 
+`exchange_registration` returns `CommittedRendezvousDelivery`, not the raw
+delivery. Its fields and constructor are private, it has no `into_inner`, and
+only the validated Complete branch can create it. The token owns the exact
+local and peer `DeviceId` plus both canonical registrations so a later route
+coordinator need not duplicate secret-bearing registration state. Access is
+read-only and Debug renders both registrations as redacted. The token is
+same-process, non-serializable Rust type-state. It is not a durable
+cryptographic attestation, a third-party proof, or a stable commit-instance
+identity; callers that need those properties require a separately designed
+signed protocol.
+
 ## Evidence and limits
 
 The in-process fault gate disconnects the second peer after the first CommitAck

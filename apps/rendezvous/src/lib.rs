@@ -164,6 +164,57 @@ pub enum RendezvousResponse {
     Complete,
 }
 
+/// A same-process type-state capability released only after Complete.
+///
+/// The fields are intentionally private: callers cannot manufacture a value
+/// that bypasses DeliveryAck, CommitAck, and Complete validation. This value is
+/// not serializable durable attestation or third-party commit proof.
+pub struct CommittedRendezvousDelivery {
+    local_device: DeviceId,
+    peer_device: DeviceId,
+    local_registration: RendezvousRegistration,
+    peer_registration: RendezvousRegistration,
+}
+
+impl CommittedRendezvousDelivery {
+    #[must_use]
+    pub fn local_device(&self) -> DeviceId {
+        self.local_device
+    }
+
+    #[must_use]
+    pub fn peer_device(&self) -> DeviceId {
+        self.peer_device
+    }
+
+    #[must_use]
+    pub fn local_registration(&self) -> &RendezvousRegistration {
+        &self.local_registration
+    }
+
+    #[must_use]
+    pub fn peer_registration(&self) -> &RendezvousRegistration {
+        &self.peer_registration
+    }
+
+    #[must_use]
+    pub fn peer_candidate_count(&self) -> usize {
+        self.peer_registration.candidates.candidates.len()
+    }
+}
+
+impl fmt::Debug for CommittedRendezvousDelivery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommittedRendezvousDelivery")
+            .field("local_device", &self.local_device)
+            .field("peer_device", &self.peer_device)
+            .field("local_registration", &"<redacted>")
+            .field("peer_registration", &"<redacted>")
+            .finish()
+    }
+}
+
 impl fmt::Debug for RendezvousResponse {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -859,7 +910,7 @@ pub async fn exchange_registration(
     self_device: DeviceId,
     registration: RendezvousRegistration,
     total_timeout: Duration,
-) -> Result<RendezvousDelivery, ServiceError> {
+) -> Result<CommittedRendezvousDelivery, ServiceError> {
     let mut fail_closed = FailClosedConnection::new(&connection);
     if total_timeout.is_zero() {
         return Err(ServiceError::InvalidConfig);
@@ -961,7 +1012,12 @@ pub async fn exchange_registration(
                 }
                 connection.close(0, b"rendezvous delivery complete");
                 fail_closed.disarm();
-                return Ok(delivery);
+                return Ok(CommittedRendezvousDelivery {
+                    local_device: self_device,
+                    peer_device: delivery.peer,
+                    local_registration: registration,
+                    peer_registration: delivery.registration,
+                });
             }
         }
     }
@@ -1036,7 +1092,7 @@ mod tests {
         server_certificate: &[u8],
         self_device: DeviceId,
         registration: RendezvousRegistration,
-    ) -> Result<RendezvousDelivery, ServiceError> {
+    ) -> Result<CommittedRendezvousDelivery, ServiceError> {
         let connection = latencydesk_socket_transport::identity::connect_exact_peer(
             endpoint,
             address,
@@ -1216,8 +1272,36 @@ mod tests {
         let (delivery_a, delivery_b) = clients;
         assert_eq!(report.registrations, 2);
         assert_eq!(report.matched, 1);
-        assert_eq!(delivery_a.unwrap().peer, device_b);
-        assert_eq!(delivery_b.unwrap().peer, device_a);
+        let delivery_a = delivery_a.unwrap();
+        let delivery_b = delivery_b.unwrap();
+        assert_eq!(delivery_a.local_device(), device_a);
+        assert_eq!(delivery_a.peer_device(), device_b);
+        assert_eq!(delivery_b.local_device(), device_b);
+        assert_eq!(delivery_b.peer_device(), device_a);
+        assert_eq!(
+            delivery_a.local_registration().role,
+            RendezvousRole::Initiator
+        );
+        assert_eq!(
+            delivery_a.peer_registration().role,
+            RendezvousRole::Responder
+        );
+        assert_eq!(delivery_a.local_registration().match_id, [9; 16]);
+        assert_eq!(delivery_a.peer_registration().match_id, [9; 16]);
+        assert_eq!(delivery_a.local_registration().generation, 1);
+        assert_eq!(delivery_a.peer_registration().generation, 1);
+        assert_eq!(delivery_a.local_registration().credentials.exchange_id, 7);
+        assert_eq!(delivery_a.peer_registration().credentials.exchange_id, 7);
+        assert_eq!(
+            delivery_a.peer_registration().candidates.candidates[0].port,
+            5002
+        );
+        assert_eq!(delivery_a.peer_candidate_count(), 1);
+        let rendered = format!("{delivery_a:?}");
+        let password = "R".repeat(32);
+        for secret in ["rendezvous5001", "rendezvous5002", password.as_str()] {
+            assert!(!rendered.contains(secret));
+        }
         server_endpoint.close(0_u32.into(), b"test complete");
         endpoint_a.close(0_u32.into(), b"test complete");
         endpoint_b.close(0_u32.into(), b"test complete");
@@ -1409,8 +1493,8 @@ mod tests {
                 registration_for_match(RendezvousRole::Responder, device_a, 5403, [0xC2; 16],),
             ),
         );
-        assert_eq!(valid_a.unwrap().peer, device_b);
-        assert_eq!(valid_b.unwrap().peer, device_a);
+        assert_eq!(valid_a.unwrap().peer_device(), device_b);
+        assert_eq!(valid_b.unwrap().peer_device(), device_a);
         let report = server.await.unwrap().unwrap();
         assert_eq!(report.registrations, 2);
         assert_eq!(report.matched, 1);
@@ -1529,10 +1613,10 @@ mod tests {
         assert_eq!(report.registrations, 4);
         assert_eq!(report.matched, 2);
         let (a, b, c, d) = deliveries;
-        assert_eq!(a.unwrap().peer, devices[1]);
-        assert_eq!(b.unwrap().peer, devices[0]);
-        assert_eq!(c.unwrap().peer, devices[3]);
-        assert_eq!(d.unwrap().peer, devices[2]);
+        assert_eq!(a.unwrap().peer_device(), devices[1]);
+        assert_eq!(b.unwrap().peer_device(), devices[0]);
+        assert_eq!(c.unwrap().peer_device(), devices[3]);
+        assert_eq!(d.unwrap().peer_device(), devices[2]);
         slow.close(0, b"test complete");
         server_endpoint.close(0_u32.into(), b"test complete");
         for endpoint in endpoints {

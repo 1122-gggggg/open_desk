@@ -331,7 +331,14 @@ Explicit registration and match caps are related by `matches × 2 ≤
 registrations`. Delivery is one-shot and does not become client-visible success
 until both exact-mTLS peers complete `DeliveryAck → CommitAck` and receive the
 server's final `Complete`; disconnected, expired, aborted, and replayed state is
-tombstoned, while uncommitted registration capacity is refunded.
+tombstoned, while uncommitted registration capacity is refunded. The client API
+returns a non-constructible `CommittedRendezvousDelivery` only from that final
+branch. It owns both canonical local/peer registrations and exact device IDs,
+offers read-only accessors, has no `into_inner`, and redacts both registrations
+from `Debug`; route orchestration therefore cannot wrap arbitrary delivery
+metadata and call it committed inside that process. This is deliberately
+non-serializable Rust type-state, not a durable cryptographic attestation,
+third-party proof, or stable commit-instance identity.
 
 `scripts/rendezvous_process_test.py` first proves a stranger certificate cannot
 kill the listener, then proves both allowed clients receive the other's offer

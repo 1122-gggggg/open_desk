@@ -106,6 +106,11 @@ Authentication does not make payloads safe. All peer messages remain untrusted a
   rejection cap. Each connection gets one control lane/request. Delivery is a
   two-phase capability: both exact peers must acknowledge Delivery and Commit,
   and neither caller returns success before the server sends Complete.
+  Only that Complete branch constructs the opaque committed-delivery token;
+  callers have no constructor or inner-value escape hatch, receive only
+  read-only local/peer device and registration accessors, and Debug redacts
+  both secret-bearing registrations. This is same-process Rust type-state, not
+  serializable durable attestation, third-party proof, or commit-instance ID.
   Disconnection, expiry, or an unconfirmed match refunds only its own reserved
   registration capacity while retaining a replay tombstone. No
   product/input/media/relay lane is exposed. This is not yet a public trust,

@@ -206,7 +206,7 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
     println!(
         "rendezvous-client: matched=true role={:?} peer_candidates={} exact_mtls=true desktop_payload=false relay=false",
         args.role,
-        delivery.registration.candidates.candidates.len(),
+        delivery.peer_candidate_count(),
     );
     endpoint.close(0_u32.into(), b"rendezvous client complete");
     tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle())
