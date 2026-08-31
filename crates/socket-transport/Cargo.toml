@@ -12,11 +12,13 @@ getrandom = { workspace = true }
 ice-core = { workspace = true }
 latencydesk-protocol = { path = "../protocol" }
 latencydesk-transport = { path = "../transport" }
+latencydesk-turn-relay = { path = "../turn-relay" }
 quinn = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+quinn-udp = "=0.5.15"
 zeroize = { workspace = true }
 
 [lints]
