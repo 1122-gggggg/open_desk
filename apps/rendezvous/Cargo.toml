@@ -1,0 +1,18 @@
+[package]
+name = "latencydesk-rendezvousd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+latencydesk-protocol = { path = "../../crates/protocol" }
+latencydesk-rendezvous = { path = "../../crates/rendezvous" }
+quinn.workspace = true
+tokio.workspace = true
+latencydesk-socket-transport = { path = "../../crates/socket-transport" }
+zeroize.workspace = true
+
+[lints]
+workspace = true

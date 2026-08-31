@@ -691,6 +691,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "latencydesk-rendezvousd"
+version = "0.1.0-alpha.2"
+dependencies = [
+ "latencydesk-protocol",
+ "latencydesk-rendezvous",
+ "latencydesk-socket-transport",
+ "quinn",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "latencydesk-runtime"
 version = "0.1.0-alpha.2"
 dependencies = [
