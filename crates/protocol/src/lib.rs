@@ -1923,6 +1923,144 @@ impl IceCredentialExchange {
     }
 }
 
+/// Authenticated peer's role in one rendezvous match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum RendezvousRole {
+    Initiator = 1,
+    Responder = 2,
+}
+
+impl TryFrom<u8> for RendezvousRole {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Initiator),
+            2 => Ok(Self::Responder),
+            other => Err(ProtocolError::InvalidRendezvousRole(other)),
+        }
+    }
+}
+
+/// One bounded rendezvous registration carried only after the service has
+/// authenticated the connection's client certificate. The payload can carry
+/// connectivity metadata and short-term ICE credentials, never desktop data.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RendezvousRegistration {
+    pub version: u8,
+    pub role: RendezvousRole,
+    pub generation: u32,
+    pub ttl_seconds: u16,
+    pub match_id: [u8; 16],
+    pub expected_peer_fingerprint: [u8; 32],
+    pub credentials: IceCredentialExchange,
+    pub candidates: CandidateExchange,
+}
+
+impl RendezvousRegistration {
+    pub const VERSION: u8 = 1;
+    pub const HEADER_LEN: usize = 68;
+    pub const MIN_TTL_SECONDS: u16 = 5;
+    pub const MAX_TTL_SECONDS: u16 = 120;
+    pub const MAX_ENCODED_LEN: usize = 4 * 1024;
+
+    pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>, ProtocolError> {
+        self.validate()?;
+        let credentials = self.credentials.encode()?;
+        let candidates = self.candidates.encode()?;
+        let total = Self::HEADER_LEN
+            .checked_add(credentials.len())
+            .and_then(|value| value.checked_add(candidates.len()))
+            .ok_or(ProtocolError::PacketLength)?;
+        if total > Self::MAX_ENCODED_LEN {
+            return Err(ProtocolError::RendezvousLength(total));
+        }
+        let mut out = Zeroizing::new(Vec::with_capacity(total));
+        out.push(self.version);
+        out.push(self.role as u8);
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&self.generation.to_be_bytes());
+        out.extend_from_slice(&self.ttl_seconds.to_be_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&self.match_id);
+        out.extend_from_slice(&self.expected_peer_fingerprint);
+        out.extend_from_slice(&(credentials.len() as u32).to_be_bytes());
+        out.extend_from_slice(&(candidates.len() as u32).to_be_bytes());
+        out.extend_from_slice(&credentials);
+        out.extend_from_slice(&candidates);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        if bytes.len() > Self::MAX_ENCODED_LEN {
+            return Err(ProtocolError::RendezvousLength(bytes.len()));
+        }
+        if bytes.len() < Self::HEADER_LEN {
+            return Err(ProtocolError::Truncated {
+                expected: Self::HEADER_LEN,
+                actual: bytes.len(),
+            });
+        }
+        if bytes[2..4] != [0, 0] || bytes[10..12] != [0, 0] {
+            return Err(ProtocolError::ReservedBits);
+        }
+        let credentials_len = read_u32(bytes, 60) as usize;
+        let candidates_len = read_u32(bytes, 64) as usize;
+        let expected = Self::HEADER_LEN
+            .checked_add(credentials_len)
+            .and_then(|value| value.checked_add(candidates_len))
+            .ok_or(ProtocolError::PacketLength)?;
+        if expected != bytes.len() {
+            return Err(ProtocolError::PayloadLength {
+                expected,
+                actual: bytes.len(),
+            });
+        }
+        let credentials_end = Self::HEADER_LEN + credentials_len;
+        let mut match_id = [0_u8; 16];
+        match_id.copy_from_slice(&bytes[12..28]);
+        let mut expected_peer_fingerprint = [0_u8; 32];
+        expected_peer_fingerprint.copy_from_slice(&bytes[28..60]);
+        let registration = Self {
+            version: bytes[0],
+            role: RendezvousRole::try_from(bytes[1])?,
+            generation: read_u32(bytes, 4),
+            ttl_seconds: read_u16(bytes, 8),
+            match_id,
+            expected_peer_fingerprint,
+            credentials: IceCredentialExchange::decode(&bytes[Self::HEADER_LEN..credentials_end])?,
+            candidates: CandidateExchange::decode(&bytes[credentials_end..])?,
+        };
+        registration.validate()?;
+        Ok(registration)
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.version != Self::VERSION {
+            return Err(ProtocolError::UnsupportedVersion(self.version));
+        }
+        if self.generation == 0
+            || !(Self::MIN_TTL_SECONDS..=Self::MAX_TTL_SECONDS).contains(&self.ttl_seconds)
+            || self.match_id == [0; 16]
+            || self.expected_peer_fingerprint == [0; 32]
+            || self.credentials.generation != self.generation
+            || self.candidates.generation != self.generation
+            || self.credentials.exchange_id != self.candidates.exchange_id
+            || !matches!(
+                (self.role, self.credentials.role),
+                (RendezvousRole::Initiator, IceCredentialRole::Controlling)
+                    | (RendezvousRole::Responder, IceCredentialRole::Controlled)
+            )
+        {
+            return Err(ProtocolError::InvalidRendezvousRegistration);
+        }
+        self.credentials.validate()?;
+        self.candidates.encode()?;
+        Ok(())
+    }
+}
+
 fn secret_string_from_bytes(bytes: &[u8]) -> Result<String, ProtocolError> {
     match String::from_utf8(bytes.to_vec()) {
         Ok(value) => Ok(value),
@@ -2465,6 +2603,9 @@ pub enum ProtocolError {
     InvalidIceCredentialCharset,
     InvalidIceProbeStage(u8),
     InvalidIceProbeMessage,
+    InvalidRendezvousRole(u8),
+    InvalidRendezvousRegistration,
+    RendezvousLength(usize),
     CandidateExchangeCount(usize),
     CandidateExchangeLength(usize),
     DuplicateCandidate,
@@ -3564,5 +3705,96 @@ mod tests {
             Err(ProtocolError::InvalidIceProbeMessage)
         ));
         assert!(IceProbeMessage::decode(&[0; 3]).is_err());
+    }
+
+    fn rendezvous_registration(role: RendezvousRole) -> RendezvousRegistration {
+        RendezvousRegistration {
+            version: RendezvousRegistration::VERSION,
+            role,
+            generation: 1,
+            ttl_seconds: 30,
+            match_id: [0x44; 16],
+            expected_peer_fingerprint: [0x55; 32],
+            credentials: IceCredentialExchange::new(
+                1,
+                7,
+                1,
+                match role {
+                    RendezvousRole::Initiator => IceCredentialRole::Controlling,
+                    RendezvousRole::Responder => IceCredentialRole::Controlled,
+                },
+                "rendezvousUfrag".into(),
+                "R".repeat(32),
+            )
+            .unwrap(),
+            candidates: CandidateExchange {
+                version: CandidateExchange::VERSION,
+                exchange_id: 7,
+                generation: 1,
+                candidates: vec![exchange_candidate(WireIpAddr::V4([127, 0, 0, 1]), 5001)],
+            },
+        }
+    }
+
+    #[test]
+    fn rendezvous_registration_round_trip_is_bounded_and_secret_safe() {
+        let registration = rendezvous_registration(RendezvousRole::Initiator);
+        let encoded = registration.encode().unwrap();
+        assert_eq!(
+            RendezvousRegistration::decode(&encoded).unwrap(),
+            registration
+        );
+        let debug = format!("{registration:?}");
+        assert!(!debug.contains("rendezvousUfrag"));
+        assert!(!debug.contains(&"R".repeat(32)));
+        for end in 0..RendezvousRegistration::HEADER_LEN {
+            assert!(RendezvousRegistration::decode(&encoded[..end]).is_err());
+        }
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(RendezvousRegistration::decode(&trailing).is_err());
+        let mut declared = encoded.clone();
+        declared[60..64].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(RendezvousRegistration::decode(&declared).is_err());
+        let mut role = encoded;
+        role[1] = 9;
+        assert!(matches!(
+            RendezvousRegistration::decode(&role),
+            Err(ProtocolError::InvalidRendezvousRole(9))
+        ));
+        assert!(matches!(
+            RendezvousRegistration::decode(&vec![0; RendezvousRegistration::MAX_ENCODED_LEN + 1]),
+            Err(ProtocolError::RendezvousLength(_))
+        ));
+    }
+
+    #[test]
+    fn rendezvous_registration_rejects_identity_role_generation_and_ttl_drift() {
+        let mut registration = rendezvous_registration(RendezvousRole::Initiator);
+        registration.match_id = [0; 16];
+        assert!(matches!(
+            registration.encode(),
+            Err(ProtocolError::InvalidRendezvousRegistration)
+        ));
+        let mut registration = rendezvous_registration(RendezvousRole::Initiator);
+        registration.expected_peer_fingerprint = [0; 32];
+        assert!(registration.encode().is_err());
+        let mut registration = rendezvous_registration(RendezvousRole::Initiator);
+        registration.ttl_seconds = 121;
+        assert!(registration.encode().is_err());
+        let mut registration = rendezvous_registration(RendezvousRole::Initiator);
+        registration.candidates.generation = 2;
+        assert!(registration.encode().is_err());
+        let mut registration = rendezvous_registration(RendezvousRole::Initiator);
+        registration.credentials = IceCredentialExchange::new(
+            1,
+            7,
+            1,
+            IceCredentialRole::Controlled,
+            "rendezvousUfrag".into(),
+            "R".repeat(32),
+        )
+        .unwrap();
+        assert!(registration.encode().is_err());
     }
 }
