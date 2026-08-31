@@ -703,6 +703,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "latencydesk-route-probe"
+version = "0.1.0-alpha.2"
+dependencies = [
+ "latencydesk-protocol",
+ "latencydesk-socket-transport",
+ "latencydesk-transport",
+ "quinn",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "latencydesk-runtime"
 version = "0.1.0-alpha.2"
 dependencies = [

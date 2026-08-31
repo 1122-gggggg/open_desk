@@ -6,6 +6,7 @@ and the following QUIC connection use the same local UDP socket, then exchange
 a bounded candidate set inside the exact-mTLS product session without changing
 the active route. It is not ICE, NAT traversal, nomination, or authorization.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -49,7 +50,7 @@ HOST_LISTEN_RE = re.compile(
 HOST_PEER_RE = re.compile(r"^quic-peer:\s+source=(\S+)\s*$", re.I | re.M)
 CLIENT_LIFECYCLE_RE = re.compile(
     r"^handshake-lifecycle:\s*generation=(\d+)\s+authorization_epoch=(\d+)\s+"
-    r"display_epoch=(\d+)\s+codec_epoch=(\d+)\s*$",
+    r"display_epoch=(\d+)\s+codec_epoch=(\d+)\s+route_epoch=(\d+)\s*$",
     re.I | re.M,
 )
 CANDIDATE_EXCHANGE_RE = re.compile(
@@ -84,7 +85,9 @@ def encode_binding_request(transaction_id: bytes) -> bytes:
 def parse_binding_request(message: bytes) -> bytes:
     if len(message) != 28:
         raise ValueError("expected one fixed-size Binding request")
-    message_type, length, cookie, transaction_id = struct.unpack(">HHI12s", message[:20])
+    message_type, length, cookie, transaction_id = struct.unpack(
+        ">HHI12s", message[:20]
+    )
     kind, attribute_length, fingerprint = struct.unpack(">HHI", message[20:28])
     if (
         message_type != BINDING_REQUEST
@@ -107,18 +110,25 @@ def encode_binding_success(transaction_id: bytes, mapped: tuple[str, int]) -> by
         raise ValueError("mapped port must be nonzero")
     xor_port = port ^ (MAGIC_COOKIE >> 16)
     xor_address = bytes(
-        plain ^ mask for plain, mask in zip(packed_address, MAGIC_COOKIE.to_bytes(4, "big"))
+        plain ^ mask
+        for plain, mask in zip(packed_address, MAGIC_COOKIE.to_bytes(4, "big"))
     )
-    xor_attribute = struct.pack(">HHBBH4s", XOR_MAPPED_ADDRESS, 8, 0, 1, xor_port, xor_address)
+    xor_attribute = struct.pack(
+        ">HHBBH4s", XOR_MAPPED_ADDRESS, 8, 0, 1, xor_port, xor_address
+    )
     header = struct.pack(">HHI12s", BINDING_SUCCESS, 20, MAGIC_COOKIE, transaction_id)
     covered = header + xor_attribute
     return covered + struct.pack(">HHI", FINGERPRINT, 4, _fingerprint(covered))
 
 
-def parse_binding_success(message: bytes, expected_transaction_id: bytes) -> tuple[str, int]:
+def parse_binding_success(
+    message: bytes, expected_transaction_id: bytes
+) -> tuple[str, int]:
     if len(message) != 40 or len(expected_transaction_id) != 12:
         raise ValueError("expected one fixed-size IPv4 Binding success")
-    message_type, length, cookie, transaction_id = struct.unpack(">HHI12s", message[:20])
+    message_type, length, cookie, transaction_id = struct.unpack(
+        ">HHI12s", message[:20]
+    )
     kind, attribute_length, reserved, family, xor_port, xor_address = struct.unpack(
         ">HHBBH4s", message[20:32]
     )
@@ -217,7 +227,9 @@ def parse_candidate_exchange(
 ) -> dict[str, object]:
     matches = CANDIDATE_EXCHANGE_RE.findall(output)
     if len(matches) != 1:
-        raise ValueError("expected one complete authenticated candidate exchange record")
+        raise ValueError(
+            "expected one complete authenticated candidate exchange record"
+        )
     (
         authenticated,
         session_id,
@@ -234,7 +246,9 @@ def parse_candidate_exchange(
         route_changed,
     ) = matches[0]
     if authenticated.lower() != "true" or route_changed.lower() != "false":
-        raise ValueError("candidate exchange must be authenticated and route preserving")
+        raise ValueError(
+            "candidate exchange must be authenticated and route preserving"
+        )
     if require_active_route != bool(active_route):
         raise ValueError("candidate exchange active-route field has the wrong role")
     return {
@@ -357,7 +371,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--identity-bin", type=Path)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--frames", type=secure.bounded_int("frames", 2, 30), default=3)
-    parser.add_argument("--timeout", type=secure.bounded_int("timeout", 10, 120), default=45)
+    parser.add_argument(
+        "--timeout", type=secure.bounded_int("timeout", 10, 120), default=45
+    )
     return parser.parse_args(argv)
 
 
@@ -561,7 +577,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "identity_generation_ok": identity_generation_ok,
         "host_exit_zero": host_exit == 0 and not host_timed_out,
         "client_exit_zero": client_exit == 0 and not client_timed_out,
-        "fake_stun_request_valid": stun_observation.get("request_fingerprint_valid") is True
+        "fake_stun_request_valid": stun_observation.get("request_fingerprint_valid")
+        is True
         and stun_observation.get("request_bytes") == 28
         and stun_observation.get("response_bytes") == 40,
         "same_socket_stun_and_quic_sources": same_socket,

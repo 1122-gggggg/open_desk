@@ -388,11 +388,12 @@ mod linux {
             };
             println!("session: active session_id={}", session_stamp.session_id);
             println!(
-            "session-lifecycle: generation={} authorization_epoch={} display_epoch={} codec_epoch={}",
+            "session-lifecycle: generation={} authorization_epoch={} display_epoch={} codec_epoch={} route_epoch={}",
             session_stamp.generation,
             session_stamp.authorization_epoch,
             session_stamp.display_epoch,
-            session_stamp.codec_epoch
+            session_stamp.codec_epoch,
+            session_stamp.route_epoch
         );
             let negotiation_result = async {
             let mut control_receiver = tokio::time::timeout(
@@ -1909,11 +1910,12 @@ mod windows {
         };
         println!("session: active session_id={}", session_stamp.session_id);
         println!(
-            "session-lifecycle: generation={} authorization_epoch={} display_epoch={} codec_epoch={}",
+            "session-lifecycle: generation={} authorization_epoch={} display_epoch={} codec_epoch={} route_epoch={}",
             session_stamp.generation,
             session_stamp.authorization_epoch,
             session_stamp.display_epoch,
-            session_stamp.codec_epoch
+            session_stamp.codec_epoch,
+            session_stamp.route_epoch
         );
         let negotiation_result = async {
             let mut control_receiver = tokio::time::timeout(

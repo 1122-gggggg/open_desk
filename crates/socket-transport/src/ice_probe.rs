@@ -447,6 +447,7 @@ mod tests {
             authorization_epoch: 3,
             display_epoch: 4,
             codec_epoch: 5,
+            route_epoch: 1,
         }
     }
 

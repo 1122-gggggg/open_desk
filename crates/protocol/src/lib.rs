@@ -11,7 +11,7 @@ pub mod quic;
 pub mod stun;
 
 /// Current wire protocol version.
-pub const WIRE_VERSION: u8 = 1;
+pub const WIRE_VERSION: u8 = 2;
 /// Fixed media fragment header length in bytes.
 pub const MEDIA_HEADER_LEN: usize = 44;
 /// Fixed reliable-control header length in bytes.
@@ -253,6 +253,11 @@ pub enum ControlKind {
     UnattendedAuth = 20,
     IceCredentials = 21,
     IceProbe = 22,
+    RoutePrepare = 23,
+    RoutePrepared = 24,
+    RouteCommit = 25,
+    RouteActivated = 26,
+    RouteConfirmed = 27,
 }
 
 impl TryFrom<u8> for ControlKind {
@@ -282,8 +287,128 @@ impl TryFrom<u8> for ControlKind {
             20 => Ok(Self::UnattendedAuth),
             21 => Ok(Self::IceCredentials),
             22 => Ok(Self::IceProbe),
+            23 => Ok(Self::RoutePrepare),
+            24 => Ok(Self::RoutePrepared),
+            25 => Ok(Self::RouteCommit),
+            26 => Ok(Self::RouteActivated),
+            27 => Ok(Self::RouteConfirmed),
             other => Err(ProtocolError::UnknownControlKind(other)),
         }
+    }
+}
+
+/// Authenticated two-phase route transition stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum RouteTransitionStage {
+    Prepare = 1,
+    Prepared = 2,
+    Commit = 3,
+    Activated = 4,
+    Confirmed = 5,
+}
+
+impl RouteTransitionStage {
+    #[must_use]
+    pub const fn control_kind(self) -> ControlKind {
+        match self {
+            Self::Prepare => ControlKind::RoutePrepare,
+            Self::Prepared => ControlKind::RoutePrepared,
+            Self::Commit => ControlKind::RouteCommit,
+            Self::Activated => ControlKind::RouteActivated,
+            Self::Confirmed => ControlKind::RouteConfirmed,
+        }
+    }
+}
+
+impl TryFrom<u8> for RouteTransitionStage {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Prepare),
+            2 => Ok(Self::Prepared),
+            3 => Ok(Self::Commit),
+            4 => Ok(Self::Activated),
+            5 => Ok(Self::Confirmed),
+            other => Err(ProtocolError::InvalidRouteTransitionStage(other)),
+        }
+    }
+}
+
+/// Fixed-width prepare/prepared/commit transcript carried on authenticated
+/// product control records. The route digest binds the exact candidate tuple;
+/// the transcript digest binds its exact-mTLS/ICE/consent proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RouteTransitionMessage {
+    pub version: u8,
+    pub stage: RouteTransitionStage,
+    pub sequence: u64,
+    pub base_route_epoch: u64,
+    pub next_route_epoch: u64,
+    pub expires_at_ns: u64,
+    pub route_digest: [u8; 32],
+    pub transcript_digest: [u8; 32],
+}
+
+impl RouteTransitionMessage {
+    pub const ENCODED_LEN: usize = 100;
+
+    pub fn validate(self) -> Result<(), ProtocolError> {
+        if self.version != WIRE_VERSION
+            || self.sequence == 0
+            || self.base_route_epoch == 0
+            || self.base_route_epoch.checked_add(1) != Some(self.next_route_epoch)
+            || self.expires_at_ns == 0
+            || self.route_digest == [0; 32]
+            || self.transcript_digest == [0; 32]
+        {
+            return Err(ProtocolError::InvalidRouteTransition);
+        }
+        Ok(())
+    }
+
+    pub fn encode(self) -> Result<[u8; Self::ENCODED_LEN], ProtocolError> {
+        self.validate()?;
+        let mut out = [0_u8; Self::ENCODED_LEN];
+        out[0] = self.version;
+        out[1] = self.stage as u8;
+        // 2..4 reserved.
+        out[4..12].copy_from_slice(&self.sequence.to_be_bytes());
+        out[12..20].copy_from_slice(&self.base_route_epoch.to_be_bytes());
+        out[20..28].copy_from_slice(&self.next_route_epoch.to_be_bytes());
+        out[28..36].copy_from_slice(&self.expires_at_ns.to_be_bytes());
+        out[36..68].copy_from_slice(&self.route_digest);
+        out[68..100].copy_from_slice(&self.transcript_digest);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        if bytes.len() != Self::ENCODED_LEN {
+            return Err(ProtocolError::PayloadLength {
+                expected: Self::ENCODED_LEN,
+                actual: bytes.len(),
+            });
+        }
+        if bytes[2..4] != [0, 0] {
+            return Err(ProtocolError::ReservedBits);
+        }
+        let mut route_digest = [0; 32];
+        route_digest.copy_from_slice(&bytes[36..68]);
+        let mut transcript_digest = [0; 32];
+        transcript_digest.copy_from_slice(&bytes[68..100]);
+        let message = Self {
+            version: bytes[0],
+            stage: RouteTransitionStage::try_from(bytes[1])?,
+            sequence: read_u64(bytes, 4),
+            base_route_epoch: read_u64(bytes, 12),
+            next_route_epoch: read_u64(bytes, 20),
+            expires_at_ns: read_u64(bytes, 28),
+            route_digest,
+            transcript_digest,
+        };
+        message.validate()?;
+        Ok(message)
     }
 }
 
@@ -971,7 +1096,7 @@ pub struct InputAppliedAck {
 }
 
 impl InputAppliedAck {
-    pub const ENCODED_LEN: usize = 56;
+    pub const ENCODED_LEN: usize = 64;
 
     pub fn encode(self) -> Result<[u8; Self::ENCODED_LEN], ProtocolError> {
         self.validate()?;
@@ -984,11 +1109,12 @@ impl InputAppliedAck {
         out[20..24].copy_from_slice(&self.stamp.authorization_epoch.to_be_bytes());
         out[24..28].copy_from_slice(&self.stamp.display_epoch.to_be_bytes());
         out[28..32].copy_from_slice(&self.stamp.codec_epoch.to_be_bytes());
-        out[32..36].copy_from_slice(&self.input_epoch.to_be_bytes());
-        out[36..44].copy_from_slice(&self.input_sequence.to_be_bytes());
-        out[44..52].copy_from_slice(&self.ack_sequence.to_be_bytes());
-        out[52..54].copy_from_slice(&self.applied_action_count.to_be_bytes());
-        // 54..56 reserved
+        out[32..40].copy_from_slice(&self.stamp.route_epoch.to_be_bytes());
+        out[40..44].copy_from_slice(&self.input_epoch.to_be_bytes());
+        out[44..52].copy_from_slice(&self.input_sequence.to_be_bytes());
+        out[52..60].copy_from_slice(&self.ack_sequence.to_be_bytes());
+        out[60..62].copy_from_slice(&self.applied_action_count.to_be_bytes());
+        // 62..64 reserved
         Ok(out)
     }
 
@@ -1002,7 +1128,7 @@ impl InputAppliedAck {
         if bytes[0] != WIRE_VERSION {
             return Err(ProtocolError::UnsupportedVersion(bytes[0]));
         }
-        if bytes[2..4] != [0, 0] || bytes[54..56] != [0, 0] {
+        if bytes[2..4] != [0, 0] || bytes[62..64] != [0, 0] {
             return Err(ProtocolError::ReservedBits);
         }
         let ack = Self {
@@ -1012,12 +1138,13 @@ impl InputAppliedAck {
                 authorization_epoch: read_u32(bytes, 20),
                 display_epoch: read_u32(bytes, 24),
                 codec_epoch: read_u32(bytes, 28),
+                route_epoch: read_u64(bytes, 32),
             },
-            input_epoch: read_u32(bytes, 32),
-            input_sequence: read_u64(bytes, 36),
-            ack_sequence: read_u64(bytes, 44),
+            input_epoch: read_u32(bytes, 40),
+            input_sequence: read_u64(bytes, 44),
+            ack_sequence: read_u64(bytes, 52),
             status: InputAckStatus::try_from(bytes[1])?,
-            applied_action_count: read_u16(bytes, 52),
+            applied_action_count: read_u16(bytes, 60),
         };
         ack.validate()?;
         Ok(ack)
@@ -1205,8 +1332,8 @@ pub struct IceProbeMessage {
 }
 
 impl IceProbeMessage {
-    pub const VERSION: u8 = 1;
-    pub const ENCODED_LEN: usize = 100;
+    pub const VERSION: u8 = WIRE_VERSION;
+    pub const ENCODED_LEN: usize = 108;
 
     pub fn encode(self) -> Result<[u8; Self::ENCODED_LEN], ProtocolError> {
         self.validate()?;
@@ -1219,9 +1346,10 @@ impl IceProbeMessage {
         out[24..28].copy_from_slice(&self.stamp.authorization_epoch.to_be_bytes());
         out[28..32].copy_from_slice(&self.stamp.display_epoch.to_be_bytes());
         out[32..36].copy_from_slice(&self.stamp.codec_epoch.to_be_bytes());
-        out[36..52].copy_from_slice(&self.client_nonce);
-        out[52..68].copy_from_slice(&self.host_nonce);
-        out[68..100].copy_from_slice(&self.challenge);
+        out[36..44].copy_from_slice(&self.stamp.route_epoch.to_be_bytes());
+        out[44..60].copy_from_slice(&self.client_nonce);
+        out[60..76].copy_from_slice(&self.host_nonce);
+        out[76..108].copy_from_slice(&self.challenge);
         Ok(out)
     }
 
@@ -1236,11 +1364,11 @@ impl IceProbeMessage {
             return Err(ProtocolError::ReservedBits);
         }
         let mut client_nonce = [0_u8; 16];
-        client_nonce.copy_from_slice(&bytes[36..52]);
+        client_nonce.copy_from_slice(&bytes[44..60]);
         let mut host_nonce = [0_u8; 16];
-        host_nonce.copy_from_slice(&bytes[52..68]);
+        host_nonce.copy_from_slice(&bytes[60..76]);
         let mut challenge = [0_u8; 32];
-        challenge.copy_from_slice(&bytes[68..100]);
+        challenge.copy_from_slice(&bytes[76..108]);
         let message = Self {
             version: bytes[0],
             stage: IceProbeStage::try_from(bytes[1])?,
@@ -1251,6 +1379,7 @@ impl IceProbeMessage {
                 authorization_epoch: read_u32(bytes, 24),
                 display_epoch: read_u32(bytes, 28),
                 codec_epoch: read_u32(bytes, 32),
+                route_epoch: read_u64(bytes, 36),
             },
             client_nonce,
             host_nonce,
@@ -2614,6 +2743,8 @@ pub enum ProtocolError {
     InvalidIceCredentialCharset,
     InvalidIceProbeStage(u8),
     InvalidIceProbeMessage,
+    InvalidRouteTransitionStage(u8),
+    InvalidRouteTransition,
     InvalidRendezvousRole(u8),
     InvalidRendezvousRegistration,
     RendezvousLength(usize),
@@ -2649,6 +2780,7 @@ mod tests {
             authorization_epoch: 3,
             display_epoch: 4,
             codec_epoch: 5,
+            route_epoch: 1,
         };
         let ack = InputAppliedAck {
             stamp,
@@ -2659,7 +2791,43 @@ mod tests {
             applied_action_count: 1,
         };
         let encoded = ack.encode().expect("ack encode");
+        assert_eq!(encoded.len(), 64);
+        assert_eq!(&encoded[32..40], &stamp.route_epoch.to_be_bytes());
         assert_eq!(InputAppliedAck::decode(&encoded).expect("ack decode"), ack);
+
+        let mut old_version = encoded;
+        old_version[0] = 1;
+        assert_eq!(
+            InputAppliedAck::decode(&old_version),
+            Err(ProtocolError::UnsupportedVersion(1))
+        );
+        assert!(matches!(
+            InputAppliedAck::decode(&encoded[..56]),
+            Err(ProtocolError::PayloadLength {
+                expected: 64,
+                actual: 56
+            })
+        ));
+        let mut trailing = encoded.to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            InputAppliedAck::decode(&trailing),
+            Err(ProtocolError::PayloadLength {
+                expected: 64,
+                actual: 65
+            })
+        ));
+        assert_eq!(
+            InputAppliedAck {
+                stamp: quic::SessionStamp {
+                    route_epoch: 0,
+                    ..stamp
+                },
+                ..ack
+            }
+            .encode(),
+            Err(ProtocolError::InvalidSessionStamp)
+        );
 
         let mut malformed = encoded;
         malformed[1] = 0xff;
@@ -2685,6 +2853,79 @@ mod tests {
             ..ack
         };
         assert_eq!(invalid.encode(), Err(ProtocolError::InvalidInputAck));
+    }
+
+    #[test]
+    fn route_transition_wire_is_stage_kind_epoch_and_digest_bound() {
+        let message = RouteTransitionMessage {
+            version: WIRE_VERSION,
+            stage: RouteTransitionStage::Prepare,
+            sequence: 7,
+            base_route_epoch: 1,
+            next_route_epoch: 2,
+            expires_at_ns: 99,
+            route_digest: [3; 32],
+            transcript_digest: [4; 32],
+        };
+        let encoded = message.encode().unwrap();
+        assert_eq!(RouteTransitionMessage::decode(&encoded), Ok(message));
+        assert_eq!(message.stage.control_kind(), ControlKind::RoutePrepare);
+        assert!(matches!(
+            RouteTransitionMessage::decode(&encoded[..99]),
+            Err(ProtocolError::PayloadLength {
+                expected: 100,
+                actual: 99
+            })
+        ));
+        let mut trailing = encoded.to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            RouteTransitionMessage::decode(&trailing),
+            Err(ProtocolError::PayloadLength {
+                expected: 100,
+                actual: 101
+            })
+        ));
+        for stage in [
+            RouteTransitionStage::Prepare,
+            RouteTransitionStage::Prepared,
+            RouteTransitionStage::Commit,
+            RouteTransitionStage::Activated,
+            RouteTransitionStage::Confirmed,
+        ] {
+            assert_eq!(
+                ControlKind::try_from(stage.control_kind() as u8),
+                Ok(stage.control_kind())
+            );
+        }
+
+        let mut invalid = encoded;
+        invalid[20..28].copy_from_slice(&3_u64.to_be_bytes());
+        assert_eq!(
+            RouteTransitionMessage::decode(&invalid),
+            Err(ProtocolError::InvalidRouteTransition)
+        );
+        let mut invalid = encoded;
+        invalid[36..68].fill(0);
+        assert_eq!(
+            RouteTransitionMessage::decode(&invalid),
+            Err(ProtocolError::InvalidRouteTransition)
+        );
+        let mut invalid = encoded;
+        invalid[2] = 1;
+        assert_eq!(
+            RouteTransitionMessage::decode(&invalid),
+            Err(ProtocolError::ReservedBits)
+        );
+        assert_eq!(
+            RouteTransitionMessage {
+                base_route_epoch: u64::MAX,
+                next_route_epoch: 0,
+                ..message
+            }
+            .encode(),
+            Err(ProtocolError::InvalidRouteTransition)
+        );
     }
 
     fn valid_header() -> MediaHeader {
@@ -3706,6 +3947,7 @@ mod tests {
             authorization_epoch: 9,
             display_epoch: 10,
             codec_epoch: 11,
+            route_epoch: 1,
         };
         let client_nonce = [0x11; 16];
         let host_nonce = [0x22; 16];
@@ -3746,6 +3988,9 @@ mod tests {
                 IceProbeMessage::decode(&message.encode().unwrap()).unwrap(),
                 message
             );
+            let encoded = message.encode().unwrap();
+            assert_eq!(encoded.len(), 108);
+            assert_eq!(&encoded[36..44], &stamp.route_epoch.to_be_bytes());
         }
         let invalid = IceProbeMessage {
             version: IceProbeMessage::VERSION,
@@ -3761,6 +4006,49 @@ mod tests {
             Err(ProtocolError::InvalidIceProbeMessage)
         ));
         assert!(IceProbeMessage::decode(&[0; 3]).is_err());
+        let valid = IceProbeMessage {
+            version: IceProbeMessage::VERSION,
+            stage: IceProbeStage::EchoRequest,
+            ice_generation: 1,
+            stamp,
+            client_nonce,
+            host_nonce,
+            challenge,
+        };
+        let encoded = valid.encode().unwrap();
+        let mut old_version = encoded;
+        old_version[0] = 1;
+        assert_eq!(
+            IceProbeMessage::decode(&old_version),
+            Err(ProtocolError::InvalidIceProbeMessage)
+        );
+        assert!(matches!(
+            IceProbeMessage::decode(&encoded[..100]),
+            Err(ProtocolError::PayloadLength {
+                expected: 108,
+                actual: 100
+            })
+        ));
+        let mut trailing = encoded.to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            IceProbeMessage::decode(&trailing),
+            Err(ProtocolError::PayloadLength {
+                expected: 108,
+                actual: 109
+            })
+        ));
+        assert_eq!(
+            IceProbeMessage {
+                stamp: quic::SessionStamp {
+                    route_epoch: 0,
+                    ..stamp
+                },
+                ..valid
+            }
+            .encode(),
+            Err(ProtocolError::InvalidIceProbeMessage)
+        );
     }
 
     fn rendezvous_registration(role: RendezvousRole) -> RendezvousRegistration {

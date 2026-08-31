@@ -150,6 +150,7 @@ impl ProductStampAllocator {
             authorization_epoch: self.next_authorization_epoch,
             display_epoch: self.next_display_epoch,
             codec_epoch: self.next_codec_epoch,
+            route_epoch: 1,
         };
         self.next_generation = following_generation;
         self.next_authorization_epoch = following_authorization;
@@ -196,6 +197,8 @@ mod tests {
         assert!(second.authorization_epoch > first.authorization_epoch);
         assert!(second.display_epoch > first.display_epoch);
         assert!(second.codec_epoch > first.codec_epoch);
+        assert_eq!(first.route_epoch, 1);
+        assert_eq!(second.route_epoch, 1);
     }
 
     #[test]

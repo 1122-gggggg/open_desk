@@ -5,6 +5,7 @@ The Client measures its local send-to-ACK interval. The Host creates the ACK
 only after reconciliation, XTEST submission, and a following X11 reply. This is
 application-ACK RTT, not input-to-photon latency and not an AnyDesk comparison.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -45,11 +46,11 @@ FIELD_RE = re.compile(r"(\w+)=(.*?)(?=\s+\w+=|$)")
 SAMPLE_RE = re.compile(r"^(\d+):(\d+)$")
 UNSAFE = "--unsafe-udp-lab"
 HOST_LIFECYCLE_RE = re.compile(
-    r"^session-lifecycle:\s*generation=(\d+)\s+authorization_epoch=(\d+)\s+display_epoch=(\d+)\s+codec_epoch=(\d+)\s*$",
+    r"^session-lifecycle:\s*generation=(\d+)\s+authorization_epoch=(\d+)\s+display_epoch=(\d+)\s+codec_epoch=(\d+)\s+route_epoch=(\d+)\s*$",
     re.I | re.M,
 )
 CLIENT_LIFECYCLE_RE = re.compile(
-    r"^handshake-lifecycle:\s*generation=(\d+)\s+authorization_epoch=(\d+)\s+display_epoch=(\d+)\s+codec_epoch=(\d+)\s*$",
+    r"^handshake-lifecycle:\s*generation=(\d+)\s+authorization_epoch=(\d+)\s+display_epoch=(\d+)\s+codec_epoch=(\d+)\s+route_epoch=(\d+)\s*$",
     re.I | re.M,
 )
 
@@ -65,9 +66,15 @@ def recompute(samples: Sequence[tuple[int, int]]) -> dict[str, int]:
     values = [value for _, value in samples]
     if not values or any(not math.isfinite(value) or value < 0 for value in values):
         raise ValueError("latencies must be finite and non-negative")
-    return {"samples": len(values), "min_us": min(values), "p50_us": nearest_rank(values, 50),
-            "p95_us": nearest_rank(values, 95), "p99_us": nearest_rank(values, 99),
-            "max_us": max(values), "mean_us": sum(values) // len(values)}
+    return {
+        "samples": len(values),
+        "min_us": min(values),
+        "p50_us": nearest_rank(values, 50),
+        "p95_us": nearest_rank(values, 95),
+        "p99_us": nearest_rank(values, 99),
+        "max_us": max(values),
+        "mean_us": sum(values) // len(values),
+    }
 
 
 def parse_input_latency(output: str) -> dict[str, object]:
@@ -75,8 +82,19 @@ def parse_input_latency(output: str) -> dict[str, object]:
     if len(matches) != 1:
         raise ValueError("expected exactly one input-latency line")
     fields = dict(FIELD_RE.findall(matches[0]))
-    required = {"session_id", "authorization_epoch", "raw_us", "samples", "min_us",
-                "p50_us", "p95_us", "p99_us", "max_us", "mean_us"}
+    required = {
+        "session_id",
+        "authorization_epoch",
+        "route_epoch",
+        "raw_us",
+        "samples",
+        "min_us",
+        "p50_us",
+        "p95_us",
+        "p99_us",
+        "max_us",
+        "mean_us",
+    }
     if not required <= fields.keys():
         raise ValueError("input-latency line is missing fields")
     try:
@@ -86,17 +104,36 @@ def parse_input_latency(output: str) -> dict[str, object]:
             if not match:
                 raise ValueError("invalid raw sample")
             samples.append((int(match.group(1)), int(match.group(2))))
-        result: dict[str, object] = {"session_id": int(fields["session_id"]),
-            "authorization_epoch": int(fields["authorization_epoch"]), "samples": samples}
-        result["summary"] = {key: int(fields[key])
-                              for key in ("samples", "min_us", "p50_us", "p95_us", "p99_us", "max_us", "mean_us")}
+        result: dict[str, object] = {
+            "session_id": int(fields["session_id"]),
+            "authorization_epoch": int(fields["authorization_epoch"]),
+            "route_epoch": int(fields["route_epoch"]),
+            "samples": samples,
+        }
+        result["summary"] = {
+            key: int(fields[key])
+            for key in (
+                "samples",
+                "min_us",
+                "p50_us",
+                "p95_us",
+                "p99_us",
+                "max_us",
+                "mean_us",
+            )
+        }
         return result
     except (TypeError, ValueError) as error:
         raise ValueError("malformed input-latency fields") from error
 
 
-def validate_probe(parsed: dict[str, object], requested: int, host_lifecycle: Sequence[tuple[int, int]],
-                   client_lifecycle: Sequence[tuple[int, int]], ceiling_us: float = 100_000) -> list[str]:
+def validate_probe(
+    parsed: dict[str, object],
+    requested: int,
+    host_lifecycle: Sequence[tuple[int, int]],
+    client_lifecycle: Sequence[tuple[int, int]],
+    ceiling_us: float = 100_000,
+) -> list[str]:
     errors: list[str] = []
     samples = parsed.get("samples", [])
     if not isinstance(samples, list) or len(samples) != requested:
@@ -112,8 +149,18 @@ def validate_probe(parsed: dict[str, object], requested: int, host_lifecycle: Se
             errors.append("loopback p95 exceeds sanity ceiling")
     except (TypeError, ValueError):
         errors.append("raw samples are invalid")
-    stamp = (int(parsed.get("session_id", 0)), int(parsed.get("authorization_epoch", 0)))
-    if stamp[0] <= 0 or stamp[1] <= 0 or stamp not in set(host_lifecycle) or stamp not in set(client_lifecycle):
+    stamp = (
+        int(parsed.get("session_id", 0)),
+        int(parsed.get("authorization_epoch", 0)),
+    )
+    if int(parsed.get("route_epoch", 0)) <= 0:
+        errors.append("route epoch is missing or inactive")
+    if (
+        stamp[0] <= 0
+        or stamp[1] <= 0
+        or stamp not in set(host_lifecycle)
+        or stamp not in set(client_lifecycle)
+    ):
         errors.append("session/authorization epoch does not match both lifecycle logs")
     return errors
 
@@ -177,7 +224,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--client-bin", type=Path)
     parser.add_argument("--identity-bin", type=Path)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--samples", type=bounded_int("samples", 100, 1024), default=128)
+    parser.add_argument(
+        "--samples", type=bounded_int("samples", 100, 1024), default=128
+    )
     parser.add_argument("--timeout", type=bounded_int("timeout", 10, 120), default=30)
     args = parser.parse_args(argv)
     revision, dirty = repository_state()

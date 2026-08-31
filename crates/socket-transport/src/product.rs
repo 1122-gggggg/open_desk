@@ -11,16 +11,18 @@ use latencydesk_protocol::quic::{
 };
 use latencydesk_protocol::{
     CandidateExchange, ControlHeader, ControlKind, ControlPacket, HandshakeCompletedMessage,
-    IceCredentialExchange, IceCredentialRole, ProtocolError, VideoCodecCapabilities,
-    VideoStreamConfig, MEDIA_HEADER_LEN,
+    IceCredentialExchange, IceCredentialRole, ProtocolError, RouteTransitionMessage,
+    RouteTransitionStage, VideoCodecCapabilities, VideoStreamConfig, MEDIA_HEADER_LEN,
 };
 use latencydesk_transport::{
     frame_fragments_with_packet_budget, FragmentSpec, IngestOutcome, ReassembledFrame, Reassembler,
     ReassemblyConfig, TransportError, MAX_DATAGRAM_MTU,
 };
+use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -31,6 +33,10 @@ const ACTIVE_EPOCH: u32 = 1;
 const DEFAULT_PRODUCT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const PRODUCT_HANDSHAKE_TIMEOUT_CODE: u32 = 0x102;
 const PRODUCT_HANDSHAKE_TIMEOUT_REASON: &[u8] = b"product handshake timed out";
+#[cfg(not(test))]
+const ROUTE_TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const ROUTE_TRANSITION_TIMEOUT: Duration = Duration::from_millis(100);
 // The legacy handshake message reserves a nonce field. TLS already provides
 // freshness for this adapter, so one canonical value avoids inventing a second
 // unauthenticated challenge protocol.
@@ -42,7 +48,12 @@ const POST_MTLS_NONCE: [u8; 16] = [0; 16];
 pub struct ProductSession {
     connection: QuicConnection,
     stamp: SessionStamp,
+    route_epoch: Arc<AtomicU64>,
+    route_sequence: Arc<AtomicU64>,
+    route_authorized: Arc<AtomicBool>,
     reassembler: Arc<Mutex<Reassembler>>,
+    reassembly_config: ReassemblyConfig,
+    reassembly_route_epoch: Arc<AtomicU64>,
     last_delivered_frame_id: Arc<Mutex<Option<u64>>>,
     clock_origin: Instant,
     inbound_control: Arc<Mutex<Option<QuicInboundStream>>>,
@@ -51,8 +62,33 @@ pub struct ProductSession {
     ice_roles: Arc<Mutex<Option<IceSignalingRoles>>>,
     ice_role_assignment: IceSignalingRoles,
     control_send: Arc<Mutex<()>>,
+    route_transition: Arc<Mutex<RouteWireState>>,
     #[cfg(test)]
     ice_send_cancellation_hook: Option<Arc<IceSendCancellationHook>>,
+    #[cfg(test)]
+    route_send_cancellation_hook: Option<Arc<IceSendCancellationHook>>,
+}
+
+/// A fully exact-mTLS-authenticated candidate with no application-lane
+/// authority until consumed by [`ProductRouteSet`].
+#[derive(Debug)]
+pub struct UnauthorizedCandidateSession {
+    session: ProductSession,
+}
+
+impl UnauthorizedCandidateSession {
+    fn new(session: ProductSession) -> Self {
+        session.set_route_authorized(false);
+        Self { session }
+    }
+
+    pub fn bind_authenticated_route(
+        &self,
+        route_digest: [u8; 32],
+        transcript_digest: [u8; 32],
+    ) -> Result<VerifiedRouteBinding, ProductSessionError> {
+        route_binding_for_session(&self.session, route_digest, transcript_digest)
+    }
 }
 
 /// Receiver for the dedicated ordered input lane.
@@ -61,6 +97,8 @@ pub struct InputReceiver {
     connection: QuicConnection,
     stream: QuicInboundStream,
     expected_stamp: SessionStamp,
+    route_epoch: Arc<AtomicU64>,
+    route_authorized: Arc<AtomicBool>,
 }
 
 /// Receiver for the peer's persistent ordered control lane.
@@ -69,9 +107,138 @@ pub struct ControlReceiver {
     connection: QuicConnection,
     stream: QuicInboundStream,
     expected_stamp: SessionStamp,
+    route_epoch: Arc<AtomicU64>,
+    route_sequence: Arc<AtomicU64>,
+    route_authorized: Arc<AtomicBool>,
     candidate_exchange: CandidateExchangeTracker,
     ice_generation: IceGenerationTracker,
     ice_roles: Arc<Mutex<Option<IceSignalingRoles>>>,
+    route_transition: Arc<Mutex<RouteWireState>>,
+    #[cfg(test)]
+    route_receive_cancellation_hook: Option<Arc<IceSendCancellationHook>>,
+}
+
+/// Two exact-mTLS product connections for one lifecycle stamp. Only one index
+/// has application authority; the other remains available for bounded rollback.
+#[derive(Debug)]
+pub struct ProductRouteSet {
+    routes: [ProductSession; 2],
+    bindings: [VerifiedRouteBinding; 2],
+    active: usize,
+    transition_timer: Arc<AtomicU64>,
+    activation: RouteActivationState,
+    transition_route: Option<usize>,
+}
+
+/// Route metadata already verified by ICE nomination, exact-mTLS transcript
+/// binding, and fresh consent before a parallel connection enters the set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedRouteBinding {
+    route_digest: [u8; 32],
+    transcript_digest: [u8; 32],
+    connection_id: usize,
+    peer_fingerprint: [u8; 32],
+}
+
+#[derive(Debug)]
+pub struct ActiveRouteControlReceiver {
+    route_index: usize,
+    receiver: ControlReceiver,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteActivationState {
+    Idle,
+    AwaitingActivated {
+        previous: usize,
+        commit: RouteTransitionMessage,
+    },
+    AwaitingConfirmed {
+        commit: RouteTransitionMessage,
+    },
+}
+
+struct FailClosedRouteSetOperation {
+    routes: [ProductSession; 2],
+    armed: bool,
+}
+
+impl FailClosedRouteSetOperation {
+    fn new(routes: &[ProductSession; 2]) -> Self {
+        Self {
+            routes: [routes[0].clone(), routes[1].clone()],
+            armed: true,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FailClosedRouteSetOperation {
+    fn drop(&mut self) {
+        if self.armed {
+            for route in &self.routes {
+                route.set_route_authorized(false);
+                route.close(0x103, b"route-set operation cancelled or failed");
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteWireState {
+    Idle,
+    PrepareSent(RouteTransitionMessage),
+    PrepareReceived(RouteTransitionMessage),
+    PreparedSent(RouteTransitionMessage),
+    PreparedReceived(RouteTransitionMessage),
+}
+
+fn same_route_transition(first: RouteTransitionMessage, second: RouteTransitionMessage) -> bool {
+    first.sequence == second.sequence
+        && first.base_route_epoch == second.base_route_epoch
+        && first.next_route_epoch == second.next_route_epoch
+        && first.expires_at_ns == second.expires_at_ns
+        && first.route_digest == second.route_digest
+        && first.transcript_digest == second.transcript_digest
+}
+
+impl RouteWireState {
+    fn sent(self, message: RouteTransitionMessage) -> Result<Self, RouteTransitionViolation> {
+        match (self, message.stage) {
+            (Self::Idle, RouteTransitionStage::Prepare) => Ok(Self::PrepareSent(message)),
+            (Self::PrepareReceived(prepare), RouteTransitionStage::Prepared)
+                if same_route_transition(prepare, message) =>
+            {
+                Ok(Self::PreparedSent(message))
+            }
+            (Self::PreparedReceived(prepared), RouteTransitionStage::Commit)
+                if same_route_transition(prepared, message) =>
+            {
+                Ok(Self::Idle)
+            }
+            _ => Err(RouteTransitionViolation::InvalidState),
+        }
+    }
+
+    fn received(self, message: RouteTransitionMessage) -> Result<Self, RouteTransitionViolation> {
+        match (self, message.stage) {
+            (Self::Idle, RouteTransitionStage::Prepare) => Ok(Self::PrepareReceived(message)),
+            (Self::PrepareSent(prepare), RouteTransitionStage::Prepared)
+                if same_route_transition(prepare, message) =>
+            {
+                Ok(Self::PreparedReceived(message))
+            }
+            (Self::PreparedSent(prepared), RouteTransitionStage::Commit)
+                if same_route_transition(prepared, message) =>
+            {
+                Ok(Self::Idle)
+            }
+            _ => Err(RouteTransitionViolation::InvalidState),
+        }
+    }
 }
 
 /// Enforces the ordered, per-peer candidate advertisement sequence.
@@ -257,6 +424,33 @@ pub enum CandidateExchangeViolation {
     GenerationExhausted,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteTransitionViolation {
+    Malformed(ProtocolError),
+    ControlRequiresTypedApi,
+    UnexpectedKind(ControlKind),
+    StageKindMismatch {
+        stage: RouteTransitionStage,
+        kind: ControlKind,
+    },
+    RouteEpoch {
+        expected: u64,
+        actual: u64,
+    },
+    Sequence {
+        expected: u64,
+        actual: u64,
+    },
+    InvalidState,
+    SessionMismatch,
+    PeerIdentityMismatch,
+    DuplicateConnection,
+    WrongActiveRoute,
+    InactiveRoute,
+    InvalidBinding,
+    BindingMismatch,
+}
+
 /// Validated product control message with an owned payload.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProductControlMessage {
@@ -379,7 +573,7 @@ pub enum ProductProtocolViolation {
         expected: SessionStamp,
         actual: SessionStamp,
     },
-    /// The initial control record did not carry the canonical active-v1 stamp.
+    /// The initial control record did not carry the canonical active-v2 stamp.
     InvalidHandshakeStamp(SessionStamp),
     /// The initial control payload was not a handshake-completion record.
     UnexpectedHandshakeKind(ControlKind),
@@ -412,6 +606,7 @@ pub enum ProductProtocolViolation {
     /// Candidate advertisement bytes or ordering were invalid.
     CandidateExchange(CandidateExchangeViolation),
     IceGeneration(IceGenerationViolation),
+    RouteTransition(RouteTransitionViolation),
     /// A replacement connection reused its session identity or did not advance
     /// every lifecycle epoch beyond the prior authenticated session.
     NonMonotonicSuccessor {
@@ -429,6 +624,13 @@ pub enum ProductSessionError {
     PeerProtocol(ProductProtocolViolation),
     CandidateExchange(CandidateExchangeViolation),
     IceGeneration(IceGenerationViolation),
+    RouteTransition(RouteTransitionViolation),
+    /// A route commit must advance exactly once from the currently active epoch.
+    RouteEpochTransition {
+        expected_current: u64,
+        actual_current: u64,
+        requested_next: u64,
+    },
     /// QUIC DATAGRAM support was not negotiated.
     DatagramsUnsupported,
     /// The path cannot fit an outer QUIC-media header, one inner media header,
@@ -474,6 +676,17 @@ impl fmt::Display for ProductSessionError {
                 write!(formatter, "local candidate exchange is invalid: {error:?}")
             }
             Self::IceGeneration(error) => write!(formatter, "local ICE generation is invalid: {error:?}"),
+            Self::RouteTransition(error) => {
+                write!(formatter, "local route transition is invalid: {error:?}")
+            }
+            Self::RouteEpochTransition {
+                expected_current,
+                actual_current,
+                requested_next,
+            } => write!(
+                formatter,
+                "route epoch transition expected {expected_current}, found {actual_current}, requested {requested_next}"
+            ),
             Self::DatagramsUnsupported => {
                 formatter.write_str("QUIC DATAGRAM support was not negotiated")
             }
@@ -517,6 +730,8 @@ impl Error for ProductSessionError {
             Self::PeerProtocol(_)
             | Self::CandidateExchange(_)
             | Self::IceGeneration(_)
+            | Self::RouteTransition(_)
+            | Self::RouteEpochTransition { .. }
             | Self::DatagramsUnsupported
             | Self::DatagramBudgetTooSmall { .. }
             | Self::InvalidMediaMaxAge
@@ -604,6 +819,34 @@ impl ProductSession {
     /// record before exposing an active client session.
     pub async fn client(connection: QuicConnection) -> Result<Self, ProductSessionError> {
         Self::client_with_reassembly(connection, ReassemblyConfig::default()).await
+    }
+
+    /// Activates a second exact-mTLS route only when its Host publishes the
+    /// same lifecycle identity as the already-authorized product session.
+    pub async fn client_route_candidate(
+        connection: QuicConnection,
+        expected: SessionStamp,
+    ) -> Result<UnauthorizedCandidateSession, ProductSessionError> {
+        validate_active_product_stamp(expected)?;
+        let session = Self::client(connection).await?;
+        let actual = session.stamp();
+        if actual != expected {
+            session.connection.close_for_protocol_violation();
+            return Err(ProductSessionError::PeerProtocol(
+                ProductProtocolViolation::StampMismatch { expected, actual },
+            ));
+        }
+        Ok(UnauthorizedCandidateSession::new(session))
+    }
+
+    /// Host half of a parallel candidate. It publishes the exact existing
+    /// lifecycle stamp but remains unable to send application traffic.
+    pub async fn host_route_candidate(
+        connection: QuicConnection,
+        stamp: SessionStamp,
+    ) -> Result<UnauthorizedCandidateSession, ProductSessionError> {
+        let session = Self::host_with_stamp(connection, stamp).await?;
+        Ok(UnauthorizedCandidateSession::new(session))
     }
 
     /// Activates a replacement Client session only when the Host supplies a
@@ -737,7 +980,12 @@ impl ProductSession {
             Ok(Self {
                 connection,
                 stamp,
+                route_epoch: Arc::new(AtomicU64::new(stamp.route_epoch)),
+                route_sequence: Arc::new(AtomicU64::new(0)),
+                route_authorized: Arc::new(AtomicBool::new(true)),
                 reassembler: Arc::new(Mutex::new(reassembler)),
+                reassembly_config: reassembly,
+                reassembly_route_epoch: Arc::new(AtomicU64::new(stamp.route_epoch)),
                 last_delivered_frame_id: Arc::new(Mutex::new(None)),
                 clock_origin: Instant::now(),
                 inbound_control: Arc::new(Mutex::new(Some(stream))),
@@ -749,8 +997,11 @@ impl ProductSession {
                     remote: IceCredentialRole::Controlled,
                 },
                 control_send: Arc::new(Mutex::new(())),
+                route_transition: Arc::new(Mutex::new(RouteWireState::Idle)),
                 #[cfg(test)]
                 ice_send_cancellation_hook: None,
+                #[cfg(test)]
+                route_send_cancellation_hook: None,
             })
         };
         match tokio::time::timeout(timeout, operation).await {
@@ -767,8 +1018,39 @@ impl ProductSession {
 
     /// Exact active stamp attached to every record in this session.
     #[must_use]
-    pub const fn stamp(&self) -> SessionStamp {
-        self.stamp
+    pub fn stamp(&self) -> SessionStamp {
+        stamp_at_route_epoch(self.stamp, self.route_epoch.load(Ordering::Acquire))
+    }
+
+    /// Applies a validated typed commit to every cloned product-lane gate.
+    fn advance_route_epoch(
+        &self,
+        expected_current: u64,
+        requested_next: u64,
+    ) -> Result<SessionStamp, ProductSessionError> {
+        let valid_next = expected_current
+            .checked_add(1)
+            .is_some_and(|next| next == requested_next);
+        if !valid_next {
+            return Err(ProductSessionError::RouteEpochTransition {
+                expected_current,
+                actual_current: self.route_epoch.load(Ordering::Acquire),
+                requested_next,
+            });
+        }
+        match self.route_epoch.compare_exchange(
+            expected_current,
+            requested_next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(self.stamp()),
+            Err(actual_current) => Err(ProductSessionError::RouteEpochTransition {
+                expected_current,
+                actual_current,
+                requested_next,
+            }),
+        }
     }
 
     /// Closes only this product connection. The owning endpoint remains usable
@@ -796,6 +1078,14 @@ impl ProductSession {
     #[must_use]
     pub fn remote_address(&self) -> std::net::SocketAddr {
         self.connection.remote_address()
+    }
+
+    pub fn bind_authenticated_route(
+        &self,
+        route_digest: [u8; 32],
+        transcript_digest: [u8; 32],
+    ) -> Result<VerifiedRouteBinding, ProductSessionError> {
+        route_binding_for_session(self, route_digest, transcript_digest)
     }
 
     /// Enables authenticated ICE signaling only when both the validated offer
@@ -829,6 +1119,7 @@ impl ProductSession {
         kind: ControlKind,
         payload: &[u8],
     ) -> Result<(), ProductSessionError> {
+        self.ensure_route_authorized()?;
         if matches!(
             kind,
             ControlKind::IceCredentials | ControlKind::IceCandidate
@@ -837,8 +1128,95 @@ impl ProductSession {
                 IceGenerationViolation::IceControlRequiresTypedApi,
             ));
         }
+        if is_route_control(kind) {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::ControlRequiresTypedApi,
+            ));
+        }
         let _send_guard = self.control_send.lock().await;
         self.send_control_unlocked(kind, payload).await
+    }
+
+    /// Sends one authenticated prepare/prepared/commit record. Only a matching
+    /// commit advances the shared epoch used by every product lane.
+    async fn send_route_transition(
+        &self,
+        message: RouteTransitionMessage,
+    ) -> Result<(), ProductSessionError> {
+        message
+            .validate()
+            .map_err(RouteTransitionViolation::Malformed)
+            .map_err(ProductSessionError::RouteTransition)?;
+        let current = self.route_epoch.load(Ordering::Acquire);
+        if message.base_route_epoch != current {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::RouteEpoch {
+                    expected: current,
+                    actual: message.base_route_epoch,
+                },
+            ));
+        }
+        if message.stage == RouteTransitionStage::Prepare {
+            let last = self.route_sequence.load(Ordering::Acquire);
+            let expected = last.checked_add(1).unwrap_or(0);
+            if message.sequence != expected {
+                return Err(ProductSessionError::RouteTransition(
+                    RouteTransitionViolation::Sequence {
+                        expected,
+                        actual: message.sequence,
+                    },
+                ));
+            }
+        }
+        let mut state = self.route_transition.lock().await;
+        let next = state
+            .sent(message)
+            .map_err(ProductSessionError::RouteTransition)?;
+        let payload = message
+            .encode()
+            .map_err(RouteTransitionViolation::Malformed)
+            .map_err(ProductSessionError::RouteTransition)?;
+        let _send_guard = self.control_send.lock().await;
+        self.send_control_unlocked(message.stage.control_kind(), &payload)
+            .await?;
+        #[cfg(test)]
+        if let Some(hook) = &self.route_send_cancellation_hook {
+            hook.reached.notify_one();
+            hook.release.notified().await;
+        }
+        if message.stage == RouteTransitionStage::Commit {
+            if let Err(error) =
+                self.advance_route_epoch(message.base_route_epoch, message.next_route_epoch)
+            {
+                self.connection.close_for_protocol_violation();
+                return Err(error);
+            }
+            self.route_sequence
+                .store(message.sequence, Ordering::Release);
+        }
+        *state = next;
+        Ok(())
+    }
+
+    async fn send_route_activation(
+        &self,
+        message: RouteTransitionMessage,
+    ) -> Result<(), ProductSessionError> {
+        if !matches!(
+            message.stage,
+            RouteTransitionStage::Activated | RouteTransitionStage::Confirmed
+        ) {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InvalidState,
+            ));
+        }
+        let payload = message
+            .encode()
+            .map_err(RouteTransitionViolation::Malformed)
+            .map_err(ProductSessionError::RouteTransition)?;
+        let _send_guard = self.control_send.lock().await;
+        self.send_control_unlocked(message.stage.control_kind(), &payload)
+            .await
     }
 
     /// Sends one credentials/candidates generation as an indivisible ordered pair.
@@ -887,21 +1265,18 @@ impl ProductSession {
         kind: ControlKind,
         payload: &[u8],
     ) -> Result<(), ProductSessionError> {
+        let stamp = self.stamp();
         let control = Zeroizing::new(ControlPacket::encode(
             ControlHeader {
                 kind,
                 flags: 0,
-                session_id: self.stamp.session_id,
+                session_id: stamp.session_id,
                 payload_len: u32::try_from(payload.len())
                     .map_err(|_| ProtocolError::ControlLength(u32::MAX))?,
             },
             payload,
         )?);
-        let record = Zeroizing::new(StreamRecord::encode(
-            StreamKind::Control,
-            self.stamp,
-            &control,
-        )?);
+        let record = Zeroizing::new(StreamRecord::encode(StreamKind::Control, stamp, &control)?);
         self.connection.send_control(&record).await?;
         Ok(())
     }
@@ -974,16 +1349,23 @@ impl ProductSession {
             connection: self.connection.clone(),
             stream,
             expected_stamp: self.stamp,
+            route_epoch: Arc::clone(&self.route_epoch),
+            route_sequence: Arc::clone(&self.route_sequence),
+            route_authorized: Arc::clone(&self.route_authorized),
             candidate_exchange: CandidateExchangeTracker::default(),
             ice_generation: IceGenerationTracker::default(),
             ice_roles: Arc::clone(&self.ice_roles),
+            route_transition: Arc::clone(&self.route_transition),
+            #[cfg(test)]
+            route_receive_cancellation_hook: None,
         })
     }
 
     /// Encodes and writes one bounded payload on the independent reliable input
     /// lane.
     pub async fn send_input(&self, payload: &[u8]) -> Result<(), ProductSessionError> {
-        let record = StreamRecord::encode(StreamKind::Input, self.stamp, payload)?;
+        self.ensure_route_authorized()?;
+        let record = StreamRecord::encode(StreamKind::Input, self.stamp(), payload)?;
         self.connection.send_input(&record).await?;
         Ok(())
     }
@@ -996,7 +1378,8 @@ impl ProductSession {
         payload: &[u8],
         timeout: Duration,
     ) -> Result<(), ProductSessionError> {
-        let record = StreamRecord::encode(StreamKind::Input, self.stamp, payload)?;
+        self.ensure_route_authorized()?;
+        let record = StreamRecord::encode(StreamKind::Input, self.stamp(), payload)?;
         self.connection
             .send_input_with_timeout(&record, timeout)
             .await?;
@@ -1023,6 +1406,8 @@ impl ProductSession {
             connection: self.connection.clone(),
             stream,
             expected_stamp: self.stamp,
+            route_epoch: Arc::clone(&self.route_epoch),
+            route_authorized: Arc::clone(&self.route_authorized),
         })
     }
 
@@ -1047,6 +1432,7 @@ impl ProductSession {
         now_ns: u64,
         mut send_now_ns: impl FnMut(usize) -> u64,
     ) -> Result<MediaFrameSendReport, ProductSessionError> {
+        self.ensure_route_authorized()?;
         let max_age_ns = u64::try_from(max_age.as_nanos())
             .ok()
             .filter(|age| *age != 0)
@@ -1085,7 +1471,7 @@ impl ProductSession {
         let mut fragments_sent = 0;
         for (index, fragment) in fragments.enumerate() {
             let datagram = MediaDatagram::encode(
-                self.stamp,
+                self.stamp(),
                 expires_at_ns,
                 fragment.header,
                 fragment.payload,
@@ -1120,11 +1506,13 @@ impl ProductSession {
     /// arrival times drive bounded reassembly age.
     pub async fn receive_media_frame(&self) -> Result<ReassembledFrame, ProductSessionError> {
         loop {
+            self.ensure_route_authorized()?;
             {
                 let mut reassembler = self.reassembler.lock().await;
                 reassembler.expire_due(self.local_now_ns());
             }
             let bytes = self.connection.receive_media().await?;
+            self.ensure_route_authorized()?;
             let datagram = match MediaDatagram::decode(&bytes) {
                 Ok(datagram) => datagram,
                 Err(error) => {
@@ -1132,11 +1520,12 @@ impl ProductSession {
                     return Err(ProductSessionError::Protocol(error));
                 }
             };
-            if datagram.stamp != self.stamp {
+            let expected_stamp = self.stamp();
+            if datagram.stamp != expected_stamp {
                 return fail_peer_protocol(
                     &self.connection,
                     ProductProtocolViolation::StampMismatch {
-                        expected: self.stamp,
+                        expected: expected_stamp,
                         actual: datagram.stamp,
                     },
                 );
@@ -1147,9 +1536,18 @@ impl ProductSession {
             let now_ns = self.local_now_ns();
             let outcome = {
                 let mut reassembler = self.reassembler.lock().await;
+                if self.reassembly_route_epoch.load(Ordering::Acquire) != expected_stamp.route_epoch
+                {
+                    *reassembler = Reassembler::new(self.reassembly_config)?;
+                    self.reassembly_route_epoch
+                        .store(expected_stamp.route_epoch, Ordering::Release);
+                }
                 reassembler.expire_due(now_ns);
                 reassembler.ingest(&bytes[QUIC_MEDIA_HEADER_LEN..], now_ns)
             };
+            if self.stamp() != expected_stamp {
+                continue;
+            }
             match outcome {
                 Ok(IngestOutcome::Complete(frame)) => {
                     let frame_id = frame.header.frame_id;
@@ -1192,7 +1590,12 @@ impl ProductSession {
         Ok(Self {
             connection,
             stamp,
+            route_epoch: Arc::new(AtomicU64::new(stamp.route_epoch)),
+            route_sequence: Arc::new(AtomicU64::new(0)),
+            route_authorized: Arc::new(AtomicBool::new(true)),
             reassembler: Arc::new(Mutex::new(Reassembler::new(reassembly)?)),
+            reassembly_config: reassembly,
+            reassembly_route_epoch: Arc::new(AtomicU64::new(stamp.route_epoch)),
             last_delivered_frame_id: Arc::new(Mutex::new(None)),
             clock_origin: Instant::now(),
             inbound_control: Arc::new(Mutex::new(None)),
@@ -1204,13 +1607,433 @@ impl ProductSession {
                 remote: IceCredentialRole::Controlling,
             },
             control_send: Arc::new(Mutex::new(())),
+            route_transition: Arc::new(Mutex::new(RouteWireState::Idle)),
             #[cfg(test)]
             ice_send_cancellation_hook: None,
+            #[cfg(test)]
+            route_send_cancellation_hook: None,
         })
     }
 
     fn local_now_ns(&self) -> u64 {
         u64::try_from(self.clock_origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    fn ensure_route_authorized(&self) -> Result<(), ProductSessionError> {
+        if self.route_authorized.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InactiveRoute,
+            ))
+        }
+    }
+
+    fn set_route_authorized(&self, authorized: bool) {
+        self.route_authorized.store(authorized, Ordering::Release);
+    }
+}
+
+impl ProductRouteSet {
+    pub fn new(
+        active: ProductSession,
+        active_binding: VerifiedRouteBinding,
+        rollback_candidate: UnauthorizedCandidateSession,
+        candidate_binding: VerifiedRouteBinding,
+    ) -> Result<Self, ProductSessionError> {
+        if active_binding.route_digest == [0; 32]
+            || active_binding.transcript_digest == [0; 32]
+            || candidate_binding.route_digest == [0; 32]
+            || candidate_binding.transcript_digest == [0; 32]
+            || active_binding.route_digest == candidate_binding.route_digest
+            || active_binding.transcript_digest == candidate_binding.transcript_digest
+            || active_binding.connection_id != active.connection.stable_id()
+            || candidate_binding.connection_id != rollback_candidate.session.connection.stable_id()
+        {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InvalidBinding,
+            ));
+        }
+        let rollback_candidate = rollback_candidate.session;
+        if active.connection.stable_id() == rollback_candidate.connection.stable_id() {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::DuplicateConnection,
+            ));
+        }
+        if active.stamp() != rollback_candidate.stamp() {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::SessionMismatch,
+            ));
+        }
+        if active.connection.peer_certificate_chain()?
+            != rollback_candidate.connection.peer_certificate_chain()?
+        {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::PeerIdentityMismatch,
+            ));
+        }
+        if active_binding.peer_fingerprint != candidate_binding.peer_fingerprint {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InvalidBinding,
+            ));
+        }
+        active.set_route_authorized(true);
+        rollback_candidate.set_route_authorized(false);
+        Ok(Self {
+            routes: [active, rollback_candidate],
+            bindings: [active_binding, candidate_binding],
+            active: 0,
+            transition_timer: Arc::new(AtomicU64::new(0)),
+            activation: RouteActivationState::Idle,
+            transition_route: None,
+        })
+    }
+
+    #[must_use]
+    pub const fn active_index(&self) -> usize {
+        self.active
+    }
+
+    #[must_use]
+    pub fn stamp(&self) -> SessionStamp {
+        self.routes[self.active].stamp()
+    }
+
+    #[must_use]
+    pub fn remote_address(&self) -> std::net::SocketAddr {
+        self.routes[self.active].remote_address()
+    }
+
+    pub async fn accept_control_receiver(
+        &self,
+    ) -> Result<ActiveRouteControlReceiver, ProductSessionError> {
+        Ok(ActiveRouteControlReceiver {
+            route_index: self.active,
+            receiver: self.routes[self.active].accept_control_receiver().await?,
+        })
+    }
+
+    pub async fn accept_standby_control_receiver(
+        &self,
+    ) -> Result<ActiveRouteControlReceiver, ProductSessionError> {
+        let standby = 1 - self.active;
+        Ok(ActiveRouteControlReceiver {
+            route_index: standby,
+            receiver: self.routes[standby].accept_control_receiver().await?,
+        })
+    }
+
+    pub async fn send_route_transition(
+        &mut self,
+        message: RouteTransitionMessage,
+    ) -> Result<(), ProductSessionError> {
+        self.validate_transition_binding(message)?;
+        let control_route = match message.stage {
+            RouteTransitionStage::Prepare if self.transition_route.is_none() => self.active,
+            RouteTransitionStage::Prepared | RouteTransitionStage::Commit => self
+                .transition_route
+                .ok_or(ProductSessionError::RouteTransition(
+                    RouteTransitionViolation::InvalidState,
+                ))?,
+            _ => {
+                return Err(ProductSessionError::RouteTransition(
+                    RouteTransitionViolation::InvalidState,
+                ))
+            }
+        };
+        let mut operation = FailClosedRouteSetOperation::new(&self.routes);
+        let current = self.active;
+        self.routes[control_route]
+            .send_route_transition(message)
+            .await?;
+        if message.stage == RouteTransitionStage::Commit {
+            self.synchronize_route_epochs(message)?;
+            self.activation = RouteActivationState::AwaitingActivated {
+                previous: current,
+                commit: message,
+            };
+            self.transition_route = None;
+        } else if message.stage == RouteTransitionStage::Prepare {
+            self.transition_route = Some(control_route);
+            self.arm_transition_timeout();
+        }
+        operation.commit();
+        Ok(())
+    }
+
+    /// Starts rollback over the retained path when the active candidate can no
+    /// longer carry the prepare exchange. Application authority remains
+    /// revoked/current until the same candidate activation barrier completes.
+    pub async fn send_rollback_via_retained(
+        &mut self,
+        message: RouteTransitionMessage,
+    ) -> Result<(), ProductSessionError> {
+        if message.stage != RouteTransitionStage::Prepare
+            || self.transition_route.is_some()
+            || self.activation != RouteActivationState::Idle
+            || self.routes[self.active]
+                .route_authorized
+                .load(Ordering::Acquire)
+        {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InvalidState,
+            ));
+        }
+        self.validate_transition_binding(message)?;
+        let retained = 1 - self.active;
+        let mut operation = FailClosedRouteSetOperation::new(&self.routes);
+        self.routes[retained].send_route_transition(message).await?;
+        self.transition_route = Some(retained);
+        self.arm_transition_timeout();
+        operation.commit();
+        Ok(())
+    }
+
+    pub async fn next_route_transition(
+        &mut self,
+        receiver: &mut ActiveRouteControlReceiver,
+    ) -> Result<RouteTransitionMessage, ProductSessionError> {
+        if self
+            .transition_route
+            .is_some_and(|route| receiver.route_index != route)
+        {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::WrongActiveRoute,
+            ));
+        }
+        let mut operation = FailClosedRouteSetOperation::new(&self.routes);
+        let current = self.active;
+        let target_binding = self.bindings[1 - self.active];
+        let message = receiver
+            .receiver
+            .next_route_transition_bound(target_binding, receiver.route_index != self.active)
+            .await?;
+        if message.stage == RouteTransitionStage::Prepare {
+            if self.transition_route.is_some() {
+                return Err(ProductSessionError::RouteTransition(
+                    RouteTransitionViolation::InvalidState,
+                ));
+            }
+            self.transition_route = Some(receiver.route_index);
+            if receiver.route_index != self.active {
+                self.routes[self.active].set_route_authorized(false);
+            }
+        } else if self.transition_route != Some(receiver.route_index) {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::WrongActiveRoute,
+            ));
+        }
+        if message.stage == RouteTransitionStage::Commit {
+            self.synchronize_route_epochs(message)?;
+            let next = 1 - current;
+            self.routes[next]
+                .send_route_activation(RouteTransitionMessage {
+                    stage: RouteTransitionStage::Activated,
+                    ..message
+                })
+                .await?;
+            self.activate_prepared_route(current);
+            self.activation = RouteActivationState::AwaitingConfirmed { commit: message };
+            self.transition_route = None;
+        } else if message.stage == RouteTransitionStage::Prepare {
+            self.arm_transition_timeout();
+        }
+        operation.commit();
+        Ok(message)
+    }
+
+    pub async fn next_route_activation(
+        &mut self,
+        receiver: &mut ActiveRouteControlReceiver,
+    ) -> Result<RouteTransitionMessage, ProductSessionError> {
+        let RouteActivationState::AwaitingActivated { previous, commit } = self.activation else {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InvalidState,
+            ));
+        };
+        let next = 1 - previous;
+        if self.active != previous || receiver.route_index != next {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::WrongActiveRoute,
+            ));
+        }
+        let mut operation = FailClosedRouteSetOperation::new(&self.routes);
+        let activated = receiver
+            .receiver
+            .next_route_activation(self.bindings[next], commit, RouteTransitionStage::Activated)
+            .await?;
+        self.routes[next]
+            .send_route_activation(RouteTransitionMessage {
+                stage: RouteTransitionStage::Confirmed,
+                ..commit
+            })
+            .await?;
+        self.activate_prepared_route(previous);
+        self.activation = RouteActivationState::Idle;
+        self.disarm_transition_timeout();
+        operation.commit();
+        Ok(activated)
+    }
+
+    pub async fn next_route_confirmation(
+        &mut self,
+        receiver: &mut ActiveRouteControlReceiver,
+    ) -> Result<RouteTransitionMessage, ProductSessionError> {
+        let RouteActivationState::AwaitingConfirmed { commit } = self.activation else {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InvalidState,
+            ));
+        };
+        if receiver.route_index != self.active {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::WrongActiveRoute,
+            ));
+        }
+        let mut operation = FailClosedRouteSetOperation::new(&self.routes);
+        let confirmed = receiver
+            .receiver
+            .next_route_activation(
+                self.bindings[self.active],
+                commit,
+                RouteTransitionStage::Confirmed,
+            )
+            .await?;
+        self.activation = RouteActivationState::Idle;
+        self.disarm_transition_timeout();
+        operation.commit();
+        Ok(confirmed)
+    }
+
+    fn synchronize_route_epochs(
+        &self,
+        message: RouteTransitionMessage,
+    ) -> Result<(), ProductSessionError> {
+        for route in &self.routes {
+            let epoch = route.stamp().route_epoch;
+            let synchronized = if epoch == message.base_route_epoch {
+                route
+                    .advance_route_epoch(message.base_route_epoch, message.next_route_epoch)
+                    .map(|_| ())
+            } else if epoch == message.next_route_epoch {
+                Ok(())
+            } else {
+                Err(ProductSessionError::RouteEpochTransition {
+                    expected_current: message.base_route_epoch,
+                    actual_current: epoch,
+                    requested_next: message.next_route_epoch,
+                })
+            };
+            if let Err(error) = synchronized {
+                for failed in &self.routes {
+                    failed.close(0x103, b"route-set epoch synchronization failed");
+                }
+                return Err(error);
+            }
+            route
+                .route_sequence
+                .store(message.sequence, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    fn activate_prepared_route(&mut self, previous: usize) {
+        let next = 1 - previous;
+        self.routes[previous].set_route_authorized(false);
+        self.routes[next].set_route_authorized(true);
+        self.active = next;
+    }
+
+    fn validate_transition_binding(
+        &self,
+        message: RouteTransitionMessage,
+    ) -> Result<(), ProductSessionError> {
+        let target = self.bindings[1 - self.active];
+        if message.route_digest != target.route_digest
+            || message.transcript_digest != target.transcript_digest
+        {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::BindingMismatch,
+            ));
+        }
+        Ok(())
+    }
+
+    fn arm_transition_timeout(&self) {
+        let ticket = self
+            .transition_timer
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let timer = Arc::clone(&self.transition_timer);
+        let routes = [self.routes[0].clone(), self.routes[1].clone()];
+        tokio::spawn(async move {
+            tokio::time::sleep(ROUTE_TRANSITION_TIMEOUT).await;
+            if timer.load(Ordering::Acquire) == ticket {
+                for route in &routes {
+                    route.set_route_authorized(false);
+                    route.close(0x103, b"route transition expired");
+                }
+            }
+        });
+    }
+
+    fn disarm_transition_timeout(&self) {
+        self.transition_timer.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub async fn send_control(
+        &self,
+        kind: ControlKind,
+        payload: &[u8],
+    ) -> Result<(), ProductSessionError> {
+        self.routes[self.active].send_control(kind, payload).await
+    }
+
+    pub async fn next_control(
+        &self,
+        receiver: &mut ActiveRouteControlReceiver,
+    ) -> Result<ProductControlMessage, ProductSessionError> {
+        if receiver.route_index != self.active {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::WrongActiveRoute,
+            ));
+        }
+        receiver.receiver.next_control().await
+    }
+
+    pub async fn send_input(&self, payload: &[u8]) -> Result<(), ProductSessionError> {
+        self.routes[self.active].send_input(payload).await
+    }
+
+    pub async fn accept_input_receiver(&self) -> Result<InputReceiver, ProductSessionError> {
+        self.routes[self.active].accept_input_receiver().await
+    }
+
+    pub fn send_media_frame(
+        &self,
+        spec: FragmentSpec,
+        frame: &[u8],
+        max_age: Duration,
+    ) -> Result<MediaFrameSendReport, ProductSessionError> {
+        self.routes[self.active].send_media_frame(spec, frame, max_age)
+    }
+
+    pub async fn receive_media_frame(&self) -> Result<ReassembledFrame, ProductSessionError> {
+        self.routes[self.active].receive_media_frame().await
+    }
+
+    pub fn close(&self, error_code: u32, reason: &[u8]) {
+        self.disarm_transition_timeout();
+        for route in &self.routes {
+            route.set_route_authorized(false);
+            route.close(error_code, reason);
+        }
+    }
+
+    /// Revokes and closes only the active transport so rollback control can
+    /// proceed over the retained exact-mTLS connection.
+    pub fn fail_active_route(&self, error_code: u32, reason: &[u8]) {
+        self.routes[self.active].set_route_authorized(false);
+        self.routes[self.active].close(error_code, reason);
     }
 }
 
@@ -1218,16 +2041,30 @@ impl InputReceiver {
     /// Reads the next input payload and rejects any stamp drift before handing
     /// bytes to the application-specific input decoder.
     pub async fn next_input(&mut self) -> Result<Bytes, ProductSessionError> {
+        if !self.route_authorized.load(Ordering::Acquire) {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InactiveRoute,
+            ));
+        }
         let record = self
             .stream
             .next_record()
             .await
             .map_err(|error| inbound_error(&self.connection, error))?;
-        if record.stamp != self.expected_stamp {
+        if !self.route_authorized.load(Ordering::Acquire) {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InactiveRoute,
+            ));
+        }
+        let expected_stamp = stamp_at_route_epoch(
+            self.expected_stamp,
+            self.route_epoch.load(Ordering::Acquire),
+        );
+        if record.stamp != expected_stamp {
             return fail_peer_protocol(
                 &self.connection,
                 ProductProtocolViolation::StampMismatch {
-                    expected: self.expected_stamp,
+                    expected: expected_stamp,
                     actual: record.stamp,
                 },
             );
@@ -1336,6 +2173,11 @@ impl ControlReceiver {
                 IceGenerationViolation::IceControlRequiresTypedApi,
             ));
         }
+        if is_route_control(message.kind) {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::ControlRequiresTypedApi,
+            ));
+        }
         let result = ProductControlMessage {
             kind: message.kind,
             payload: Bytes::copy_from_slice(&message.payload),
@@ -1344,17 +2186,220 @@ impl ControlReceiver {
         Ok(result)
     }
 
-    async fn next_control_private(&mut self) -> Result<PrivateControlMessage, ProductSessionError> {
+    /// Receives one authenticated route transition stage and enforces the
+    /// prepare -> prepared -> commit state machine across both directions.
+    #[cfg(test)]
+    async fn next_route_transition(
+        &mut self,
+    ) -> Result<RouteTransitionMessage, ProductSessionError> {
+        self.next_route_transition_inner(None, false).await
+    }
+
+    async fn next_route_transition_bound(
+        &mut self,
+        binding: VerifiedRouteBinding,
+        allow_inactive: bool,
+    ) -> Result<RouteTransitionMessage, ProductSessionError> {
+        self.next_route_transition_inner(Some(binding), allow_inactive)
+            .await
+    }
+
+    async fn next_route_activation(
+        &mut self,
+        binding: VerifiedRouteBinding,
+        commit: RouteTransitionMessage,
+        expected_stage: RouteTransitionStage,
+    ) -> Result<RouteTransitionMessage, ProductSessionError> {
+        let mut operation = FailClosedControlRead::new(self.connection.clone());
         let record = self
             .stream
             .next_record()
             .await
             .map_err(|error| inbound_error(&self.connection, error))?;
-        if record.stamp != self.expected_stamp {
+        let expected_stamp = stamp_at_route_epoch(
+            self.expected_stamp,
+            self.route_epoch.load(Ordering::Acquire),
+        );
+        if record.stamp != expected_stamp {
             return fail_peer_protocol(
                 &self.connection,
                 ProductProtocolViolation::StampMismatch {
-                    expected: self.expected_stamp,
+                    expected: expected_stamp,
+                    actual: record.stamp,
+                },
+            );
+        }
+        let packet = ControlPacket::decode(&record.payload).map_err(|error| {
+            self.connection.close_for_protocol_violation();
+            ProductSessionError::PeerProtocol(ProductProtocolViolation::MalformedControl(error))
+        })?;
+        let message = RouteTransitionMessage::decode(packet.payload).map_err(|error| {
+            self.connection.close_for_protocol_violation();
+            ProductSessionError::PeerProtocol(ProductProtocolViolation::RouteTransition(
+                RouteTransitionViolation::Malformed(error),
+            ))
+        })?;
+        if packet.header.session_id != expected_stamp.session_id
+            || packet.header.kind != expected_stage.control_kind()
+            || message.stage != expected_stage
+            || !same_route_transition(message, commit)
+            || message.route_digest != binding.route_digest
+            || message.transcript_digest != binding.transcript_digest
+        {
+            return fail_peer_protocol(
+                &self.connection,
+                ProductProtocolViolation::RouteTransition(
+                    RouteTransitionViolation::BindingMismatch,
+                ),
+            );
+        }
+        operation.commit();
+        Ok(message)
+    }
+
+    async fn next_route_transition_inner(
+        &mut self,
+        binding: Option<VerifiedRouteBinding>,
+        allow_inactive: bool,
+    ) -> Result<RouteTransitionMessage, ProductSessionError> {
+        let mut operation = FailClosedControlRead::new(self.connection.clone());
+        let private = self.next_control_private_inner(allow_inactive).await?;
+        if !is_route_control(private.kind) {
+            return fail_peer_protocol(
+                &self.connection,
+                ProductProtocolViolation::RouteTransition(
+                    RouteTransitionViolation::UnexpectedKind(private.kind),
+                ),
+            );
+        }
+        let message = match RouteTransitionMessage::decode(&private.payload) {
+            Ok(message) => message,
+            Err(error) => {
+                return fail_peer_protocol(
+                    &self.connection,
+                    ProductProtocolViolation::RouteTransition(RouteTransitionViolation::Malformed(
+                        error,
+                    )),
+                )
+            }
+        };
+        if message.stage.control_kind() != private.kind {
+            return fail_peer_protocol(
+                &self.connection,
+                ProductProtocolViolation::RouteTransition(
+                    RouteTransitionViolation::StageKindMismatch {
+                        stage: message.stage,
+                        kind: private.kind,
+                    },
+                ),
+            );
+        }
+        if binding.is_some_and(|expected| {
+            message.route_digest != expected.route_digest
+                || message.transcript_digest != expected.transcript_digest
+        }) {
+            return fail_peer_protocol(
+                &self.connection,
+                ProductProtocolViolation::RouteTransition(
+                    RouteTransitionViolation::BindingMismatch,
+                ),
+            );
+        }
+        let current = self.route_epoch.load(Ordering::Acquire);
+        if message.base_route_epoch != current {
+            return fail_peer_protocol(
+                &self.connection,
+                ProductProtocolViolation::RouteTransition(RouteTransitionViolation::RouteEpoch {
+                    expected: current,
+                    actual: message.base_route_epoch,
+                }),
+            );
+        }
+        if message.stage == RouteTransitionStage::Prepare {
+            let last = self.route_sequence.load(Ordering::Acquire);
+            let expected = last.checked_add(1).unwrap_or(0);
+            if message.sequence != expected {
+                return fail_peer_protocol(
+                    &self.connection,
+                    ProductProtocolViolation::RouteTransition(RouteTransitionViolation::Sequence {
+                        expected,
+                        actual: message.sequence,
+                    }),
+                );
+            }
+        }
+        let mut state = self.route_transition.lock().await;
+        let next = match state.received(message) {
+            Ok(next) => next,
+            Err(violation) => {
+                return fail_peer_protocol(
+                    &self.connection,
+                    ProductProtocolViolation::RouteTransition(violation),
+                )
+            }
+        };
+        if message.stage == RouteTransitionStage::Commit
+            && self
+                .route_epoch
+                .compare_exchange(
+                    message.base_route_epoch,
+                    message.next_route_epoch,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return fail_peer_protocol(
+                &self.connection,
+                ProductProtocolViolation::RouteTransition(RouteTransitionViolation::InvalidState),
+            );
+        }
+        if message.stage == RouteTransitionStage::Commit {
+            self.route_sequence
+                .store(message.sequence, Ordering::Release);
+        }
+        #[cfg(test)]
+        if let Some(hook) = &self.route_receive_cancellation_hook {
+            hook.reached.notify_one();
+            hook.release.notified().await;
+        }
+        *state = next;
+        operation.commit();
+        Ok(message)
+    }
+
+    async fn next_control_private(&mut self) -> Result<PrivateControlMessage, ProductSessionError> {
+        self.next_control_private_inner(false).await
+    }
+
+    async fn next_control_private_inner(
+        &mut self,
+        allow_inactive: bool,
+    ) -> Result<PrivateControlMessage, ProductSessionError> {
+        if !allow_inactive && !self.route_authorized.load(Ordering::Acquire) {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InactiveRoute,
+            ));
+        }
+        let record = self
+            .stream
+            .next_record()
+            .await
+            .map_err(|error| inbound_error(&self.connection, error))?;
+        if !allow_inactive && !self.route_authorized.load(Ordering::Acquire) {
+            return Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InactiveRoute,
+            ));
+        }
+        let expected_stamp = stamp_at_route_epoch(
+            self.expected_stamp,
+            self.route_epoch.load(Ordering::Acquire),
+        );
+        if record.stamp != expected_stamp {
+            return fail_peer_protocol(
+                &self.connection,
+                ProductProtocolViolation::StampMismatch {
+                    expected: expected_stamp,
                     actual: record.stamp,
                 },
             );
@@ -1448,6 +2493,46 @@ fn validate_active_product_stamp(stamp: SessionStamp) -> Result<(), ProductSessi
     Ok(())
 }
 
+fn stamp_at_route_epoch(mut stamp: SessionStamp, route_epoch: u64) -> SessionStamp {
+    stamp.route_epoch = route_epoch;
+    stamp
+}
+
+fn route_binding_for_session(
+    session: &ProductSession,
+    route_digest: [u8; 32],
+    transcript_digest: [u8; 32],
+) -> Result<VerifiedRouteBinding, ProductSessionError> {
+    if route_digest == [0; 32] || transcript_digest == [0; 32] {
+        return Err(ProductSessionError::RouteTransition(
+            RouteTransitionViolation::InvalidBinding,
+        ));
+    }
+    let peer_chain = session.connection.peer_certificate_chain()?;
+    let peer_leaf = peer_chain
+        .first()
+        .ok_or(ProductSessionError::RouteTransition(
+            RouteTransitionViolation::PeerIdentityMismatch,
+        ))?;
+    Ok(VerifiedRouteBinding {
+        route_digest,
+        transcript_digest,
+        connection_id: session.connection.stable_id(),
+        peer_fingerprint: Sha256::digest(peer_leaf).into(),
+    })
+}
+
+fn is_route_control(kind: ControlKind) -> bool {
+    matches!(
+        kind,
+        ControlKind::RoutePrepare
+            | ControlKind::RoutePrepared
+            | ControlKind::RouteCommit
+            | ControlKind::RouteActivated
+            | ControlKind::RouteConfirmed
+    )
+}
+
 fn active_stamp(session_id: NonZeroU64) -> SessionStamp {
     SessionStamp {
         session_id: session_id.get(),
@@ -1455,6 +2540,7 @@ fn active_stamp(session_id: NonZeroU64) -> SessionStamp {
         authorization_epoch: ACTIVE_EPOCH,
         display_epoch: ACTIVE_EPOCH,
         codec_epoch: ACTIVE_EPOCH,
+        route_epoch: 1,
     }
 }
 
@@ -1807,6 +2893,15 @@ mod tests {
         _server_endpoint: quinn::Endpoint,
     }
 
+    struct ConnectedRoutePairs {
+        first_client: QuicConnection,
+        first_server: QuicConnection,
+        second_client: QuicConnection,
+        second_server: QuicConnection,
+        _client_endpoint: quinn::Endpoint,
+        _server_endpoint: quinn::Endpoint,
+    }
+
     fn test_identity(name: &str) -> TestIdentity {
         let certified = generate_simple_self_signed(vec![name.into()]).expect("certificate");
         TestIdentity {
@@ -1930,6 +3025,64 @@ mod tests {
         (host.expect("host session"), client.expect("client session"))
     }
 
+    async fn product_route_sets(path_mtu: u16) -> (ProductRouteSet, ProductRouteSet) {
+        let (server_config, client_config) = test_configs(path_mtu);
+        let server_endpoint =
+            bind_server(server_config, SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let client_endpoint =
+            bind_client(client_config, SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let server_address = server_endpoint.local_addr().unwrap();
+        let (first_server, first_client) = tokio::join!(
+            QuicConnection::accept(&server_endpoint),
+            QuicConnection::connect(&client_endpoint, server_address, "localhost"),
+        );
+        let (second_server, second_client) = tokio::join!(
+            QuicConnection::accept(&server_endpoint),
+            QuicConnection::connect(&client_endpoint, server_address, "localhost"),
+        );
+        let pairs = ConnectedRoutePairs {
+            first_client: first_client.unwrap(),
+            first_server: first_server.unwrap(),
+            second_client: second_client.unwrap(),
+            second_server: second_server.unwrap(),
+            _client_endpoint: client_endpoint,
+            _server_endpoint: server_endpoint,
+        };
+        let stamp = active_stamp(NonZeroU64::new(41).unwrap());
+        let (first_host, first_client) = tokio::join!(
+            ProductSession::host_with_stamp(pairs.first_server, stamp),
+            ProductSession::client(pairs.first_client),
+        );
+        let first_host = first_host.unwrap();
+        let first_client = first_client.unwrap();
+        let (second_host, second_client) = tokio::join!(
+            ProductSession::host_route_candidate(pairs.second_server, stamp),
+            ProductSession::client_route_candidate(pairs.second_client, stamp),
+        );
+        let second_host = second_host.unwrap();
+        let second_client = second_client.unwrap();
+        let host_active_binding = route_binding(&first_host, 0x21);
+        let host_candidate_binding = candidate_route_binding(&second_host, 0x31);
+        let client_active_binding = route_binding(&first_client, 0x21);
+        let client_candidate_binding = candidate_route_binding(&second_client, 0x31);
+        (
+            ProductRouteSet::new(
+                first_host,
+                host_active_binding,
+                second_host,
+                host_candidate_binding,
+            )
+            .unwrap(),
+            ProductRouteSet::new(
+                first_client,
+                client_active_binding,
+                second_client,
+                client_candidate_binding,
+            )
+            .unwrap(),
+        )
+    }
+
     async fn configure_ice_pair(host: &ProductSession, client: &ProductSession) {
         let offered = authenticated_ice_offer();
         let selected = authenticated_ice_selection();
@@ -1942,17 +3095,18 @@ mod tests {
     }
 
     async fn send_raw_product_control(session: &ProductSession, kind: ControlKind, payload: &[u8]) {
+        let stamp = session.stamp();
         let control = ControlPacket::encode(
             ControlHeader {
                 kind,
                 flags: 0,
-                session_id: session.stamp.session_id,
+                session_id: stamp.session_id,
                 payload_len: u32::try_from(payload.len()).unwrap(),
             },
             payload,
         )
         .unwrap();
-        let record = StreamRecord::encode(StreamKind::Control, session.stamp, &control).unwrap();
+        let record = StreamRecord::encode(StreamKind::Control, stamp, &control).unwrap();
         session.connection.send_control(&record).await.unwrap();
     }
 
@@ -2582,8 +3736,41 @@ mod tests {
         }
     }
 
+    fn route_message(
+        stage: RouteTransitionStage,
+        sequence: u64,
+        base_route_epoch: u64,
+        route_digest: [u8; 32],
+    ) -> RouteTransitionMessage {
+        RouteTransitionMessage {
+            version: latencydesk_protocol::WIRE_VERSION,
+            stage,
+            sequence,
+            base_route_epoch,
+            next_route_epoch: base_route_epoch + 1,
+            expires_at_ns: 1_000_000,
+            route_digest,
+            transcript_digest: [route_digest[0].wrapping_add(0x70); 32],
+        }
+    }
+
+    fn route_binding(session: &ProductSession, byte: u8) -> VerifiedRouteBinding {
+        session
+            .bind_authenticated_route([byte; 32], [byte.wrapping_add(0x70); 32])
+            .unwrap()
+    }
+
+    fn candidate_route_binding(
+        session: &UnauthorizedCandidateSession,
+        byte: u8,
+    ) -> VerifiedRouteBinding {
+        session
+            .bind_authenticated_route([byte; 32], [byte.wrapping_add(0x70); 32])
+            .unwrap()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn post_mtls_handshake_activates_the_exact_v1_stamp() {
+    async fn post_mtls_handshake_activates_the_exact_v2_stamp() {
         let (host, client) = product_pair(1_450).await;
         let expected = SessionStamp {
             session_id: 41,
@@ -2591,6 +3778,7 @@ mod tests {
             authorization_epoch: 1,
             display_epoch: 1,
             codec_epoch: 1,
+            route_epoch: 1,
         };
         assert_eq!(host.stamp(), expected);
         assert_eq!(client.stamp(), expected);
@@ -2605,6 +3793,7 @@ mod tests {
             authorization_epoch: 8,
             display_epoch: 9,
             codec_epoch: 10,
+            route_epoch: 1,
         };
         let (host, client) = tokio::join!(
             ProductSession::host_with_stamp(pair.server, stamp),
@@ -2624,6 +3813,7 @@ mod tests {
             authorization_epoch: 8,
             display_epoch: 9,
             codec_epoch: 10,
+            route_epoch: 1,
         };
         let replayed = SessionStamp {
             session_id: 81,
@@ -2631,6 +3821,7 @@ mod tests {
             authorization_epoch: 9,
             display_epoch: 9,
             codec_epoch: 10,
+            route_epoch: 1,
         };
         let (host, client) = tokio::join!(
             ProductSession::host_with_stamp(pair.server, replayed),
@@ -2654,6 +3845,7 @@ mod tests {
             authorization_epoch: 8,
             display_epoch: 9,
             codec_epoch: 10,
+            route_epoch: 1,
         };
         let successor = SessionStamp {
             session_id: 81,
@@ -2661,6 +3853,7 @@ mod tests {
             authorization_epoch: 9,
             display_epoch: 10,
             codec_epoch: 11,
+            route_epoch: 1,
         };
         let (host, client) = tokio::join!(
             ProductSession::host_with_stamp(pair.server, successor),
@@ -2668,6 +3861,7 @@ mod tests {
         );
         assert_eq!(host.expect("host successor").stamp(), successor);
         assert_eq!(client.expect("client successor").stamp(), successor);
+        assert_eq!(successor.route_epoch, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2678,6 +3872,7 @@ mod tests {
             authorization_epoch: 8,
             display_epoch: 9,
             codec_epoch: 10,
+            route_epoch: 1,
         };
         for invalid in [
             SessionStamp {
@@ -2686,6 +3881,7 @@ mod tests {
                 authorization_epoch: 9,
                 display_epoch: 10,
                 codec_epoch: 11,
+                route_epoch: 1,
             },
             SessionStamp {
                 session_id: 81,
@@ -2693,6 +3889,7 @@ mod tests {
                 authorization_epoch: 9,
                 display_epoch: 9,
                 codec_epoch: 11,
+                route_epoch: 1,
             },
             SessionStamp {
                 session_id: 81,
@@ -2700,6 +3897,7 @@ mod tests {
                 authorization_epoch: 9,
                 display_epoch: 10,
                 codec_epoch: 10,
+                route_epoch: 1,
             },
         ] {
             let pair = connected_pair(1_450).await;
@@ -2729,6 +3927,7 @@ mod tests {
             authorization_epoch: 1,
             display_epoch: 1,
             codec_epoch: 1,
+            route_epoch: 1,
         };
         let (first_host, first_client) = tokio::join!(
             ProductSession::host_with_stamp(pair.server, first_stamp),
@@ -2750,6 +3949,7 @@ mod tests {
             authorization_epoch: 2,
             display_epoch: 2,
             codec_epoch: 2,
+            route_epoch: 1,
         };
         let (successor_host, successor_client) = tokio::join!(
             ProductSession::host_with_stamp(
@@ -2823,6 +4023,7 @@ mod tests {
             authorization_epoch: 1,
             display_epoch: 1,
             codec_epoch: 0,
+            route_epoch: 1,
         };
         let record = encode_handshake_completed(wrong_stamp).expect("handshake record");
         pair.server
@@ -3097,6 +4298,675 @@ mod tests {
         assert!(matches!(
             client.connection.closed().await,
             quinn::ConnectionError::ApplicationClosed(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authenticated_route_prepare_prepared_commit_promotes_and_rolls_back() {
+        let (host, client) = product_pair(1_450).await;
+        let mut client_control = client.accept_control_receiver().await.unwrap();
+
+        let prepare = route_message(RouteTransitionStage::Prepare, 1, 1, [0x11; 32]);
+        host.send_route_transition(prepare).await.unwrap();
+        assert_eq!(host.stamp().route_epoch, 1);
+        assert_eq!(
+            client_control.next_route_transition().await.unwrap(),
+            prepare
+        );
+        assert_eq!(client.stamp().route_epoch, 1);
+
+        let prepared = RouteTransitionMessage {
+            stage: RouteTransitionStage::Prepared,
+            ..prepare
+        };
+        client.send_route_transition(prepared).await.unwrap();
+        let mut host_control = host.accept_control_receiver().await.unwrap();
+        assert_eq!(
+            host_control.next_route_transition().await.unwrap(),
+            prepared
+        );
+        assert_eq!(host.stamp().route_epoch, 1);
+
+        let commit = RouteTransitionMessage {
+            stage: RouteTransitionStage::Commit,
+            ..prepare
+        };
+        host.send_route_transition(commit).await.unwrap();
+        assert_eq!(host.stamp().route_epoch, 2);
+        assert_eq!(
+            client_control.next_route_transition().await.unwrap(),
+            commit
+        );
+        assert_eq!(client.stamp().route_epoch, 2);
+
+        // Rollback is another authenticated transition and advances to N+2;
+        // the prior route never regains its stale epoch value.
+        let rollback_prepare = route_message(RouteTransitionStage::Prepare, 2, 2, [0x22; 32]);
+        host.send_route_transition(rollback_prepare).await.unwrap();
+        client_control.next_route_transition().await.unwrap();
+        let rollback_prepared = RouteTransitionMessage {
+            stage: RouteTransitionStage::Prepared,
+            ..rollback_prepare
+        };
+        client
+            .send_route_transition(rollback_prepared)
+            .await
+            .unwrap();
+        host_control.next_route_transition().await.unwrap();
+        let rollback_commit = RouteTransitionMessage {
+            stage: RouteTransitionStage::Commit,
+            ..rollback_prepare
+        };
+        host.send_route_transition(rollback_commit).await.unwrap();
+        client_control.next_route_transition().await.unwrap();
+        assert_eq!(host.stamp().route_epoch, 3);
+        assert_eq!(client.stamp().route_epoch, 3);
+        let replay = route_message(RouteTransitionStage::Prepare, 2, 3, [0x23; 32]);
+        assert!(matches!(
+            host.send_route_transition(replay).await,
+            Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::Sequence {
+                    expected: 3,
+                    actual: 2
+                }
+            ))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_exact_mtls_route_set_switches_authority_and_retains_rollback() {
+        let (mut host, mut client) = product_route_sets(1_450).await;
+        assert_eq!(host.active_index(), 0);
+        assert_eq!(client.active_index(), 0);
+        let mut client_control = client.accept_control_receiver().await.unwrap();
+
+        let unbound = route_message(RouteTransitionStage::Prepare, 1, 1, [0x32; 32]);
+        assert!(matches!(
+            host.send_route_transition(unbound).await,
+            Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::BindingMismatch
+            ))
+        ));
+        assert_eq!(host.active_index(), 0);
+
+        let prepare = route_message(RouteTransitionStage::Prepare, 1, 1, [0x31; 32]);
+        host.send_route_transition(prepare).await.unwrap();
+        client
+            .next_route_transition(&mut client_control)
+            .await
+            .unwrap();
+        let prepared = RouteTransitionMessage {
+            stage: RouteTransitionStage::Prepared,
+            ..prepare
+        };
+        client.send_route_transition(prepared).await.unwrap();
+        let mut host_control = host.accept_control_receiver().await.unwrap();
+        host.next_route_transition(&mut host_control).await.unwrap();
+        let commit = RouteTransitionMessage {
+            stage: RouteTransitionStage::Commit,
+            ..prepare
+        };
+        host.send_route_transition(commit).await.unwrap();
+        assert_eq!(host.active_index(), 0);
+        client
+            .next_route_transition(&mut client_control)
+            .await
+            .unwrap();
+        assert_eq!(client.active_index(), 1);
+        let mut host_candidate_control = host.accept_standby_control_receiver().await.unwrap();
+        host.next_route_activation(&mut host_candidate_control)
+            .await
+            .unwrap();
+        let mut client_candidate_control = client.accept_control_receiver().await.unwrap();
+        client
+            .next_route_confirmation(&mut client_candidate_control)
+            .await
+            .unwrap();
+        assert_eq!(host.active_index(), 1);
+        assert_eq!(client.active_index(), 1);
+        assert_eq!(host.stamp().route_epoch, 2);
+        assert_eq!(client.stamp().route_epoch, 2);
+        assert!(matches!(
+            host.routes[0].send_input(b"old-route").await,
+            Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InactiveRoute
+            ))
+        ));
+
+        client.send_input(b"candidate-route").await.unwrap();
+        let mut input = host.accept_input_receiver().await.unwrap();
+        assert_eq!(input.next_input().await.unwrap(), b"candidate-route"[..]);
+        host.send_media_frame(
+            video_spec(30),
+            b"candidate-media",
+            Duration::from_millis(250),
+        )
+        .unwrap();
+        assert_eq!(
+            client.receive_media_frame().await.unwrap().bytes,
+            b"candidate-media"
+        );
+
+        // Roll back over the current route, advancing to epoch 3 and restoring
+        // authority exclusively to the retained connection at index 0.
+        let rollback = route_message(RouteTransitionStage::Prepare, 2, 2, [0x21; 32]);
+        host.send_route_transition(rollback).await.unwrap();
+        client
+            .next_route_transition(&mut client_candidate_control)
+            .await
+            .unwrap();
+        client
+            .send_route_transition(RouteTransitionMessage {
+                stage: RouteTransitionStage::Prepared,
+                ..rollback
+            })
+            .await
+            .unwrap();
+        host.next_route_transition(&mut host_candidate_control)
+            .await
+            .unwrap();
+        host.send_route_transition(RouteTransitionMessage {
+            stage: RouteTransitionStage::Commit,
+            ..rollback
+        })
+        .await
+        .unwrap();
+        assert_eq!(host.active_index(), 1);
+        client
+            .next_route_transition(&mut client_candidate_control)
+            .await
+            .unwrap();
+        assert_eq!(client.active_index(), 0);
+        host.next_route_activation(&mut host_control).await.unwrap();
+        client
+            .next_route_confirmation(&mut client_control)
+            .await
+            .unwrap();
+        assert_eq!(host.active_index(), 0);
+        assert_eq!(client.active_index(), 0);
+        assert_eq!(host.stamp().route_epoch, 3);
+        assert_eq!(client.stamp().route_epoch, 3);
+        assert!(matches!(
+            client.routes[1].send_input(b"stale-candidate").await,
+            Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InactiveRoute
+            ))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_active_candidate_rolls_back_over_the_retained_path() {
+        let (mut host, mut client) = product_route_sets(1_450).await;
+        let mut client_retained = client.accept_control_receiver().await.unwrap();
+        let prepare = route_message(RouteTransitionStage::Prepare, 1, 1, [0x31; 32]);
+        host.send_route_transition(prepare).await.unwrap();
+        client
+            .next_route_transition(&mut client_retained)
+            .await
+            .unwrap();
+        client
+            .send_route_transition(RouteTransitionMessage {
+                stage: RouteTransitionStage::Prepared,
+                ..prepare
+            })
+            .await
+            .unwrap();
+        let mut host_retained = host.accept_control_receiver().await.unwrap();
+        host.next_route_transition(&mut host_retained)
+            .await
+            .unwrap();
+        host.send_route_transition(RouteTransitionMessage {
+            stage: RouteTransitionStage::Commit,
+            ..prepare
+        })
+        .await
+        .unwrap();
+        client
+            .next_route_transition(&mut client_retained)
+            .await
+            .unwrap();
+        let mut host_candidate = host.accept_standby_control_receiver().await.unwrap();
+        host.next_route_activation(&mut host_candidate)
+            .await
+            .unwrap();
+        let mut client_candidate = client.accept_control_receiver().await.unwrap();
+        client
+            .next_route_confirmation(&mut client_candidate)
+            .await
+            .unwrap();
+        assert_eq!((host.active_index(), client.active_index()), (1, 1));
+
+        let rollback = route_message(RouteTransitionStage::Prepare, 2, 2, [0x21; 32]);
+        assert!(matches!(
+            host.send_rollback_via_retained(rollback).await,
+            Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InvalidState
+            ))
+        ));
+        host.routes[1].set_route_authorized(false);
+        client.routes[1].set_route_authorized(false);
+        host.send_rollback_via_retained(rollback).await.unwrap();
+        client
+            .next_route_transition(&mut client_retained)
+            .await
+            .unwrap();
+        client
+            .send_route_transition(RouteTransitionMessage {
+                stage: RouteTransitionStage::Prepared,
+                ..rollback
+            })
+            .await
+            .unwrap();
+        host.next_route_transition(&mut host_retained)
+            .await
+            .unwrap();
+        host.send_route_transition(RouteTransitionMessage {
+            stage: RouteTransitionStage::Commit,
+            ..rollback
+        })
+        .await
+        .unwrap();
+        client
+            .next_route_transition(&mut client_retained)
+            .await
+            .unwrap();
+        host.next_route_activation(&mut host_retained)
+            .await
+            .unwrap();
+        client
+            .next_route_confirmation(&mut client_retained)
+            .await
+            .unwrap();
+        assert_eq!((host.active_index(), client.active_index()), (0, 0));
+        assert_eq!(
+            (host.stamp().route_epoch, client.stamp().route_epoch),
+            (3, 3)
+        );
+        client.send_input(b"retained-after-failure").await.unwrap();
+        let mut input = host.accept_input_receiver().await.unwrap();
+        assert_eq!(
+            input.next_input().await.unwrap(),
+            b"retained-after-failure"[..]
+        );
+        assert_eq!(
+            (
+                host.routes[0].stamp().route_epoch,
+                host.routes[1].stamp().route_epoch,
+            ),
+            (3, 3)
+        );
+
+        let repromote = route_message(RouteTransitionStage::Prepare, 3, 3, [0x31; 32]);
+        host.send_route_transition(repromote).await.unwrap();
+        client
+            .next_route_transition(&mut client_retained)
+            .await
+            .unwrap();
+        client
+            .send_route_transition(RouteTransitionMessage {
+                stage: RouteTransitionStage::Prepared,
+                ..repromote
+            })
+            .await
+            .unwrap();
+        host.next_route_transition(&mut host_retained)
+            .await
+            .unwrap();
+        host.send_route_transition(RouteTransitionMessage {
+            stage: RouteTransitionStage::Commit,
+            ..repromote
+        })
+        .await
+        .unwrap();
+        client
+            .next_route_transition(&mut client_retained)
+            .await
+            .unwrap();
+        host.next_route_activation(&mut host_candidate)
+            .await
+            .unwrap();
+        client
+            .next_route_confirmation(&mut client_candidate)
+            .await
+            .unwrap();
+        assert_eq!((host.active_index(), client.active_index()), (1, 1));
+        assert_eq!(
+            (host.stamp().route_epoch, client.stamp().route_epoch),
+            (4, 4)
+        );
+
+        host.fail_active_route(0x104, b"injected active path failure");
+        client.fail_active_route(0x104, b"injected active path failure");
+        let closed_rollback = route_message(RouteTransitionStage::Prepare, 4, 4, [0x21; 32]);
+        host.send_rollback_via_retained(closed_rollback)
+            .await
+            .unwrap();
+        client
+            .next_route_transition(&mut client_retained)
+            .await
+            .unwrap();
+        client
+            .send_route_transition(RouteTransitionMessage {
+                stage: RouteTransitionStage::Prepared,
+                ..closed_rollback
+            })
+            .await
+            .unwrap();
+        host.next_route_transition(&mut host_retained)
+            .await
+            .unwrap();
+        host.send_route_transition(RouteTransitionMessage {
+            stage: RouteTransitionStage::Commit,
+            ..closed_rollback
+        })
+        .await
+        .unwrap();
+        client
+            .next_route_transition(&mut client_retained)
+            .await
+            .unwrap();
+        host.next_route_activation(&mut host_retained)
+            .await
+            .unwrap();
+        client
+            .next_route_confirmation(&mut client_retained)
+            .await
+            .unwrap();
+        assert_eq!((host.active_index(), client.active_index()), (0, 0));
+        assert_eq!(
+            (host.stamp().route_epoch, client.stamp().route_epoch),
+            (5, 5)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn route_set_rejects_a_second_connection_to_another_exact_peer() {
+        let (same_host, _same_client) = product_pair(1_450).await;
+        let same_candidate = UnauthorizedCandidateSession::new(same_host.clone());
+        let same_active_binding = route_binding(&same_host, 0x21);
+        let same_candidate_binding = candidate_route_binding(&same_candidate, 0x31);
+        assert!(matches!(
+            ProductRouteSet::new(
+                same_host,
+                same_active_binding,
+                same_candidate,
+                same_candidate_binding
+            ),
+            Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::DuplicateConnection
+            ))
+        ));
+        let (first_host, _first_client) = product_pair(1_450).await;
+        let (second_host, _second_client) = product_pair(1_450).await;
+        let foreign_candidate = UnauthorizedCandidateSession::new(second_host);
+        let first_binding = route_binding(&first_host, 0x21);
+        let foreign_binding = candidate_route_binding(&foreign_candidate, 0x31);
+        assert!(matches!(
+            ProductRouteSet::new(
+                first_host,
+                first_binding,
+                foreign_candidate,
+                foreign_binding
+            ),
+            Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::PeerIdentityMismatch
+            ))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn route_set_prepare_timeout_revokes_both_connections() {
+        let (mut host, _client) = product_route_sets(1_450).await;
+        host.send_route_transition(route_message(
+            RouteTransitionStage::Prepare,
+            1,
+            1,
+            [0x31; 32],
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(ROUTE_TRANSITION_TIMEOUT + Duration::from_millis(50)).await;
+        assert!(matches!(
+            host.send_input(b"after-expiry").await,
+            Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InactiveRoute
+            ))
+        ));
+        assert!(!host.routes[0].route_authorized.load(Ordering::Acquire));
+        assert!(!host.routes[1].route_authorized.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelling_commit_after_wire_write_revokes_the_whole_route_set() {
+        let (mut host, mut client) = product_route_sets(1_450).await;
+        let mut client_control = client.accept_control_receiver().await.unwrap();
+        let prepare = route_message(RouteTransitionStage::Prepare, 1, 1, [0x31; 32]);
+        host.send_route_transition(prepare).await.unwrap();
+        client
+            .next_route_transition(&mut client_control)
+            .await
+            .unwrap();
+        client
+            .send_route_transition(RouteTransitionMessage {
+                stage: RouteTransitionStage::Prepared,
+                ..prepare
+            })
+            .await
+            .unwrap();
+        let mut host_control = host.accept_control_receiver().await.unwrap();
+        host.next_route_transition(&mut host_control).await.unwrap();
+
+        let hook = Arc::new(IceSendCancellationHook::default());
+        host.routes[0].route_send_cancellation_hook = Some(Arc::clone(&hook));
+        let retained = [host.routes[0].clone(), host.routes[1].clone()];
+        let commit = RouteTransitionMessage {
+            stage: RouteTransitionStage::Commit,
+            ..prepare
+        };
+        let task = tokio::spawn(async move { host.send_route_transition(commit).await });
+        hook.reached.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!retained[0].route_authorized.load(Ordering::Acquire));
+        assert!(!retained[1].route_authorized.load(Ordering::Acquire));
+        assert!(matches!(
+            retained[1].send_input(b"must-not-send").await,
+            Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InactiveRoute
+            ))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelling_commit_receive_after_epoch_update_revokes_both_routes() {
+        let (mut host, mut client) = product_route_sets(1_450).await;
+        let mut client_control = client.accept_control_receiver().await.unwrap();
+        let prepare = route_message(RouteTransitionStage::Prepare, 1, 1, [0x31; 32]);
+        host.send_route_transition(prepare).await.unwrap();
+        client
+            .next_route_transition(&mut client_control)
+            .await
+            .unwrap();
+        client
+            .send_route_transition(RouteTransitionMessage {
+                stage: RouteTransitionStage::Prepared,
+                ..prepare
+            })
+            .await
+            .unwrap();
+        let mut host_control = host.accept_control_receiver().await.unwrap();
+        host.next_route_transition(&mut host_control).await.unwrap();
+
+        let hook = Arc::new(IceSendCancellationHook::default());
+        client_control.receiver.route_receive_cancellation_hook = Some(Arc::clone(&hook));
+        let retained = [client.routes[0].clone(), client.routes[1].clone()];
+        let receive =
+            tokio::spawn(async move { client.next_route_transition(&mut client_control).await });
+        host.send_route_transition(RouteTransitionMessage {
+            stage: RouteTransitionStage::Commit,
+            ..prepare
+        })
+        .await
+        .unwrap();
+        hook.reached.notified().await;
+        receive.abort();
+        assert!(receive.await.unwrap_err().is_cancelled());
+        assert!(!retained[0].route_authorized.load(Ordering::Acquire));
+        assert!(!retained[1].route_authorized.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn route_commit_without_prepare_and_generic_route_control_fail_closed() {
+        let (host, _client) = product_pair(1_450).await;
+        let commit = route_message(RouteTransitionStage::Commit, 1, 1, [0x11; 32]);
+        assert!(matches!(
+            host.send_route_transition(commit).await,
+            Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::InvalidState
+            ))
+        ));
+        assert!(matches!(
+            host.send_control(ControlKind::RoutePrepare, &commit.encode().unwrap())
+                .await,
+            Err(ProductSessionError::RouteTransition(
+                RouteTransitionViolation::ControlRequiresTypedApi
+            ))
+        ));
+        assert_eq!(host.stamp().route_epoch, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn route_epoch_promotion_and_rollback_update_all_live_product_lanes() {
+        let (host, client) = product_pair(1_450).await;
+        let mut client_control = client
+            .accept_control_receiver()
+            .await
+            .expect("retained control receiver");
+
+        assert_eq!(host.advance_route_epoch(1, 2).unwrap().route_epoch, 2);
+        assert_eq!(client.advance_route_epoch(1, 2).unwrap().route_epoch, 2);
+        assert!(matches!(
+            host.advance_route_epoch(1, 2),
+            Err(ProductSessionError::RouteEpochTransition {
+                actual_current: 2,
+                ..
+            })
+        ));
+
+        host.send_control(ControlKind::ConfigureStream, b"epoch-2")
+            .await
+            .expect("epoch-2 control");
+        assert_eq!(
+            client_control
+                .next_control()
+                .await
+                .expect("epoch-2 control receive")
+                .payload,
+            Bytes::from_static(b"epoch-2")
+        );
+        client.send_input(b"epoch-2-input").await.unwrap();
+        let mut host_input = host.accept_input_receiver().await.unwrap();
+        assert_eq!(
+            host_input.next_input().await.unwrap(),
+            Bytes::from_static(b"epoch-2-input")
+        );
+        host.send_media_frame(video_spec(21), b"epoch-2-media", Duration::from_millis(250))
+            .unwrap();
+        assert_eq!(
+            client.receive_media_frame().await.unwrap().bytes,
+            b"epoch-2-media"
+        );
+
+        // A failed candidate rolls back by advancing again; epoch values never
+        // return to the prior route's number.
+        assert_eq!(host.advance_route_epoch(2, 3).unwrap().route_epoch, 3);
+        assert_eq!(client.advance_route_epoch(2, 3).unwrap().route_epoch, 3);
+        host.send_control(ControlKind::ConfigureStream, b"epoch-3")
+            .await
+            .expect("epoch-3 control");
+        assert_eq!(
+            client_control
+                .next_control()
+                .await
+                .expect("epoch-3 control receive")
+                .payload,
+            Bytes::from_static(b"epoch-3")
+        );
+        client.send_input(b"epoch-3-input").await.unwrap();
+        assert_eq!(
+            host_input.next_input().await.unwrap(),
+            Bytes::from_static(b"epoch-3-input")
+        );
+        host.send_media_frame(video_spec(22), b"epoch-3-media", Duration::from_millis(250))
+            .unwrap();
+        assert_eq!(
+            client.receive_media_frame().await.unwrap().bytes,
+            b"epoch-3-media"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_route_epoch_is_rejected_before_control_input_or_media_dispatch() {
+        // Reliable control.
+        let (host, client) = product_pair(1_450).await;
+        let old_stamp = host.stamp();
+        let mut receiver = client.accept_control_receiver().await.unwrap();
+        host.advance_route_epoch(1, 2).unwrap();
+        client.advance_route_epoch(1, 2).unwrap();
+        let control = ControlPacket::encode(
+            ControlHeader {
+                kind: ControlKind::ConfigureStream,
+                flags: 0,
+                session_id: old_stamp.session_id,
+                payload_len: 5,
+            },
+            b"stale",
+        )
+        .unwrap();
+        let record = StreamRecord::encode(StreamKind::Control, old_stamp, &control).unwrap();
+        host.connection.send_control(&record).await.unwrap();
+        assert!(matches!(
+            receiver.next_control().await,
+            Err(ProductSessionError::PeerProtocol(
+                ProductProtocolViolation::StampMismatch { .. }
+            ))
+        ));
+
+        // Ordered input.
+        let (host, client) = product_pair(1_450).await;
+        let old_stamp = client.stamp();
+        host.advance_route_epoch(1, 2).unwrap();
+        client.advance_route_epoch(1, 2).unwrap();
+        let record = StreamRecord::encode(StreamKind::Input, old_stamp, b"stale").unwrap();
+        client.connection.send_input(&record).await.unwrap();
+        let mut receiver = host.accept_input_receiver().await.unwrap();
+        assert!(matches!(
+            receiver.next_input().await,
+            Err(ProductSessionError::PeerProtocol(
+                ProductProtocolViolation::StampMismatch { .. }
+            ))
+        ));
+
+        // Media before reassembly.
+        let (host, client) = product_pair(1_450).await;
+        let old_stamp = host.stamp();
+        host.advance_route_epoch(1, 2).unwrap();
+        client.advance_route_epoch(1, 2).unwrap();
+        let inner =
+            fragment_frame_with_packet_budget(video_spec(1), b"stale-media", MEDIA_HEADER_LEN + 64)
+                .unwrap()
+                .remove(0);
+        let inner = MediaPacket::decode(&inner).unwrap();
+        let wire =
+            MediaDatagram::encode(old_stamp, 1_000_000, inner.header, inner.payload).unwrap();
+        host.connection
+            .send_media(Bytes::from(wire), 0, 1_000_000)
+            .unwrap();
+        assert!(matches!(
+            client.receive_media_frame().await,
+            Err(ProductSessionError::PeerProtocol(
+                ProductProtocolViolation::StampMismatch { .. }
+            ))
         ));
     }
 

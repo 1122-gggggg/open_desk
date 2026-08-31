@@ -13,10 +13,15 @@ spec.loader.exec_module(module)
 
 
 def latency_line(target: str, session_id: int, latency_offset: int = 0) -> str:
-    values = [10 + latency_offset, 20 + latency_offset, 30 + latency_offset, 40 + latency_offset]
+    values = [
+        10 + latency_offset,
+        20 + latency_offset,
+        30 + latency_offset,
+        40 + latency_offset,
+    ]
     return (
         f"input-latency: target={target} session_id={session_id} generation=1 "
-        "authorization_epoch=1 display_epoch=1 codec_epoch=1 samples=4 "
+        "authorization_epoch=1 display_epoch=1 codec_epoch=1 route_epoch=1 samples=4 "
         f"min_us={values[0]} p50_us={values[1]} p95_us={values[3]} "
         f"p99_us={values[3]} max_us={values[3]} "
         f"mean_us={sum(values) // len(values)} raw_us="
@@ -27,14 +32,14 @@ def latency_line(target: str, session_id: int, latency_offset: int = 0) -> str:
 def start_line(target: str, session_id: int) -> str:
     return (
         f"input-latency-start: target={target} session_id={session_id} generation=1 "
-        "authorization_epoch=1 display_epoch=1 codec_epoch=1 samples=4"
+        "authorization_epoch=1 display_epoch=1 codec_epoch=1 route_epoch=1 samples=4"
     )
 
 
 def stop_line(target: str, session_id: int) -> str:
     return (
         f"input-latency-stop: target={target} session_id={session_id} generation=1 "
-        "authorization_epoch=1 display_epoch=1 codec_epoch=1 samples=4"
+        "authorization_epoch=1 display_epoch=1 codec_epoch=1 route_epoch=1 samples=4"
     )
 
 
@@ -96,8 +101,10 @@ class MultiTargetInputParsingTests(unittest.TestCase):
             ]
         )
         records = module.parse_probe_records(output)
-        self.assertEqual([item["target"] for item in records], ["127.0.0.1:4001", "127.0.0.1:4002"])
-        self.assertEqual(records[0]["stamp"], (11, 1, 1, 1, 1))
+        self.assertEqual(
+            [item["target"] for item in records], ["127.0.0.1:4001", "127.0.0.1:4002"]
+        )
+        self.assertEqual(records[0]["stamp"], (11, 1, 1, 1, 1, 1))
         self.assertEqual(len(records[1]["samples"]), 4)
 
     def test_duplicate_target_or_session_fails_closed(self):
@@ -146,7 +153,7 @@ class MultiTargetInputValidationTests(unittest.TestCase):
             "mTLS: exact client certificate authenticated\n"
             "session: active session_id=11\n"
             "session-lifecycle: generation=1 authorization_epoch=1 "
-            "display_epoch=1 codec_epoch=1\n"
+            "display_epoch=1 codec_epoch=1 route_epoch=1\n"
             "stream: explicit Raw NV12 320x180 over QUIC DATAGRAM\n"
             "input: ReleaseAll applied\n"
         )
@@ -166,7 +173,7 @@ class MultiTargetInputValidationTests(unittest.TestCase):
         self.assertTrue(all(checks.values()))
 
         wrong = dict(record)
-        wrong["stamp"] = (11, 2, 1, 1, 1)
+        wrong["stamp"] = (11, 2, 1, 1, 1, 1)
         checks, errors = module.validate_target_evidence(
             address,
             certificate,
@@ -189,11 +196,11 @@ class MultiTargetInputValidationTests(unittest.TestCase):
                 "mTLS: exact host certificate authenticated",
                 "route: authenticated 127.0.0.1:4001 after racing 1 candidate(s)",
                 "handshake: active session_id=11",
-                "handshake-lifecycle: generation=1 authorization_epoch=1 display_epoch=1 codec_epoch=1",
+                "handshake-lifecycle: generation=1 authorization_epoch=1 display_epoch=1 codec_epoch=1 route_epoch=1",
                 "mTLS: exact host certificate authenticated",
                 "route: authenticated 127.0.0.1:4002 after racing 1 candidate(s)",
                 "handshake: active session_id=22",
-                "handshake-lifecycle: generation=1 authorization_epoch=1 display_epoch=1 codec_epoch=1",
+                "handshake-lifecycle: generation=1 authorization_epoch=1 display_epoch=1 codec_epoch=1 route_epoch=1",
                 start_line("127.0.0.1:4001", 11),
                 start_line("127.0.0.1:4002", 22),
                 stop_line("127.0.0.1:4001", 11),
@@ -236,7 +243,7 @@ class MultiTargetInputValidationTests(unittest.TestCase):
                     f"route: authenticated {address} after racing 1 candidate(s)",
                     f"handshake: active session_id={session_id}",
                     "handshake-lifecycle: generation=1 authorization_epoch=1 "
-                    "display_epoch=1 codec_epoch=1",
+                    "display_epoch=1 codec_epoch=1 route_epoch=1",
                     start_line(address, session_id),
                     stop_line(address, session_id),
                     latency_line(address, session_id, index),
@@ -268,11 +275,16 @@ class MultiTargetInputCliTests(unittest.TestCase):
         )
         self.assertEqual(len(hosts), 2)
         self.assertTrue(
-            all(command[command.index("--listen") + 1] == "127.0.0.1:0" for command in hosts)
+            all(
+                command[command.index("--listen") + 1] == "127.0.0.1:0"
+                for command in hosts
+            )
         )
         self.assertEqual(parent.count("--target"), 2)
         self.assertEqual(parent[parent.index("--input-latency-probes") + 1], "128")
-        targets = [parent[index + 1] for index, item in enumerate(parent) if item == "--target"]
+        targets = [
+            parent[index + 1] for index, item in enumerate(parent) if item == "--target"
+        ]
         self.assertEqual(len(set(targets)), 2)
         self.assertFalse(module.secure.commands_contain_unsafe_flag([*hosts, parent]))
 
@@ -282,18 +294,12 @@ class MultiTargetInputCliTests(unittest.TestCase):
             {f"host{index}": Path(f"private/host{index}") for index in range(1, 17)}
         )
         addresses = [f"127.0.0.1:{port}" for port in range(41001, 41017)]
-        hosts = module.build_host_commands(
-            Path("host"), ["127.0.0.1:0"] * 16, dirs
-        )
-        parent = module.build_parent_command(
-            Path("client"), addresses, dirs, 100
-        )
+        hosts = module.build_host_commands(Path("host"), ["127.0.0.1:0"] * 16, dirs)
+        parent = module.build_parent_command(Path("client"), addresses, dirs, 100)
         self.assertEqual(len(hosts), 16)
         self.assertEqual(parent.count("--target"), 16)
         targets = [
-            parent[index + 1]
-            for index, item in enumerate(parent)
-            if item == "--target"
+            parent[index + 1] for index, item in enumerate(parent) if item == "--target"
         ]
         self.assertEqual(len(set(targets)), 16)
 

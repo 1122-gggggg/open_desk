@@ -1,0 +1,17 @@
+[package]
+name = "latencydesk-route-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+latencydesk-protocol = { path = "../../crates/protocol" }
+latencydesk-socket-transport = { path = "../../crates/socket-transport" }
+latencydesk-transport = { path = "../../crates/transport" }
+quinn.workspace = true
+tokio.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

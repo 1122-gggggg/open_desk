@@ -29,6 +29,7 @@ members = [
     "crates/transport",
     "crates/turn-relay",
     "apps/turn-relayd",
+    "apps/route-probe",
 ]
 
 [workspace.package]

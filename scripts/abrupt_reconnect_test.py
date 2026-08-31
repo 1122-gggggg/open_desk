@@ -41,11 +41,11 @@ LOOPBACK_RECOVERY_TARGET_MS = 2_000.0
 STREAM_RE = re.compile(r"stream: .*over QUIC DATAGRAM", re.I)
 SESSION_RE = re.compile(r"(?:session: active|handshake: active) session_id=(\d+)", re.I)
 LIFE_RE = re.compile(
-    r"session-lifecycle: generation=(\d+) authorization_epoch=(\d+) display_epoch=(\d+) codec_epoch=(\d+)",
+    r"session-lifecycle: generation=(\d+) authorization_epoch=(\d+) display_epoch=(\d+) codec_epoch=(\d+) route_epoch=(\d+)",
     re.I,
 )
 CLIENT_LIFE_RE = re.compile(
-    r"handshake-lifecycle: generation=(\d+) authorization_epoch=(\d+) display_epoch=(\d+) codec_epoch=(\d+)",
+    r"handshake-lifecycle: generation=(\d+) authorization_epoch=(\d+) display_epoch=(\d+) codec_epoch=(\d+) route_epoch=(\d+)",
     re.I,
 )
 RECEIVED_RE = re.compile(r"received: session_id=(\d+) frames=(\d+)", re.I)
@@ -67,14 +67,15 @@ def bounded_float(name: str, minimum: float, maximum: float):
 
 
 def lifecycles_strictly_advance(
-    lifecycles: Sequence[tuple[int, int, int, int]],
+    lifecycles: Sequence[tuple[int, int, int, int, int]],
 ) -> bool:
-    return len(lifecycles) == 2 and all(
-        current > previous
-        for previous_lifecycle, current_lifecycle in zip(
-            lifecycles, lifecycles[1:]
+    return (
+        len(lifecycles) == 2
+        and all(
+            current > previous
+            for previous, current in zip(lifecycles[0][:4], lifecycles[1][:4])
         )
-        for previous, current in zip(previous_lifecycle, current_lifecycle)
+        and lifecycles[0][4] == lifecycles[1][4] == 1
     )
 
 
@@ -222,7 +223,8 @@ def validate_abrupt_result(
         "post_resume_reconnect_within_target": isinstance(
             observation.get("post_resume_reconnect_ms"), (int, float)
         )
-        and 0 <= float(observation["post_resume_reconnect_ms"])
+        and 0
+        <= float(observation["post_resume_reconnect_ms"])
         <= LOOPBACK_RECOVERY_TARGET_MS,
         "two_matching_sessions": observation.get("host_session_ids")
         == observation.get("client_session_ids")
@@ -312,8 +314,7 @@ def extract_evidence(
         "proxy_dropped": proxy.dropped,
         "proxy_forwarded": proxy.forwarded,
         "proxy_forwarded_after_resume": proxy.forwarded_after_resume,
-        "proxy_resumed": proxy.resumed
-        and proxy.forwarded_after_resume > 0,
+        "proxy_resumed": proxy.resumed and proxy.forwarded_after_resume > 0,
         "drop_triggered_after_desktop_stream": True,
         "identity_generation_ok": identity_generation_ok,
         "transport_loss_logged": loss,
@@ -431,7 +432,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "reconnect: recovered authenticated session",
             RECOVERY_OBSERVATION_TIMEOUT,
         ):
-            raise RuntimeError("client did not authenticate a successor after proxy resume")
+            raise RuntimeError(
+                "client did not authenticate a successor after proxy resume"
+            )
         post_resume_reconnect_ms = (time.monotonic() - resumed_at) * 1_000
         client_exit, client_timeout = client_proc.finish(45)
         host_exit, host_timeout = host_proc.finish(15)

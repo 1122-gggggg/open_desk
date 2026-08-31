@@ -6,6 +6,7 @@ probe interval must overlap, and every raw sample remains bound to its target
 and full product lifecycle. This is single-machine application-ACK RTT, not
 input-to-photon or a competitor comparison.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -33,14 +34,14 @@ START_PREFIX_RE = re.compile(r"^input-latency-start:", re.MULTILINE | re.IGNOREC
 START_RE = re.compile(
     r"^input-latency-start:\s+target=(\S+)\s+session_id=(\d+)\s+"
     r"generation=(\d+)\s+authorization_epoch=(\d+)\s+display_epoch=(\d+)\s+"
-    r"codec_epoch=(\d+)\s+samples=(\d+)\s*$",
+    r"codec_epoch=(\d+)\s+route_epoch=(\d+)\s+samples=(\d+)\s*$",
     re.MULTILINE | re.IGNORECASE,
 )
 STOP_PREFIX_RE = re.compile(r"^input-latency-stop:", re.MULTILINE | re.IGNORECASE)
 STOP_RE = re.compile(
     r"^input-latency-stop:\s+target=(\S+)\s+session_id=(\d+)\s+"
     r"generation=(\d+)\s+authorization_epoch=(\d+)\s+display_epoch=(\d+)\s+"
-    r"codec_epoch=(\d+)\s+samples=(\d+)\s*$",
+    r"codec_epoch=(\d+)\s+route_epoch=(\d+)\s+samples=(\d+)\s*$",
     re.MULTILINE | re.IGNORECASE,
 )
 HOST_CERTIFICATE_RE = re.compile(
@@ -73,9 +74,12 @@ def parse_probe_records(output: str) -> list[dict[str, object]]:
             "authorization_epoch",
             "display_epoch",
             "codec_epoch",
+            "route_epoch",
         }
         if not required <= fields.keys():
-            raise ValueError("input-latency record is missing target/full lifecycle fields")
+            raise ValueError(
+                "input-latency record is missing target/full lifecycle fields"
+            )
         parsed = input_probe.parse_input_latency(f"input-latency: {body}")
         stamp = (
             _positive_int(fields, "session_id"),
@@ -83,6 +87,7 @@ def parse_probe_records(output: str) -> list[dict[str, object]]:
             _positive_int(fields, "authorization_epoch"),
             _positive_int(fields, "display_epoch"),
             _positive_int(fields, "codec_epoch"),
+            _positive_int(fields, "route_epoch"),
         )
         parsed.update(target=fields["target"], stamp=stamp)
         records.append(parsed)
@@ -107,8 +112,8 @@ def _parse_probe_boundaries(
     boundaries = [
         {
             "target": target,
-            "stamp": tuple(int(value) for value in values[:5]),
-            "samples": int(values[5]),
+            "stamp": tuple(int(value) for value in values[:6]),
+            "samples": int(values[6]),
         }
         for target, *values in matches
     ]
@@ -218,7 +223,9 @@ def read_process_sample(pid: int, proc_root: Path = Path("/proc")) -> dict[str, 
     }
 
 
-def _group_identity(snapshot: dict[str, object]) -> list[tuple[int, int, int, int, int]]:
+def _group_identity(
+    snapshot: dict[str, object],
+) -> list[tuple[int, int, int, int, int]]:
     return [
         (
             int(member["pid"]),
@@ -372,7 +379,11 @@ def concurrent_probe_overlap(
     parent_alive: bool,
     host_alive: Sequence[bool],
 ) -> bool:
-    if not parent_alive or len(host_alive) != len(expected_targets) or not all(host_alive):
+    if (
+        not parent_alive
+        or len(host_alive) != len(expected_targets)
+        or not all(host_alive)
+    ):
         return False
     try:
         starts = parse_probe_starts(output)
@@ -480,7 +491,7 @@ def validate_target_evidence(
         [(host_ids[0], host_lifecycles[0][1])]
         if len(host_ids) == len(host_lifecycles) == 1
         else [],
-        [(stamp[0], stamp[2])] if len(stamp) == 5 else [],
+        [(stamp[0], stamp[2])] if len(stamp) == 6 else [],
         ceiling_us,
     )
     certificates = [value.lower() for value in HOST_CERTIFICATE_RE.findall(host_output)]
@@ -491,7 +502,7 @@ def validate_target_evidence(
         and stop.get("target") == address,
         "full_stamp_matches_host": len(host_ids) == 1
         and len(host_lifecycles) == 1
-        and len(stamp) == 5
+        and len(stamp) == 6
         and stamp[0] == host_ids[0]
         and stamp[1:] == host_lifecycles[0],
         "boundaries_match_completion": start_stamp == stamp
@@ -527,9 +538,7 @@ def validate_global_evidence(
     start_targets = [str(start.get("target", "")) for start in starts]
     stop_targets = [str(stop.get("target", "")) for stop in stops]
     record_stamps = [tuple(record.get("stamp", ())) for record in records]
-    start_by_target = {
-        str(start.get("target", "")): start for start in starts
-    }
+    start_by_target = {str(start.get("target", "")): start for start in starts}
     stop_by_target = {str(stop.get("target", "")): stop for stop in stops}
     client_ids = secure.parse_client_session_ids(parent_output)
     client_lifecycles = [
@@ -557,12 +566,12 @@ def validate_global_evidence(
             for target, record in zip(record_targets, records)
         ),
         "distinct_session_ids": len(record_stamps) == len(expected_targets)
-        and all(len(stamp) == 5 for stamp in record_stamps)
+        and all(len(stamp) == 6 for stamp in record_stamps)
         and len({stamp[0] for stamp in record_stamps}) == len(expected_targets),
         "exact_client_session_ids": len(client_ids) == len(expected_targets)
-        and set(client_ids) == {stamp[0] for stamp in record_stamps if len(stamp) == 5},
+        and set(client_ids) == {stamp[0] for stamp in record_stamps if len(stamp) == 6},
         "exact_client_lifecycles": Counter(client_lifecycles)
-        == Counter(stamp[1:] for stamp in record_stamps if len(stamp) == 5),
+        == Counter(stamp[1:] for stamp in record_stamps if len(stamp) == 6),
         "exact_routes": len(routes) == len(expected_targets)
         and {route for route, _ in routes} == expected_targets
         and all(attempts == 1 for _, attempts in routes),
@@ -698,7 +707,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise RuntimeError("not every Host became ready")
 
         actual_addresses = [parse_host_listen_address(host.output()) for host in hosts]
-        if len(actual_addresses) != args.target_count or len(set(actual_addresses)) != args.target_count:
+        if (
+            len(actual_addresses) != args.target_count
+            or len(set(actual_addresses)) != args.target_count
+        ):
             raise RuntimeError("Hosts did not bind distinct loopback addresses")
         target_plan = [
             {
@@ -845,21 +857,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     p95_values = [
         int(record["summary"]["p95_us"])
         for record in records
-        if isinstance(record.get("summary"), dict)
-        and "p95_us" in record["summary"]
+        if isinstance(record.get("summary"), dict) and "p95_us" in record["summary"]
     ]
     aggregate = {
         "target_count": len(records),
-        "total_raw_samples": sum(
-            len(record.get("samples", [])) for record in records
-        ),
+        "total_raw_samples": sum(len(record.get("samples", [])) for record in records),
         "p95_min_us": min(p95_values) if p95_values else None,
         "p95_max_us": max(p95_values) if p95_values else None,
         "note": "p95 range preserves per-target distributions; samples are not pooled",
     }
-    target_indexes = {
-        str(item["address"]): int(item["index"]) for item in target_plan
-    }
+    target_indexes = {str(item["address"]): int(item["index"]) for item in target_plan}
 
     report.update(
         status="passed" if passed else "failed",

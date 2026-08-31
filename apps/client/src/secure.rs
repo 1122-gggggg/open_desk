@@ -111,23 +111,25 @@ fn nearest_rank(sorted: &[u64], percentile: usize) -> u64 {
 
 fn format_input_latency_start(stamp: SessionStamp, target: SocketAddr, probe_count: u32) -> String {
     format!(
-        "input-latency-start: target={target} session_id={} generation={} authorization_epoch={} display_epoch={} codec_epoch={} samples={probe_count}",
+        "input-latency-start: target={target} session_id={} generation={} authorization_epoch={} display_epoch={} codec_epoch={} route_epoch={} samples={probe_count}",
         stamp.session_id,
         stamp.generation,
         stamp.authorization_epoch,
         stamp.display_epoch,
         stamp.codec_epoch,
+        stamp.route_epoch,
     )
 }
 
 fn format_input_latency_stop(stamp: SessionStamp, target: SocketAddr, probe_count: u32) -> String {
     format!(
-        "input-latency-stop: target={target} session_id={} generation={} authorization_epoch={} display_epoch={} codec_epoch={} samples={probe_count}",
+        "input-latency-stop: target={target} session_id={} generation={} authorization_epoch={} display_epoch={} codec_epoch={} route_epoch={} samples={probe_count}",
         stamp.session_id,
         stamp.generation,
         stamp.authorization_epoch,
         stamp.display_epoch,
         stamp.codec_epoch,
+        stamp.route_epoch,
     )
 }
 
@@ -150,12 +152,13 @@ fn format_input_latency_report(
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "input-latency: target={target} session_id={} generation={} authorization_epoch={} display_epoch={} codec_epoch={} samples={} min_us={} p50_us={} p95_us={} p99_us={} max_us={} mean_us={} raw_us={raw}",
+        "input-latency: target={target} session_id={} generation={} authorization_epoch={} display_epoch={} codec_epoch={} route_epoch={} samples={} min_us={} p50_us={} p95_us={} p99_us={} max_us={} mean_us={} raw_us={raw}",
         stamp.session_id,
         stamp.generation,
         stamp.authorization_epoch,
         stamp.display_epoch,
         stamp.codec_epoch,
+        stamp.route_epoch,
         report.samples.len(),
         report.minimum_us,
         report.p50_us,
@@ -287,8 +290,12 @@ fn log_active_session(session: &ProductSession, remote: SocketAddr, attempts_sta
     println!("route: authenticated {remote} after racing {attempts_started} candidate(s)");
     println!("handshake: active session_id={}", stamp.session_id);
     println!(
-        "handshake-lifecycle: generation={} authorization_epoch={} display_epoch={} codec_epoch={}",
-        stamp.generation, stamp.authorization_epoch, stamp.display_epoch, stamp.codec_epoch
+        "handshake-lifecycle: generation={} authorization_epoch={} display_epoch={} codec_epoch={} route_epoch={}",
+        stamp.generation,
+        stamp.authorization_epoch,
+        stamp.display_epoch,
+        stamp.codec_epoch,
+        stamp.route_epoch
     );
 }
 
@@ -600,7 +607,7 @@ pub fn run(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
         "client-certificate-sha256: {}",
         encode_hex(&identity.fingerprint())
     );
-    println!("transport: QUIC v1 / TLS 1.3 / exact-certificate mTLS");
+    println!("transport: QUIC v2 / TLS 1.3 / exact-certificate mTLS");
 
     let candidates = super::connection_candidates(args);
     let (session, selected_remote, attempts_started) =
@@ -2729,6 +2736,7 @@ mod tests {
             authorization_epoch: 3,
             display_epoch: 4,
             codec_epoch: 5,
+            route_epoch: 1,
         };
         let ack = InputAppliedAck {
             stamp,
@@ -2782,6 +2790,7 @@ mod tests {
             authorization_epoch: 3,
             display_epoch: 4,
             codec_epoch: 5,
+            route_epoch: 1,
         };
         let target = "127.0.0.1:9001".parse().expect("target");
         let report =
@@ -2789,15 +2798,15 @@ mod tests {
 
         assert_eq!(
             format_input_latency_start(stamp, target, 2),
-            "input-latency-start: target=127.0.0.1:9001 session_id=41 generation=2 authorization_epoch=3 display_epoch=4 codec_epoch=5 samples=2"
+            "input-latency-start: target=127.0.0.1:9001 session_id=41 generation=2 authorization_epoch=3 display_epoch=4 codec_epoch=5 route_epoch=1 samples=2"
         );
         assert_eq!(
             format_input_latency_stop(stamp, target, 2),
-            "input-latency-stop: target=127.0.0.1:9001 session_id=41 generation=2 authorization_epoch=3 display_epoch=4 codec_epoch=5 samples=2"
+            "input-latency-stop: target=127.0.0.1:9001 session_id=41 generation=2 authorization_epoch=3 display_epoch=4 codec_epoch=5 route_epoch=1 samples=2"
         );
         let rendered = format_input_latency_report(stamp, target, &report);
         assert!(rendered.starts_with(
-            "input-latency: target=127.0.0.1:9001 session_id=41 generation=2 authorization_epoch=3 display_epoch=4 codec_epoch=5 samples=2"
+            "input-latency: target=127.0.0.1:9001 session_id=41 generation=2 authorization_epoch=3 display_epoch=4 codec_epoch=5 route_epoch=1 samples=2"
         ));
         assert!(rendered.ends_with("raw_us=1:10,2:20"));
     }

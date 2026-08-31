@@ -10,11 +10,11 @@ use crate::{
 };
 
 /// Bytes occupied by a [`SessionStamp`] in a QUIC application record.
-pub const SESSION_STAMP_LEN: usize = 28;
+pub const SESSION_STAMP_LEN: usize = 36;
 /// Bytes in a reliable QUIC stream record header.
-pub const STREAM_RECORD_HEADER_LEN: usize = 40;
+pub const STREAM_RECORD_HEADER_LEN: usize = 48;
 /// Bytes prepended to a media fragment carried in a QUIC DATAGRAM.
-pub const QUIC_MEDIA_HEADER_LEN: usize = 44;
+pub const QUIC_MEDIA_HEADER_LEN: usize = 52;
 /// Largest input record payload accepted by the protocol.
 pub const MAX_INPUT_BYTES: u32 = 64 * 1024;
 
@@ -35,12 +35,14 @@ pub struct SessionStamp {
     pub display_epoch: u32,
     /// Selected codec generation; zero is valid only before codec selection.
     pub codec_epoch: u32,
+    /// Active network route generation. Every on-wire record requires nonzero.
+    pub route_epoch: u64,
 }
 
 impl SessionStamp {
     /// Validates an identity that may still be in the pairing/control phase.
     pub fn validate_pending(self) -> Result<(), ProtocolError> {
-        if self.session_id == 0 || self.generation == 0 {
+        if self.session_id == 0 || self.generation == 0 || self.route_epoch == 0 {
             return Err(ProtocolError::InvalidSessionStamp);
         }
         Ok(())
@@ -68,6 +70,7 @@ impl SessionStamp {
         bytes[16..20].copy_from_slice(&self.authorization_epoch.to_be_bytes());
         bytes[20..24].copy_from_slice(&self.display_epoch.to_be_bytes());
         bytes[24..28].copy_from_slice(&self.codec_epoch.to_be_bytes());
+        bytes[28..36].copy_from_slice(&self.route_epoch.to_be_bytes());
     }
 
     fn decode_from(bytes: &[u8], offset: usize) -> Self {
@@ -77,6 +80,7 @@ impl SessionStamp {
             authorization_epoch: read_u32(bytes, offset + 16),
             display_epoch: read_u32(bytes, offset + 20),
             codec_epoch: read_u32(bytes, offset + 24),
+            route_epoch: read_u64(bytes, offset + 28),
         }
     }
 }
@@ -114,10 +118,10 @@ impl TryFrom<u8> for StreamKind {
 
 /// Fixed-width reliable stream record header.
 ///
-/// Layout (40 bytes):
+/// Layout (48 bytes):
 /// `magic[4], version[1], kind[1], reserved[2], session_id[8],
 /// generation[8], authorization_epoch[4], display_epoch[4],
-/// codec_epoch[4], payload_len[4]`.
+/// codec_epoch[4], route_epoch[8], payload_len[4]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamRecordHeader {
     /// Declared reliable lane.
@@ -152,8 +156,8 @@ impl StreamRecordHeader {
         bytes[0..4].copy_from_slice(&STREAM_RECORD_MAGIC);
         bytes[4] = WIRE_VERSION;
         bytes[5] = self.kind as u8;
-        self.stamp.encode_into(&mut bytes[8..36]);
-        bytes[36..40].copy_from_slice(&self.payload_len.to_be_bytes());
+        self.stamp.encode_into(&mut bytes[8..44]);
+        bytes[44..48].copy_from_slice(&self.payload_len.to_be_bytes());
         Ok(bytes)
     }
 
@@ -179,7 +183,7 @@ impl StreamRecordHeader {
         let header = Self {
             kind: StreamKind::try_from(bytes[5])?,
             stamp: SessionStamp::decode_from(bytes, 8),
-            payload_len: read_u32(bytes, 36),
+            payload_len: read_u32(bytes, 44),
         };
         header.validate()?;
         Ok(header)
@@ -296,8 +300,8 @@ impl<'a> MediaDatagram<'a> {
         let mut encoded_quic_header = [0_u8; QUIC_MEDIA_HEADER_LEN];
         encoded_quic_header[0..4].copy_from_slice(&MEDIA_DATAGRAM_MAGIC);
         encoded_quic_header[4] = WIRE_VERSION;
-        stamp.encode_into(&mut encoded_quic_header[8..36]);
-        encoded_quic_header[36..44].copy_from_slice(&expires_at_ns.to_be_bytes());
+        stamp.encode_into(&mut encoded_quic_header[8..44]);
+        encoded_quic_header[44..52].copy_from_slice(&expires_at_ns.to_be_bytes());
 
         let mut out = Vec::with_capacity(QUIC_MEDIA_HEADER_LEN + MEDIA_HEADER_LEN + payload.len());
         out.extend_from_slice(&encoded_quic_header);
@@ -338,7 +342,7 @@ impl<'a> MediaDatagram<'a> {
         }
         Ok(Self {
             stamp,
-            expires_at_ns: read_u64(bytes, 36),
+            expires_at_ns: read_u64(bytes, 44),
             packet,
         })
     }
@@ -365,6 +369,7 @@ mod tests {
             authorization_epoch: 0,
             display_epoch: 0,
             codec_epoch: 0,
+            route_epoch: 1,
         }
     }
 
@@ -439,6 +444,45 @@ mod tests {
         assert_eq!(
             StreamRecord::encode(StreamKind::Control, invalid, b"control"),
             Err(ProtocolError::InvalidSessionStamp)
+        );
+        let invalid_route = SessionStamp {
+            route_epoch: 0,
+            ..active_stamp()
+        };
+        assert_eq!(
+            StreamRecord::encode(StreamKind::Control, invalid_route, b"control"),
+            Err(ProtocolError::InvalidSessionStamp)
+        );
+    }
+
+    #[test]
+    fn protocol_v2_encodes_route_epoch_in_reliable_and_media_headers() {
+        let stamp = SessionStamp {
+            route_epoch: 0x0102_0304_0506_0708,
+            ..active_stamp()
+        };
+        let record = StreamRecord::encode(StreamKind::Control, stamp, b"x").unwrap();
+        assert_eq!(record[4], 2);
+        assert_eq!(&record[36..44], &stamp.route_epoch.to_be_bytes());
+        assert_eq!(&record[44..48], &1_u32.to_be_bytes());
+        assert_eq!(StreamRecord::decode(&record).unwrap().stamp, stamp);
+        let mut v1_record = record.clone();
+        v1_record[4] = 1;
+        assert_eq!(
+            StreamRecord::decode(&v1_record),
+            Err(ProtocolError::UnsupportedVersion(1))
+        );
+
+        let datagram = MediaDatagram::encode(stamp, 99, media_header(), b"h264").unwrap();
+        assert_eq!(datagram[4], 2);
+        assert_eq!(&datagram[36..44], &stamp.route_epoch.to_be_bytes());
+        assert_eq!(&datagram[44..52], &99_u64.to_be_bytes());
+        assert_eq!(MediaDatagram::decode(&datagram).unwrap().stamp, stamp);
+        let mut v1_datagram = datagram;
+        v1_datagram[4] = 1;
+        assert_eq!(
+            MediaDatagram::decode(&v1_datagram),
+            Err(ProtocolError::UnsupportedVersion(1))
         );
     }
 

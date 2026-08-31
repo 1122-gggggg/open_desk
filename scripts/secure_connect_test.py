@@ -9,6 +9,7 @@ between the two sessions.
 No identity material or command containing private-key paths is written to the
 JSON artifact.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -56,7 +57,7 @@ HOST_SESSION_RE = re.compile(
     r"^session:\s*active\s+session_id=(\d+)\s*$", re.IGNORECASE | re.MULTILINE
 )
 HOST_LIFECYCLE_RE = re.compile(
-    r"^session-lifecycle:\s*generation=(\d+)\s+authorization_epoch=(\d+)\s+display_epoch=(\d+)\s+codec_epoch=(\d+)\s*$",
+    r"^session-lifecycle:\s*generation=(\d+)\s+authorization_epoch=(\d+)\s+display_epoch=(\d+)\s+codec_epoch=(\d+)\s+route_epoch=(\d+)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 CLIENT_SESSION_RE = re.compile(
@@ -203,7 +204,9 @@ def prerequisite_skip_reason(
     if not platform.startswith("linux"):
         return "secure process smoke requires Linux X11; no processes were started"
     if not display or not display.strip():
-        return "secure process smoke requires a usable DISPLAY; no processes were started"
+        return (
+            "secure process smoke requires a usable DISPLAY; no processes were started"
+        )
     return None
 
 
@@ -249,8 +252,11 @@ def parse_host_session_ids(output: str) -> list[int]:
     return [int(value) for value in HOST_SESSION_RE.findall(output)]
 
 
-def parse_host_lifecycles(output: str) -> list[tuple[int, int, int, int]]:
-    return [tuple(int(value) for value in match) for match in HOST_LIFECYCLE_RE.findall(output)]
+def parse_host_lifecycles(output: str) -> list[tuple[int, int, int, int, int]]:
+    return [
+        tuple(int(value) for value in match)
+        for match in HOST_LIFECYCLE_RE.findall(output)
+    ]
 
 
 def parse_client_session_id(output: str) -> int | None:
@@ -271,7 +277,9 @@ def parse_received(output: str) -> tuple[int | None, int]:
 
 
 def parse_received_all(output: str) -> list[tuple[int, int]]:
-    return [(int(session), int(frames)) for session, frames in RECEIVED_RE.findall(output)]
+    return [
+        (int(session), int(frames)) for session, frames in RECEIVED_RE.findall(output)
+    ]
 
 
 def parse_client_route(output: str) -> tuple[str | None, int]:
@@ -317,7 +325,9 @@ def timeout_budgets(pairing_timeout: int) -> tuple[int, int, int]:
     rogue = min(5, max(2, pairing_timeout // 6))
     valid = pairing_timeout - ready - rogue - 5
     if valid < 5:
-        raise ValueError("pairing timeout is too small for rogue-then-valid verification")
+        raise ValueError(
+            "pairing timeout is too small for rogue-then-valid verification"
+        )
     return ready, rogue, valid
 
 
@@ -536,7 +546,9 @@ def validate_secure_result(
     return checks, errors
 
 
-def generate_identity(identity_bin: Path, name: str, directory: Path, timeout: int) -> None:
+def generate_identity(
+    identity_bin: Path, name: str, directory: Path, timeout: int
+) -> None:
     command = [
         str(identity_bin),
         "generate",
@@ -570,7 +582,9 @@ def generate_identity(identity_bin: Path, name: str, directory: Path, timeout: i
     if not certificate.is_file() or not private_key.is_file():
         raise RuntimeError(f"identity generator omitted required files for {name}")
     if os.name == "posix" and stat.S_IMODE(private_key.stat().st_mode) & 0o077:
-        raise RuntimeError(f"identity generator created an overly permissive key for {name}")
+        raise RuntimeError(
+            f"identity generator created an overly permissive key for {name}"
+        )
 
 
 def repository_state() -> tuple[str | None, bool | None]:
@@ -758,7 +772,9 @@ def run_secure_smoke(
         commands = (host_command, rogue_command, valid_command)
         observation["unsafe_flag_present"] = commands_contain_unsafe_flag(commands)
         if observation["unsafe_flag_present"]:
-            raise RuntimeError("refusing to execute a command containing --unsafe-udp-lab")
+            raise RuntimeError(
+                "refusing to execute a command containing --unsafe-udp-lab"
+            )
 
         host_process = TrackedProcess(host_command, ROOT)
         processes.append(host_process)
@@ -818,7 +834,9 @@ def run_secure_smoke(
         try:
             temporary.cleanup()
         except OSError as error:
-            cleanup_error = f"temporary credential cleanup failed: {error.__class__.__name__}"
+            cleanup_error = (
+                f"temporary credential cleanup failed: {error.__class__.__name__}"
+            )
             existing = observation.get("runtime_error")
             observation["runtime_error"] = (
                 f"{existing}; {cleanup_error}" if existing else cleanup_error
@@ -836,9 +854,10 @@ def run_secure_smoke(
     observation["host_exact_mtls_log"] = (
         host_output.lower().count(HOST_MTLS_MARKER.lower()) >= 2
     )
-    observation["rogue_rejection_logged"] = bool(
-        observation["rogue_rejection_logged"]
-    ) or HOST_REJECTION_MARKER.lower() in host_output.lower()
+    observation["rogue_rejection_logged"] = (
+        bool(observation["rogue_rejection_logged"])
+        or HOST_REJECTION_MARKER.lower() in host_output.lower()
+    )
     observation["host_graceful_shutdown_log"] = (
         HOST_SHUTDOWN_MARKER.lower() in host_output.lower()
     )
@@ -851,22 +870,33 @@ def run_secure_smoke(
     host_desktop_streams = parse_host_desktop_streams(host_output)
     observation["host_desktop_stream_log"] = host_desktop_streams >= 2
     client_routes = parse_client_routes(client_output)
-    selected_remote, candidate_attempts = client_routes[-1] if client_routes else (None, 0)
+    selected_remote, candidate_attempts = (
+        client_routes[-1] if client_routes else (None, 0)
+    )
     observation["client_fallback_selected"] = (
         listen_addr is not None
         and len(client_routes) >= 2
-        and all(remote == listen_addr and attempts >= 2 for remote, attempts in client_routes[-2:])
+        and all(
+            remote == listen_addr and attempts >= 2
+            for remote, attempts in client_routes[-2:]
+        )
     )
     host_session_ids = parse_host_session_ids(host_output)
     host_lifecycles = parse_host_lifecycles(host_output)
     client_session_ids = parse_client_session_ids(client_output)
     received_sessions = parse_received_all(client_output)
     observation["host_session_id"] = host_session_ids[-1] if host_session_ids else None
-    observation["client_session_id"] = client_session_ids[-1] if client_session_ids else None
-    received_session, received_frames = received_sessions[-1] if received_sessions else (None, 0)
+    observation["client_session_id"] = (
+        client_session_ids[-1] if client_session_ids else None
+    )
+    received_session, received_frames = (
+        received_sessions[-1] if received_sessions else (None, 0)
+    )
     observation["received_session_id"] = received_session
     observation["received_frames"] = received_frames
-    first_client_session_id = client_session_ids[-2] if len(client_session_ids) >= 2 else None
+    first_client_session_id = (
+        client_session_ids[-2] if len(client_session_ids) >= 2 else None
+    )
     first_received_session, first_received_frames = (
         received_sessions[-2] if len(received_sessions) >= 2 else (None, 0)
     )
@@ -878,12 +908,9 @@ def run_secure_smoke(
         and first_received_frames >= args.frames
     )
     successor_client_session_id = observation["client_session_id"]
-    lifecycle_advanced = (
-        len(host_lifecycles) >= 2
-        and all(
-            current > previous
-            for previous, current in zip(host_lifecycles[-2], host_lifecycles[-1])
-        )
+    lifecycle_advanced = len(host_lifecycles) >= 2 and all(
+        current > previous
+        for previous, current in zip(host_lifecycles[-2], host_lifecycles[-1])
     )
     observation["successor_session_distinct"] = (
         len(host_session_ids) >= 2
@@ -963,7 +990,9 @@ def run_secure_smoke(
                 "host_lifecycles": host_lifecycles,
                 "host_desktop_streams": host_desktop_streams,
                 "first_client_session_id": observation["first_client_session_id"],
-                "first_client_received_frames": observation["first_client_received_frames"],
+                "first_client_received_frames": observation[
+                    "first_client_received_frames"
+                ],
                 "client_session_id": observation["client_session_id"],
                 "client_session_ids": client_session_ids,
                 "received_session_id": observation["received_session_id"],
@@ -1034,7 +1063,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--host-bin", type=Path, help="path to latencydesk-host")
     parser.add_argument("--client-bin", type=Path, help="path to latencydesk-client")
-    parser.add_argument("--identity-bin", type=Path, help="path to latencydesk-identity")
+    parser.add_argument(
+        "--identity-bin", type=Path, help="path to latencydesk-identity"
+    )
     parser.add_argument(
         "--frames",
         type=bounded_int("frames", 1, 600),

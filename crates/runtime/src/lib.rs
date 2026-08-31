@@ -954,6 +954,7 @@ mod tests {
             authorization_epoch: stamp.authorization_epoch(),
             display_epoch: stamp.display_epoch(),
             codec_epoch: stamp.codec_epoch(),
+            route_epoch: 1,
         }
     }
 
@@ -1322,6 +1323,7 @@ mod tests {
             authorization_epoch: 2,
             display_epoch: 3,
             codec_epoch: 4,
+            route_epoch: 1,
         };
         assert_eq!(
             client

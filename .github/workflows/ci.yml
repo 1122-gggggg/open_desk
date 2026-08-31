@@ -48,7 +48,23 @@ jobs:
           python3 -c 'import json, pathlib; data = json.loads(pathlib.Path("artifacts/ci/multisession-stress.json").read_text()); assert data["schema"] == 1; assert data["concurrent_sessions"] == 8; assert data["profile_runs"] == data["unique_session_profile_runs"] == 32; assert data["submitted_frames"] == data["completed_frames"] + data["incomplete_frames"] + data["exact_mismatches"]; assert data["exact_mismatches"] == 0; assert data["max_input_service_pops"] == 1'
       - name: Build secure process-smoke binaries
         if: matrix.os == 'ubuntu-latest'
-        run: cargo build --locked -p latencydesk-host -p latencydesk-client -p latencydesk-identity -p latencydesk-rendezvousd -p latencydesk-turn-relayd
+        run: cargo build --locked -p latencydesk-host -p latencydesk-client -p latencydesk-identity -p latencydesk-rendezvousd -p latencydesk-turn-relayd -p latencydesk-route-probe
+      - name: Two-path exact-mTLS promotion and rollback process smoke
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p artifacts/ci
+          python3 scripts/route_promotion_process_test.py \
+            --binary target/debug/latencydesk-route-probe \
+            --identity-bin target/debug/latencydesk-identity \
+            --timeout 20 --output artifacts/ci/route-promotion-process.json
+      - name: Upload route promotion process evidence
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v7
+        with:
+          name: route-promotion-process-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/ci/route-promotion-process.json
+          if-no-files-found: error
+          retention-days: 30
       - name: Exact-mTLS rendezvous process smoke
         if: matrix.os == 'ubuntu-latest'
         run: |

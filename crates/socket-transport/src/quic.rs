@@ -286,6 +286,11 @@ impl QuicInboundStream {
 }
 
 impl QuicConnection {
+    #[must_use]
+    pub(crate) fn stable_id(&self) -> usize {
+        self.connection.stable_id()
+    }
+
     /// UDP source address observed by Quinn for the authenticated peer. This
     /// is diagnostic path metadata only; certificate verification supplies
     /// peer identity.
@@ -989,6 +994,7 @@ mod tests {
             authorization_epoch: 3,
             display_epoch: 4,
             codec_epoch: 5,
+            route_epoch: 1,
         }
     }
 

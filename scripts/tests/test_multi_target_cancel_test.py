@@ -23,7 +23,7 @@ def valid_output() -> str:
             "input-latency-start: "
             f"target=127.0.0.1:{9000 + index} session_id={index} "
             "generation=1 authorization_epoch=1 display_epoch=1 codec_epoch=1 "
-            "samples=1024"
+            "route_epoch=1 samples=1024"
         )
     lines.extend(
         [

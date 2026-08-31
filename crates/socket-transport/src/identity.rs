@@ -25,7 +25,7 @@ use tokio::task::JoinSet;
 /// DNS subject alternative name present in every generated identity.
 pub const TLS_SERVER_NAME: &str = "latencydesk.local";
 /// ALPN identifier used by the LatencyDesk QUIC protocol.
-pub const TLS_ALPN_PROTOCOL: &[u8] = b"latencydesk/1";
+pub const TLS_ALPN_PROTOCOL: &[u8] = b"latencydesk/2";
 /// Maximum number of Unicode scalar values accepted in a certificate display name.
 pub const MAX_DISPLAY_NAME_CHARS: usize = 64;
 /// Maximum DER certificate size accepted from disk or callers.
@@ -716,6 +716,14 @@ pub fn mtls_client_config(
     identity: &TlsIdentity,
     exact_server_certificate_der: &[u8],
 ) -> Result<quinn::ClientConfig, IdentityError> {
+    mtls_client_config_with_alpn(identity, exact_server_certificate_der, TLS_ALPN_PROTOCOL)
+}
+
+fn mtls_client_config_with_alpn(
+    identity: &TlsIdentity,
+    exact_server_certificate_der: &[u8],
+    alpn_protocol: &[u8],
+) -> Result<quinn::ClientConfig, IdentityError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let server_roots = exact_root_store(exact_server_certificate_der)?;
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
@@ -724,7 +732,7 @@ pub fn mtls_client_config(
         .with_root_certificates(server_roots)
         .with_client_auth_cert(identity.certificate_chain(), identity.private_key())
         .map_err(IdentityError::InvalidIdentity)?;
-    tls.alpn_protocols = vec![TLS_ALPN_PROTOCOL.to_vec()];
+    tls.alpn_protocols = vec![alpn_protocol.to_vec()];
     tls.enable_early_data = false;
 
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
@@ -1536,6 +1544,7 @@ mod tests {
             authorization_epoch: 1,
             display_epoch: 1,
             codec_epoch: 1,
+            route_epoch: 1,
         };
         let header = MediaHeader {
             kind: MediaKind::Video,
@@ -1562,6 +1571,39 @@ mod tests {
             .expect("datagram timeout")
             .expect("receive datagram");
         assert_eq!(received, datagram);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn product_v1_alpn_cannot_authenticate_to_v2() {
+        assert_eq!(TLS_ALPN_PROTOCOL, b"latencydesk/2");
+        let server_identity = TlsIdentity::generate("ALPN Server").unwrap();
+        let client_identity = TlsIdentity::generate("ALPN Client").unwrap();
+        let server_certificate = server_identity.certificate_der().to_vec();
+        let client_certificate = client_identity.certificate_der().to_vec();
+        let server_endpoint = bind_server(
+            mtls_server_config(&server_identity, &client_certificate).unwrap(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let client_endpoint = bind_client(
+            mtls_client_config_with_alpn(&client_identity, &server_certificate, b"latencydesk/1")
+                .unwrap(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let address = server_endpoint.local_addr().unwrap();
+        let (server, client) = tokio::join!(
+            timeout(
+                Duration::from_secs(2),
+                accept_exact_peer(&server_endpoint, &client_certificate)
+            ),
+            timeout(
+                Duration::from_secs(2),
+                connect_exact_peer(&client_endpoint, address, &server_certificate)
+            ),
+        );
+        assert!(client.is_err() || client.unwrap().is_err());
+        assert!(server.is_err() || server.unwrap().is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

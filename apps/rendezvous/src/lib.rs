@@ -35,6 +35,7 @@ pub const RENDEZVOUS_STAMP: SessionStamp = SessionStamp {
     authorization_epoch: 1,
     display_epoch: 1,
     codec_epoch: 1,
+    route_epoch: 1,
 };
 
 #[derive(Debug)]

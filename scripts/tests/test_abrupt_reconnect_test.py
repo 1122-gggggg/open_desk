@@ -129,26 +129,26 @@ class EvidenceExtractionTests(unittest.TestCase):
     def logs(self) -> tuple[str, str]:
         host = """mTLS: exact client certificate authenticated
 session: active session_id=101
-session-lifecycle: generation=1 authorization_epoch=1 display_epoch=1 codec_epoch=1
+session-lifecycle: generation=1 authorization_epoch=1 display_epoch=1 codec_epoch=1 route_epoch=1
 stream: H.264 4:2:0 320x180 over QUIC DATAGRAM
 session: authenticated peer transport lost
 input: ReleaseAll applied
 listener: waiting for authenticated successor session
 mTLS: exact client certificate authenticated
 session: active session_id=202
-session-lifecycle: generation=2 authorization_epoch=2 display_epoch=2 codec_epoch=2
+session-lifecycle: generation=2 authorization_epoch=2 display_epoch=2 codec_epoch=2 route_epoch=1
 stream: H.264 4:2:0 320x180 over QUIC DATAGRAM
 input: ReleaseAll applied
 """
         client = """mTLS: exact host certificate authenticated
 route: authenticated 127.0.0.1:4001 after racing 2 candidate(s)
 handshake: active session_id=101
-handshake-lifecycle: generation=1 authorization_epoch=1 display_epoch=1 codec_epoch=1
+handshake-lifecycle: generation=1 authorization_epoch=1 display_epoch=1 codec_epoch=1 route_epoch=1
 reconnect: recoverable transport loss, attempt 1/3 after 100ms
 mTLS: exact host certificate authenticated
 route: authenticated 127.0.0.1:4001 after racing 2 candidate(s)
 handshake: active session_id=202
-handshake-lifecycle: generation=2 authorization_epoch=2 display_epoch=2 codec_epoch=2
+handshake-lifecycle: generation=2 authorization_epoch=2 display_epoch=2 codec_epoch=2 route_epoch=1
 reconnect: recovered authenticated session after 1 attempt(s)
 received: session_id=202 frames=3
 """
@@ -163,7 +163,9 @@ received: session_id=202 frames=3
             resumed=True,
         )
 
-    def test_realistic_abrupt_logs_require_only_the_successor_frame_summary(self) -> None:
+    def test_realistic_abrupt_logs_require_only_the_successor_frame_summary(
+        self,
+    ) -> None:
         host, client = self.logs()
         observation = mod.extract_evidence(
             host,
@@ -185,7 +187,7 @@ received: session_id=202 frames=3
 
     def test_epoch_field_regression_wrong_route_and_late_release_fail(self) -> None:
         self.assertFalse(
-            mod.lifecycles_strictly_advance([(1, 5, 5, 5), (2, 6, 4, 6)])
+            mod.lifecycles_strictly_advance([(1, 5, 5, 5, 1), (2, 6, 4, 6, 1)])
         )
         host, client = self.logs()
         host = host.replace(

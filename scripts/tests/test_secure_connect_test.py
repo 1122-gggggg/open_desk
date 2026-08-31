@@ -60,14 +60,14 @@ class OutputParsingTests(unittest.TestCase):
 
     def test_parses_successor_session_ids_and_monotonic_lifecycle(self) -> None:
         output = """session: active session_id=41
-session-lifecycle: generation=1 authorization_epoch=1 display_epoch=1 codec_epoch=1
+session-lifecycle: generation=1 authorization_epoch=1 display_epoch=1 codec_epoch=1 route_epoch=1
 session: active session_id=42
-session-lifecycle: generation=2 authorization_epoch=2 display_epoch=2 codec_epoch=2
+session-lifecycle: generation=2 authorization_epoch=2 display_epoch=2 codec_epoch=2 route_epoch=1
 """
         self.assertEqual(secure_connect_test.parse_host_session_ids(output), [41, 42])
         self.assertEqual(
             secure_connect_test.parse_host_lifecycles(output),
-            [(1, 1, 1, 1), (2, 2, 2, 2)],
+            [(1, 1, 1, 1, 1), (2, 2, 2, 2, 1)],
         )
         client_output = """handshake: active session_id=41
 received: session_id=41 frames=3
@@ -95,9 +95,7 @@ stream: unverified 320x180 over QUIC DATAGRAM
             )
         )
         self.assertIsNone(
-            secure_connect_test.parse_client_session_id(
-                "session: active session_id=9"
-            )
+            secure_connect_test.parse_client_session_id("session: active session_id=9")
         )
 
     def test_parses_completed_frames_and_their_session(self) -> None:
@@ -340,12 +338,8 @@ class PlatformGateTests(unittest.TestCase):
         self.assertEqual(report["source"]["binary_sha256_proves_revision"], False)
 
     def test_linux_without_display_is_explicitly_skipped(self) -> None:
-        self.assertIsNotNone(
-            secure_connect_test.prerequisite_skip_reason("linux", "")
-        )
-        self.assertIsNone(
-            secure_connect_test.prerequisite_skip_reason("linux", ":99")
-        )
+        self.assertIsNotNone(secure_connect_test.prerequisite_skip_reason("linux", ""))
+        self.assertIsNone(secure_connect_test.prerequisite_skip_reason("linux", ":99"))
 
 
 if __name__ == "__main__":
