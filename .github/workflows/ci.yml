@@ -132,13 +132,23 @@ jobs:
       - name: Isolated NAT behavior and exact-mTLS ProductSession matrices
         if: matrix.os == 'ubuntu-latest'
         run: |
+          behavior_status=0
           python3 scripts/nat_netns_matrix.py run --allow-netns \
-            --output artifacts/ci/nat-behavior-matrix.json
+            --output artifacts/ci/nat-behavior-matrix.json || behavior_status=$?
+          product_status=0
           python3 scripts/nat_product_netns_test.py --allow-netns \
             --probe-bin target/debug/latencydesk-product-probe \
             --identity-bin target/debug/latencydesk-identity \
             --profiles lan-v4 eim-eif double-nat cgnat native-v6 \
-            --output artifacts/ci/nat-product-matrix.json
+            --output artifacts/ci/nat-product-matrix.json || product_status=$?
+          for status in "$behavior_status" "$product_status"; do
+            if [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then
+              exit "$status"
+            fi
+          done
+          if [ "$behavior_status" -eq 2 ] || [ "$product_status" -eq 2 ]; then
+            echo "::notice title=NAT matrix capability blocked::This hosted runner cannot create rootless user/network namespaces; blocked artifacts were retained."
+          fi
       - name: Upload isolated NAT product evidence
         if: always() && matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v7
