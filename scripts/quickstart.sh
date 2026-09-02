@@ -8,7 +8,7 @@ set -euo pipefail
 REPO_URL="https://github.com/1122-gggggg/open_desk.git"
 REPO_DIR="${HOME}/open_desk"
 HOST_PORT=9000
-EXCHANGE_PORT=8080
+EXCHANGE_PORT=18080
 MODE="host"
 HOST_IP=""
 

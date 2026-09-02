@@ -10,7 +10,7 @@ param(
 $ErrorActionPreference = "Stop"
 $RepoUrl = "https://github.com/1122-gggggg/open_desk.git"
 $RepoDir = "C:\tmp\open_desk"
-$ExchangePort = 8080
+\$ExchangePort = 18080
 $HostPort = 9000
 
 function Need($cmd) { if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) { throw "缺 $cmd，請先安裝" } }
