@@ -1,12 +1,10 @@
 # LatencyDesk Windows one-click — 從 GitHub 拉取並與 Linux Host 交換憑證
 # 用法:
 #   irm https://raw.githubusercontent.com/1122-gggggg/open_desk/main/scripts/quickstart.ps1 | iex
-#   # Host 一鍵
-#   powershell -ExecutionPolicy Bypass -File quickstart.ps1 -Host
 #   # Client 一鍵 (此 Windows 控 Linux)
 #   powershell -ExecutionPolicy Bypass -File quickstart.ps1 -Client 192.168.50.201
 param(
-  [switch]$Host,
+  [switch]$RunAsHost,
   [string]$Client
 )
 $ErrorActionPreference = "Stop"
@@ -44,7 +42,7 @@ function Fingerprint($path) {
   catch { (Get-FileHash $path -Algorithm SHA256).Hash.ToLower() }
 }
 
-if ($Host) {
+if ($RunAsHost) {
   Write-Host "Host 模式請在 Linux 執行 quickstart.sh --host，Windows Host 尚不支援可靠擷取"
   exit 1
 }
