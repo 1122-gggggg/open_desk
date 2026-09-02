@@ -824,6 +824,7 @@ dependencies = [
 name = "latencydesk-transport"
 version = "0.1.0-alpha.2"
 dependencies = [
+ "bytes",
  "latencydesk-protocol",
 ]
 

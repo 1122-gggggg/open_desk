@@ -5,11 +5,21 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-if(MSVC)
-  add_compile_options(/W4 /WX /permissive- /EHsc)
-else()
-  add_compile_options(-Wall -Wextra -Wpedantic -Werror)
+# --- Unity build / batch (opt-in, cacheable) ---
+option(LATENCYDESK_UNITY_BUILD "Enable unity build batching" OFF)
+if(LATENCYDESK_UNITY_BUILD)
+  set(CMAKE_UNITY_BUILD ON)
+  set(CMAKE_UNITY_BUILD_BATCH_SIZE 16 CACHE STRING "Unity build batch size")
+  set(CMAKE_UNITY_BUILD_MODE BATCH)
 endif()
+
+# --- Warning flags: deduplicated single definition ---
+if(MSVC)
+  set(_latencydesk_warn_flags /W4 /WX /permissive- /EHsc /MP)
+else()
+  set(_latencydesk_warn_flags -Wall -Wextra -Wpedantic -Werror)
+endif()
+add_compile_options(${_latencydesk_warn_flags})
 
 add_executable(latencydesk_protocol_conformance tests/protocol_conformance.cpp)
 target_include_directories(latencydesk_protocol_conformance PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)

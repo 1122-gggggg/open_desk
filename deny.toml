@@ -9,19 +9,35 @@ yanked = "deny"
 [licenses]
 version = 2
 confidence-threshold = 0.93
+# allow 列表已按字母序排序，便於審計與去重；新增授權需維持排序並補齊來源註解
 allow = [
   "Apache-2.0",
-  "MIT",
   "BSD-2-Clause",
   "BSD-3-Clause",
   "ISC",
+  "MIT",
   "Unicode-3.0",
   "Zlib",
 ]
 
 [bans]
+# multiple-versions 暫維持 warn 而非 deny 的原因：
+# - ring 0.17 固定依賴 getrandom 0.2.x，而 quinn-proto → rand 依賴 getrandom 0.4.x，雙版本並存屬上游分叉，無法在不替換 ring 或 rand 情況下收斂
+# - bitflags 1.3/2.13、windows-sys 0.52/0.61、socket2 0.5/0.6、syn 2.0/3.0、cpufeatures 0.2/0.3、redox_syscall 0.5/0.9 等亦為平台/衍生依賴的預期多版本
+# - 若需提升為 deny，需配合 skip 允許清單（見下方範例），否則 cargo deny check 將因上述預期重複而失敗
+# 提升策略：當上游完成 getrandom 統一或引入 cargo-deny skip 後，可將此改為 "deny"
 multiple-versions = "warn"
 wildcards = "deny"
+# 提升為 deny 時的參考 skip 清單（保留註解以備一鍵升級）：
+# skip = [
+#   { name = "getrandom" },
+#   { name = "bitflags" },
+#   { name = "windows-sys" },
+#   { name = "socket2" },
+#   { name = "syn" },
+#   { name = "cpufeatures" },
+#   { name = "redox_syscall" },
+# ]
 
 [sources]
 unknown-registry = "deny"

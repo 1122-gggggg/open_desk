@@ -1,4 +1,51 @@
 cmake_minimum_required(VERSION 3.20)
 project(latencydesk LANGUAGES CXX)
+
+# --- ccache detection (opt-out) ---
+option(LATENCYDESK_ENABLE_CCACHE "Enable ccache if available" ON)
+if(LATENCYDESK_ENABLE_CCACHE)
+  find_program(CCACHE_PROGRAM ccache)
+  if(CCACHE_PROGRAM)
+    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}" CACHE STRING "" FORCE)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}" CACHE STRING "" FORCE)
+    message(STATUS "ccache enabled: ${CCACHE_PROGRAM}")
+  endif()
+endif()
+
+# --- IPO / LTO (opt-out, auto-detected) ---
+option(LATENCYDESK_ENABLE_IPO "Enable interprocedural optimization" ON)
+if(LATENCYDESK_ENABLE_IPO)
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT _latencydesk_ipo_supported OUTPUT _latencydesk_ipo_error)
+  if(_latencydesk_ipo_supported)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+  else()
+    message(STATUS "IPO not supported: ${_latencydesk_ipo_error}")
+  endif()
+endif()
+
+# --- Ninja parallel build pools ---
+if(CMAKE_GENERATOR MATCHES "Ninja")
+  include(ProcessorCount)
+  ProcessorCount(_latencydesk_nproc)
+  if(_latencydesk_nproc GREATER 0)
+    set_property(GLOBAL APPEND PROPERTY JOB_POOLS latencydesk_compile=${_latencydesk_nproc})
+    set_property(GLOBAL APPEND PROPERTY JOB_POOLS latencydesk_link=2)
+    set(CMAKE_JOB_POOL_COMPILE latencydesk_compile)
+    set(CMAKE_JOB_POOL_LINK latencydesk_link)
+  endif()
+endif()
+
+# --- Release optimization flags (-O3 -march=native opt-out) ---
+option(LATENCYDESK_ENABLE_MARCH_NATIVE "Enable -march=native in Release" ON)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+  add_compile_options($<$<CONFIG:Release>:-O3>)
+  if(LATENCYDESK_ENABLE_MARCH_NATIVE)
+    add_compile_options($<$<CONFIG:Release>:-march=native>)
+  endif()
+elseif(MSVC)
+  add_compile_options($<$<CONFIG:Release>:/O2>)
+endif()
+
 include(CTest)
 add_subdirectory(native)

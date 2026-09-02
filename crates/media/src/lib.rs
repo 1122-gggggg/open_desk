@@ -411,6 +411,101 @@ pub struct TileCacheStats {
     pub stale_rejections: u64,
 }
 
+/// NV12 plane length for even dimensions (Y + interleaved UV).
+#[must_use]
+#[inline]
+pub fn nv12_len(width: u32, height: u32) -> usize {
+    let w = width as usize;
+    let h = height as usize;
+    w * h + w * h / 2
+}
+
+/// Ensures `vec` has capacity for `required` without reallocating if already sufficient.
+#[inline]
+pub fn ensure_vec_capacity(vec: &mut Vec<u8>, required: usize) {
+    if vec.capacity() < required {
+        vec.reserve(required - vec.capacity());
+    }
+}
+
+/// Clears and resizes `vec` to `len` reusing allocation. Fill is zero as callers overwrite.
+#[inline]
+pub fn reuse_vec(vec: &mut Vec<u8>, len: usize) {
+    ensure_vec_capacity(vec, len);
+    vec.clear();
+    vec.resize(len, 0);
+}
+
+/// Scratch buffer that owns a reusable NV12 allocation to eliminate per-frame `Vec::new`.
+#[derive(Debug, Default)]
+pub struct Nv12Scratch {
+    buf: Vec<u8>,
+}
+
+impl Nv12Scratch {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    #[must_use]
+    pub fn with_capacity_for(width: u32, height: u32) -> Self {
+        let cap = nv12_len(width, height);
+        Self {
+            buf: Vec::with_capacity(cap),
+        }
+    }
+
+    /// Prepares buffer for `width×height` NV12 and returns mutable vec reused without allocation.
+    pub fn prepare(&mut self, width: u32, height: u32) -> &mut Vec<u8> {
+        let len = nv12_len(width, height);
+        ensure_vec_capacity(&mut self.buf, len);
+        self.buf.clear();
+        self.buf.resize(len, 0);
+        &mut self.buf
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf
+    }
+
+    #[must_use]
+    pub fn into_vec(self) -> Vec<u8> {
+        self.buf
+    }
+
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
+
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+}
+
+/// Packs NV12 into an 8-byte header + payload unit reusing `out` allocation instead of allocating.
+#[inline]
+pub fn pack_nv12_access_unit_into(width: u32, height: u32, nv12: &[u8], out: &mut Vec<u8>) {
+    let needed = 8usize.saturating_add(nv12.len());
+    ensure_vec_capacity(out, needed);
+    out.clear();
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(nv12);
+}
+
+/// Allocates with exact `with_capacity` to avoid over-allocation growth.
+#[must_use]
+pub fn pack_nv12_access_unit(width: u32, height: u32, nv12: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8usize.saturating_add(nv12.len()));
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(nv12);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

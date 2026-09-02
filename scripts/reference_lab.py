@@ -7,20 +7,10 @@ executable gate even in bootstrap environments without a Rust toolchain.
 """
 from __future__ import annotations
 
-import argparse
-import json
-import random
+import functools
+import os
 import struct
-import subprocess
 import sys
-import re
-try:
-    import tomllib
-except ModuleNotFoundError:
-    try:
-        import tomli as tomllib
-    except ModuleNotFoundError:
-        tomllib = None
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,7 +23,36 @@ KEYFRAME = 1
 LOSSLESS = 4
 MAX_FRAME = 16 * 1024 * 1024
 
+# --- cached regex / lazy import helpers (avoid recompile and import cost) ---
+_RE_MEMBERS: object = None
+_RE_QUOTED: object = None
 
+
+def _get_member_patterns():
+    global _RE_MEMBERS, _RE_QUOTED
+    if _RE_MEMBERS is None:
+        import re
+
+        _RE_MEMBERS = re.compile(r'members\s*=\s*\[(.*?)\]', re.DOTALL)
+        _RE_QUOTED = re.compile(r'"([^"]+)"')
+    return _RE_MEMBERS, _RE_QUOTED  # type: ignore[return-value]
+
+
+@functools.lru_cache(maxsize=1)
+def _cargo_text() -> str:
+    return (ROOT / "Cargo.toml").read_text()
+
+
+def _default_fuzz_iterations() -> int:
+    raw = os.environ.get("REFERENCE_LAB_FUZZ_ITERATIONS", "25000")
+    try:
+        value = int(raw)
+        return value if value >= 0 else 25000
+    except (ValueError, TypeError):
+        return 25000
+
+
+@functools.lru_cache(maxsize=256)
 def fnv1a(data: bytes) -> int:
     value = 0xCBF29CE484222325
     for byte in data:
@@ -42,6 +61,7 @@ def fnv1a(data: bytes) -> int:
     return value
 
 
+@functools.lru_cache(maxsize=128)
 def fake_frame(width: int, height: int, sequence: int, seed: int) -> bytes:
     out = bytearray(width * height * 4)
     caret_x = (sequence * 5) % width
@@ -374,13 +394,28 @@ def input_probe() -> dict[str, object]:
 
 
 def rust_structure() -> dict[str, object]:
-    content = (ROOT / "Cargo.toml").read_text()
+    # lazy tomllib import (heavy, only needed here)
+    try:
+        import tomllib  # type: ignore
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib  # type: ignore
+        except ModuleNotFoundError:
+            tomllib = None  # type: ignore[assignment]
+
+    content = _cargo_text()
     if tomllib is not None:
-        cargo = tomllib.loads(content)
-        members = cargo["workspace"]["members"]
+        try:
+            cargo = tomllib.loads(content)  # type: ignore[attr-defined]
+            members = cargo["workspace"]["members"]
+        except Exception:
+            members_re, quoted_re = _get_member_patterns()
+            match = members_re.search(content)  # type: ignore[attr-defined]
+            members = quoted_re.findall(match.group(1)) if match else []  # type: ignore[attr-defined]
     else:
-        match = re.search(r'members\s*=\s*\[(.*?)\]', content, re.DOTALL)
-        members = re.findall(r'"([^"]+)"', match.group(1)) if match else []
+        members_re, quoted_re = _get_member_patterns()
+        match = members_re.search(content)  # type: ignore[attr-defined]
+        members = quoted_re.findall(match.group(1)) if match else []  # type: ignore[attr-defined]
     missing = [member for member in members if not (ROOT / member / "Cargo.toml").is_file()]
     source_missing = [member for member in members if not (ROOT / member / "src").exists()]
     delimiter_failures: list[str] = []
@@ -466,6 +501,8 @@ def rust_structure() -> dict[str, object]:
 
 
 def parser_fuzz(iterations: int, seed: int) -> dict[str, int | bool]:
+    import random
+
     rng = random.Random(seed)
     unexpected = accepted_random = accepted_mutations = 0
     valid = fragment(encode_exact(fake_frame(32, 24, 1, seed), 32, 24, 1), 1)[0]
@@ -519,7 +556,10 @@ def parser_fuzz(iterations: int, seed: int) -> dict[str, int | bool]:
     }
 
 
+@functools.lru_cache(maxsize=1)
 def git_commit() -> str | None:
+    import subprocess
+
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, capture_output=True, check=False
     )
@@ -527,8 +567,11 @@ def git_commit() -> str | None:
 
 
 def main() -> int:
+    import argparse
+    import json
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--fuzz-iterations", type=int, default=25_000)
+    parser.add_argument("--fuzz-iterations", type=int, default=_default_fuzz_iterations())
     parser.add_argument("--frames", type=int, default=20)
     parser.add_argument("--hostile-frames", type=int, default=50)
     parser.add_argument("--seed", type=int, default=12345)

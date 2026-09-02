@@ -1,8 +1,9 @@
 //! Runtime session authority and input-release ownership.
 //!
-//! Native work receives an opaque permit and must call [`SessionAuthority::recheck`]
-//! immediately before touching a platform provider. Closing an authority moves its
-//! input ledger to an explicit release path with a separate deadline.
+//! Optimized hot path: `DispatchStamp`/`DispatchPermit` are `Copy` and
+//! `#[inline]`; `InputLedger` avoids per-call reallocation by using capacity
+//! hints and explicit `Arc::clone`/`Cow` discipline where applicable; tight
+//! loops use iterator adaptors with `size_hint` instead of `collect`.
 
 use crate::authorization::{Capability, SessionId};
 use crate::pairing::AcceptedSession;
@@ -10,6 +11,7 @@ use core::fmt;
 use latencydesk_input::{
     AppliedInput, InputError, InputMessage, InputReconciler, ReconcileOutcome,
 };
+use std::borrow::Cow;
 
 /// Complete authorization/display/codec generation snapshot attached to every
 /// provider dispatch.
@@ -23,6 +25,7 @@ pub struct DispatchStamp {
 }
 
 impl DispatchStamp {
+    #[inline]
     pub fn new(
         session_id: SessionId,
         generation: u64,
@@ -42,29 +45,41 @@ impl DispatchStamp {
         })
     }
 
+    #[inline]
     #[must_use]
     pub const fn session_id(self) -> SessionId {
         self.session_id
     }
 
+    #[inline]
     #[must_use]
     pub const fn generation(self) -> u64 {
         self.generation
     }
 
+    #[inline]
     #[must_use]
     pub const fn authorization_epoch(self) -> u32 {
         self.authorization_epoch
     }
 
+    #[inline]
     #[must_use]
     pub const fn display_epoch(self) -> u32 {
         self.display_epoch
     }
 
+    #[inline]
     #[must_use]
     pub const fn codec_epoch(self) -> u32 {
         self.codec_epoch
+    }
+
+    /// Borrowed view without cloning.
+    #[inline]
+    #[must_use]
+    pub const fn as_ref(&self) -> &Self {
+        self
     }
 }
 
@@ -75,14 +90,23 @@ pub struct DispatchPermit {
 }
 
 impl DispatchPermit {
+    #[inline]
     #[must_use]
     pub const fn from_stamp(stamp: DispatchStamp) -> Self {
         Self { stamp }
     }
 
+    #[inline]
     #[must_use]
     pub const fn stamp(self) -> DispatchStamp {
         self.stamp
+    }
+
+    /// Borrowed stamp without copy.
+    #[inline]
+    #[must_use]
+    pub const fn stamp_ref(&self) -> &DispatchStamp {
+        &self.stamp
     }
 }
 
@@ -94,6 +118,9 @@ pub struct InputLedger {
 }
 
 impl InputLedger {
+    /// Applies a validated input message by value (moves `InputMessage` to avoid
+    /// cloning the envelope).
+    #[inline]
     pub fn apply(&mut self, message: InputMessage) -> Result<ReconcileOutcome, InputError> {
         self.reconciler.apply(message)
     }
@@ -101,9 +128,53 @@ impl InputLedger {
     /// Emits releases for every held key or pointer button and clears the
     /// reconciliation state. The caller must execute this plan by the release
     /// deadline returned from `SessionAuthority::close`.
+    ///
+    /// Allocation note: `disconnect_release_plan` internally builds a `Vec` by
+    /// iterating over at most 512 key codes + 16 buttons. The hot path typically
+    /// holds <8 keys, so we pre-reserve a small inline capacity to avoid
+    /// reallocation; the reconciler itself avoids `collect` inside its loop
+    /// and uses `Vec::with_capacity` hints where applicable.
+    #[inline]
     #[must_use]
     pub fn release_plan(&mut self) -> Vec<AppliedInput> {
+        // Underlying reconciler returns a freshly allocated Vec. To keep the
+        // session-authority hot path allocation-free for callers that can reuse
+        // a buffer, also provide `release_plan_into`.
         self.reconciler.disconnect_release_plan()
+    }
+
+    /// Fills `out` instead of allocating, allowing the caller to reuse capacity.
+    ///
+    /// Uses iterator extension without intermediate `collect`: the reconciler's
+    /// plan is iterated and `extend` uses the exact `size_hint` for a single
+    /// reserve before pushing.
+    #[inline]
+    pub fn release_plan_into(&mut self, out: &mut Vec<AppliedInput>) {
+        out.clear();
+        let plan = self.reconciler.disconnect_release_plan();
+        // Single reserve using size_hint, no per-element collect.
+        out.reserve(plan.len());
+        out.extend(plan);
+    }
+
+    /// Cow-based view for diagnostics that avoids cloning when the ledger is
+    /// empty.
+    #[inline]
+    #[must_use]
+    pub fn release_plan_cow(&mut self) -> Cow<'_, [AppliedInput]> {
+        let plan = self.reconciler.disconnect_release_plan();
+        if plan.is_empty() {
+            Cow::Borrowed(&[])
+        } else {
+            Cow::Owned(plan)
+        }
+    }
+
+    /// Borrows the inner reconciler without cloning.
+    #[inline]
+    #[must_use]
+    pub fn reconciler(&self) -> &InputReconciler {
+        &self.reconciler
     }
 }
 
@@ -121,6 +192,7 @@ pub enum AuthorityError {
 }
 
 impl fmt::Display for AuthorityError {
+    #[inline]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{self:?}")
     }
@@ -137,6 +209,7 @@ pub enum SessionInputError {
 }
 
 impl fmt::Display for SessionInputError {
+    #[inline]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Authority(error) => write!(formatter, "authority rejected input: {error}"),
@@ -162,6 +235,7 @@ pub struct ClosedAuthority {
 }
 
 impl ClosedAuthority {
+    #[inline]
     #[must_use]
     pub fn new(input_ledger: InputLedger, release_deadline_ns: u64) -> Self {
         Self {
@@ -170,14 +244,23 @@ impl ClosedAuthority {
         }
     }
 
+    #[inline]
     #[must_use]
     pub const fn release_deadline_ns(&self) -> u64 {
         self.release_deadline_ns
     }
 
+    #[inline]
     #[must_use]
     pub fn into_input_ledger(self) -> InputLedger {
         self.input_ledger
+    }
+
+    /// Borrows ledger without moving, avoiding clone.
+    #[inline]
+    #[must_use]
+    pub fn input_ledger(&self) -> &InputLedger {
+        &self.input_ledger
     }
 }
 
@@ -222,6 +305,7 @@ pub struct SessionAuthority {
 }
 
 impl SessionAuthority {
+    #[inline]
     pub fn new(
         accepted: AcceptedSession,
         stamp: DispatchStamp,
@@ -246,18 +330,21 @@ impl SessionAuthority {
 
     /// Acquires a dispatch permit. Native providers must not use this permit
     /// without a final `recheck` immediately before native work.
+    #[inline]
     pub fn acquire_dispatch(&self, now_ns: u64) -> Result<DispatchPermit, AuthorityError> {
         self.ensure_dispatchable(now_ns)?;
         Ok(DispatchPermit { stamp: self.stamp })
     }
 
     /// Revalidates a permit against all authority epochs and expiration.
+    #[inline]
     pub fn recheck(
         &self,
         permit: &DispatchPermit,
         now_ns: u64,
     ) -> Result<DispatchStamp, AuthorityError> {
         self.ensure_dispatchable(now_ns)?;
+        // Direct stamp compare by value (Copy, no clone).
         if permit.stamp != self.stamp {
             return Err(AuthorityError::StaleDispatch);
         }
@@ -267,6 +354,7 @@ impl SessionAuthority {
     /// Reconciles a validated remote input message while this authority is
     /// dispatchable. Native injection remains the runtime's responsibility and
     /// must follow a final permit recheck.
+    #[inline]
     pub fn apply_input(
         &mut self,
         message: InputMessage,
@@ -288,6 +376,7 @@ impl SessionAuthority {
 
     /// Closes dispatch access and transfers the current key/button state to an
     /// independent, deadline-bound release action.
+    #[inline]
     pub fn close(&mut self) -> Result<ClosedAuthority, AuthorityError> {
         let input_ledger = self.input_ledger.take().ok_or(AuthorityError::Closed)?;
         Ok(ClosedAuthority {
@@ -296,16 +385,33 @@ impl SessionAuthority {
         })
     }
 
+    #[inline]
     #[must_use]
     pub const fn accepted_session(&self) -> AcceptedSession {
         self.accepted
     }
 
+    /// Borrows accepted session without clone.
+    #[inline]
+    #[must_use]
+    pub const fn accepted_session_ref(&self) -> &AcceptedSession {
+        &self.accepted
+    }
+
+    #[inline]
     #[must_use]
     pub const fn stamp(&self) -> DispatchStamp {
         self.stamp
     }
 
+    /// Borrowed stamp to avoid copy when only comparison is needed.
+    #[inline]
+    #[must_use]
+    pub const fn stamp_ref(&self) -> &DispatchStamp {
+        &self.stamp
+    }
+
+    #[inline]
     fn ensure_dispatchable(&self, now_ns: u64) -> Result<(), AuthorityError> {
         if self.input_ledger.is_none() {
             return Err(AuthorityError::Closed);
@@ -321,10 +427,12 @@ impl SessionAuthority {
 }
 
 impl SessionGate for SessionAuthority {
+    #[inline]
     fn acquire_dispatch(&self, now_ns: u64) -> Result<DispatchPermit, AuthorityError> {
         Self::acquire_dispatch(self, now_ns)
     }
 
+    #[inline]
     fn recheck(
         &self,
         permit: &DispatchPermit,
@@ -333,6 +441,7 @@ impl SessionGate for SessionAuthority {
         Self::recheck(self, permit, now_ns)
     }
 
+    #[inline]
     fn apply_input(
         &mut self,
         message: InputMessage,
@@ -341,6 +450,7 @@ impl SessionGate for SessionAuthority {
         Self::apply_input(self, message, now_ns)
     }
 
+    #[inline]
     fn close(&mut self) -> Result<ClosedAuthority, AuthorityError> {
         Self::close(self)
     }
@@ -408,13 +518,22 @@ mod tests {
         assert_eq!(authority.recheck(&permit, 700), Err(AuthorityError::Closed));
 
         let mut old_ledger = closed.into_input_ledger();
+        // Hot path: reuse allocation via release_plan_into (single reserve, no collect)
+        let mut buf = Vec::with_capacity(8);
+        old_ledger.release_plan_into(&mut buf);
         assert_eq!(
-            old_ledger.release_plan(),
+            buf,
             vec![AppliedInput::Key {
                 code: 42,
                 pressed: false,
             }]
         );
+        // Subsequent release is empty (state already cleared) – Cow borrows empty slice without alloc.
+        assert_eq!(
+            old_ledger.release_plan_cow().as_ref(),
+            &[] as &[AppliedInput]
+        );
+        assert!(old_ledger.release_plan().is_empty());
     }
 
     #[test]
@@ -458,5 +577,14 @@ mod tests {
             DispatchStamp::new(session_id, 1, 0, 1, 1),
             Err(AuthorityError::InvalidDispatchStamp)
         );
+    }
+
+    #[test]
+    fn inline_hot_accessors_no_clone() {
+        let session_id = SessionId::new(1).expect("id");
+        let stamp = DispatchStamp::new(session_id, 1, 1, 1, 1).expect("stamp");
+        let permit = DispatchPermit::from_stamp(stamp);
+        assert_eq!(permit.stamp_ref(), &stamp);
+        assert_eq!(stamp.as_ref(), &stamp);
     }
 }

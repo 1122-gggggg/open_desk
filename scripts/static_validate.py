@@ -2,11 +2,19 @@
 """Dependency-free structural validation for the LatencyDesk repository."""
 from __future__ import annotations
 
+import concurrent.futures
+import functools
 import json
+import os
 import shutil
 import subprocess
 import sys
 import re
+
+# --- __pycache__ 加速：確保位元組碼快取啟用以加速後續啟動 ---
+if getattr(sys, "dont_write_bytecode", False):
+    sys.dont_write_bytecode = False
+
 try:
     import tomllib
 except ModuleNotFoundError:
@@ -173,6 +181,26 @@ PRESENTATION_CONTRACT_TOKENS = [
 ]
 
 CORE_UNSAFE_CONSTRUCT_RE = re.compile(r"\bunsafe\s+(?:trait|impl|fn)\b|\bunsafe\s*\{")
+# --- 快取正則編譯 ---
+_MEMBERS_RE = re.compile(r'members\s*=\s*\[(.*?)\]', re.DOTALL)
+_QUOTED_RE = re.compile(r'"([^"]+)"')
+
+@functools.lru_cache(maxsize=512)
+def _cached_text(path_str: str) -> str:
+    try:
+        return Path(path_str).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+@functools.lru_cache(maxsize=512)
+def _cached_lower(path_str: str) -> str:
+    return _cached_text(path_str).lower()
+
+
+@functools.lru_cache(maxsize=512)
+def _file_exists(path_str: str) -> bool:
+    return Path(path_str).is_file()
 
 def run(cmd: list[str]) -> dict[str, object]:
     result = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, check=False)
@@ -189,33 +217,59 @@ def main() -> int:
     failures: list[str] = []
 
     for relative in REQUIRED:
-        path = ROOT / relative
-        ok = path.is_file()
+        path_str = str(ROOT / relative)
+        ok = _file_exists(path_str)
         checks.append({"check": "required_file", "path": relative, "ok": ok})
         if not ok:
             failures.append(f"missing required file: {relative}")
 
-    for relative, phrases in REQUIRED_PHRASES.items():
-        path = ROOT / relative
-        text = path.read_text(encoding="utf-8") if path.is_file() else ""
-        for phrase in phrases:
-            ok = phrase.lower() in text.lower()
+    # --- 並行檢查 REQUIRED_PHRASES 與 SOURCE_GUARDS（減少重複 read、快取 lower）---
+    def _check_phrase_entry(item: tuple[str, list[str]]) -> list[tuple[str, str, bool]]:
+        relative, phrases = item
+        pstr = str(ROOT / relative)
+        # 提早退出：檔案不存在直接全部標記失敗，免去 read/lower
+        if not _file_exists(pstr):
+            return [(relative, ph, False) for ph in phrases]
+        lower = _cached_lower(pstr)
+        # 提早退出：空檔直接失敗
+        if not lower:
+            return [(relative, ph, False) for ph in phrases]
+        return [(relative, ph, ph.lower() in lower) for ph in phrases]
+
+    def _check_guard_entry(item: tuple[str, list[str]]) -> list[tuple[str, str, bool]]:
+        relative, tokens = item
+        pstr = str(ROOT / relative)
+        if not _file_exists(pstr):
+            return [(relative, tok, False) for tok in tokens]
+        text = _cached_text(pstr)
+        if not text:
+            return [(relative, tok, False) for tok in tokens]
+        # token in text 為 C 層級搜尋，已具早退特性
+        return [(relative, tok, tok in text) for tok in tokens]
+
+    phrase_items = list(REQUIRED_PHRASES.items())
+    guard_items = list(SOURCE_GUARDS.items())
+    # 使用 ThreadPool 並行 I/O；map 保持原始順序以確保輸出一致
+    max_workers = min(32, (os.cpu_count() or 4) * 4)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        phrase_results = list(executor.map(_check_phrase_entry, phrase_items))
+        guard_results = list(executor.map(_check_guard_entry, guard_items))
+
+    for results in phrase_results:
+        for relative, phrase, ok in results:
             checks.append({"check": "required_phrase", "path": relative, "phrase": phrase, "ok": ok})
             if not ok:
                 failures.append(f"{relative} missing phrase: {phrase}")
 
-    for relative, tokens in SOURCE_GUARDS.items():
-        path = ROOT / relative
-        text = path.read_text(encoding="utf-8") if path.is_file() else ""
-        for token in tokens:
-            ok = token in text
+    for results in guard_results:
+        for relative, token, ok in results:
             checks.append({"check": "source_guard", "path": relative, "token": token, "ok": ok})
             if not ok:
                 failures.append(f"source guard missing in {relative}: {token}")
 
 
     presentation_path = ROOT / "crates/platform/src/lib.rs"
-    presentation_text = presentation_path.read_text(encoding="utf-8") if presentation_path.is_file() else ""
+    presentation_text = _cached_text(str(presentation_path))
     for token in PRESENTATION_CONTRACT_TOKENS:
         ok = token in presentation_text
         checks.append({"check": "presentation_contract", "token": token, "ok": ok})
@@ -234,40 +288,66 @@ def main() -> int:
         failures.append(f"core unsafe construct: {construct}")
     cargo_path = ROOT / "Cargo.toml"
     try:
-        content = cargo_path.read_text(encoding="utf-8")
+        content = _cached_text(str(cargo_path))
         if tomllib is not None:
             workspace = tomllib.loads(content)["workspace"]
             members = workspace["members"]
         else:
-            match = re.search(r'members\s*=\s*\[(.*?)\]', content, re.DOTALL)
-            if match:
-                members = re.findall(r'"([^"]+)"', match.group(1))
+            m = _MEMBERS_RE.search(content)
+            if m:
+                members = _QUOTED_RE.findall(m.group(1))
             else:
                 members = []
     except Exception as error:
         failures.append(f"workspace manifest invalid: {error}")
         members = []
-    duplicates = sorted({member for member in members if members.count(member) > 1})
+    # 使用 Counter 避免 O(n^2) 的 list.count，並保持排序輸出一致
+    from collections import Counter
+    counts = Counter(members)
+    duplicates = sorted([member for member, c in counts.items() if c > 1])
     if duplicates:
         failures.append(f"duplicate workspace members: {duplicates}")
     checks.append({"check": "unique_workspace_members", "ok": not duplicates, "duplicates": duplicates})
-    for member in members:
+
+    # workspace_member 檢查並行化（保留原始順序）
+    def _check_member(member: str) -> tuple[str, bool]:
         manifest = ROOT / member / "Cargo.toml"
         source = ROOT / member / "src"
+        # is_file / is_dir 為系統呼叫，適合並行
         ok = manifest.is_file() and source.is_dir()
+        return member, ok
+
+    if members:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            member_results = list(executor.map(_check_member, members))
+    else:
+        member_results = []
+    for member, ok in member_results:
         checks.append({"check": "workspace_member", "member": member, "ok": ok})
         if not ok:
             failures.append(f"workspace member incomplete: {member}")
 
-    reference_result = run([sys.executable, "scripts/reference_lab.py", "--fuzz-iterations", "5000"])
+    # --- 並行執行獨立子進程（提早退出：兩者獨立，無需序列等待）---
+    reference_result: dict[str, object] | None = None
+    cargo_result: dict[str, object] | None = None
+    cargo_available = bool(shutil.which("cargo"))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        fut_ref = executor.submit(run, [sys.executable, "scripts/reference_lab.py", "--fuzz-iterations", "5000"])
+        fut_cargo = None
+        if cargo_available:
+            fut_cargo = executor.submit(run, ["cargo", "metadata", "--format-version", "1", "--no-deps"])
+        reference_result = fut_ref.result()  # type: ignore[assignment]
+        if fut_cargo is not None:
+            cargo_result = fut_cargo.result()  # type: ignore[assignment]
+
+    # 保底：若未透過執行緒池（理論不發生）
+    if reference_result is None:
+        reference_result = run([sys.executable, "scripts/reference_lab.py", "--fuzz-iterations", "5000"])
     if reference_result["returncode"] != 0:
         failures.append("independent reference lab failed")
 
-    cargo_result = None
-    if shutil.which("cargo"):
-        cargo_result = run(["cargo", "metadata", "--format-version", "1", "--no-deps"])
-        if cargo_result["returncode"] != 0:
-            failures.append("cargo metadata failed")
+    if cargo_result is not None and cargo_result["returncode"] != 0:
+        failures.append("cargo metadata failed")
 
     report = {
         "root": str(ROOT),
@@ -276,7 +356,7 @@ def main() -> int:
         "checks": checks,
         "reference_lab": reference_result,
         "cargo_metadata": cargo_result,
-        "cargo_available": bool(shutil.which("cargo")),
+        "cargo_available": cargo_available,
         "note": "Reference/static checks are bootstrap gates. cargo fmt/clippy/test remain authoritative Rust gates.",
     }
     OUT.parent.mkdir(parents=True, exist_ok=True)

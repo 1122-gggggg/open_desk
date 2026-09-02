@@ -77,15 +77,100 @@ pub fn parse_nv12_access_unit(bytes: &[u8]) -> Option<(u32, u32, &[u8])> {
     Some((width, height, &bytes[8..]))
 }
 
+// LUTs for BT.601 limited-range conversion – eliminates per-pixel multiplies and enables better inlining.
+const Y_R_TABLE: [i32; 256] = {
+    let mut t = [0i32; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = 66 * (i as i32);
+        i += 1;
+    }
+    t
+};
+const Y_G_TABLE: [i32; 256] = {
+    let mut t = [0i32; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = 129 * (i as i32);
+        i += 1;
+    }
+    t
+};
+const Y_B_TABLE: [i32; 256] = {
+    let mut t = [0i32; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = 25 * (i as i32);
+        i += 1;
+    }
+    t
+};
+const U_R_TABLE: [i32; 256] = {
+    let mut t = [0i32; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = -38 * (i as i32);
+        i += 1;
+    }
+    t
+};
+const U_G_TABLE: [i32; 256] = {
+    let mut t = [0i32; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = -74 * (i as i32);
+        i += 1;
+    }
+    t
+};
+const U_B_TABLE: [i32; 256] = {
+    let mut t = [0i32; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = 112 * (i as i32);
+        i += 1;
+    }
+    t
+};
+const V_R_TABLE: [i32; 256] = {
+    let mut t = [0i32; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = 112 * (i as i32);
+        i += 1;
+    }
+    t
+};
+const V_G_TABLE: [i32; 256] = {
+    let mut t = [0i32; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = -94 * (i as i32);
+        i += 1;
+    }
+    t
+};
+const V_B_TABLE: [i32; 256] = {
+    let mut t = [0i32; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = -18 * (i as i32);
+        i += 1;
+    }
+    t
+};
+
 /// BT.601 limited-range integer conversion used by the desktop capture path.
+/// `#[inline(always)]` ensures the 2×2 kernel and NV12→ARGB hot loops inline.
 #[must_use]
+#[inline(always)]
 pub fn rgb_to_yuv_bt601_limited(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
-    let r = i32::from(r);
-    let g = i32::from(g);
-    let b = i32::from(b);
-    let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-    let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-    let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+    let y =
+        ((Y_R_TABLE[r as usize] + Y_G_TABLE[g as usize] + Y_B_TABLE[b as usize] + 128) >> 8) + 16;
+    let u =
+        ((U_R_TABLE[r as usize] + U_G_TABLE[g as usize] + U_B_TABLE[b as usize] + 128) >> 8) + 128;
+    let v =
+        ((V_R_TABLE[r as usize] + V_G_TABLE[g as usize] + V_B_TABLE[b as usize] + 128) >> 8) + 128;
     (
         y.clamp(16, 235) as u8,
         u.clamp(16, 240) as u8,
@@ -94,6 +179,7 @@ pub fn rgb_to_yuv_bt601_limited(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
 }
 
 #[must_use]
+#[inline(always)]
 pub fn yuv_to_rgb_bt601_limited(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
     let y = i32::from(y) - 16;
     let u = i32::from(u) - 128;
@@ -124,21 +210,31 @@ pub fn nv12_to_argb_u32(
             actual: nv12.len(),
         });
     }
-    let width = width as usize;
-    let height = height as usize;
-    let y_plane = &nv12[..width * height];
-    let uv = &nv12[width * height..required];
+    let width_us = width as usize;
+    let height_us = height as usize;
+    let y_plane = &nv12[..width_us * height_us];
+    let uv = &nv12[width_us * height_us..required];
+    let needed = width_us * height_us;
+    if out.capacity() < needed {
+        out.reserve(needed - out.capacity());
+    }
     out.clear();
-    out.resize(width * height, 0);
-    for row in 0..height {
-        let uv_row = (row / 2) * width;
-        for col in 0..width {
-            let y = y_plane[row * width + col];
-            let uv_index = uv_row + (col & !1);
-            let u = uv[uv_index];
-            let v = uv[uv_index + 1];
-            let (r, g, b) = yuv_to_rgb_bt601_limited(y, u, v);
-            out[row * width + col] = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+    out.resize(needed, 0);
+    // Process 2 pixels at a time: one UV pair per 2 luma samples. Eliminates per-pixel branch and division.
+    for row in 0..height_us {
+        let y_row = row * width_us;
+        let uv_row = (row >> 1) * width_us;
+        let out_row = y_row;
+        for col in (0..width_us).step_by(2) {
+            let uv_idx = uv_row + col;
+            let u = uv[uv_idx];
+            let v = uv[uv_idx + 1];
+            let y0 = y_plane[y_row + col];
+            let y1 = y_plane[y_row + col + 1];
+            let (r0, g0, b0) = yuv_to_rgb_bt601_limited(y0, u, v);
+            let (r1, g1, b1) = yuv_to_rgb_bt601_limited(y1, u, v);
+            out[out_row + col] = (u32::from(r0) << 16) | (u32::from(g0) << 8) | u32::from(b0);
+            out[out_row + col + 1] = (u32::from(r1) << 16) | (u32::from(g1) << 8) | u32::from(b1);
         }
     }
     Ok(())
@@ -150,7 +246,11 @@ pub fn bgra_to_nv12_bt601_limited(
     bgra: &[u8],
     src_stride: usize,
 ) -> Result<Vec<u8>, ConvertError> {
-    let mut nv12 = Vec::new();
+    if width < 2 || height < 2 || width % 2 != 0 || height % 2 != 0 {
+        return Err(ConvertError::InvalidDimensions);
+    }
+    let len = nv12_len(width, height);
+    let mut nv12 = Vec::with_capacity(len);
     bgra_to_nv12_bt601_limited_into(width, height, bgra, src_stride, &mut nv12)?;
     Ok(nv12)
 }
@@ -183,22 +283,50 @@ pub fn bgra_to_nv12_bt601_limited_into(
     }
 
     let len = nv12_len(width, height);
+    if nv12.capacity() < len {
+        nv12.reserve(len - nv12.capacity());
+    }
     nv12.clear();
-    nv12.resize(len, 128);
+    nv12.resize(len, 0);
     let luma = width_us * height_us;
-    for y in 0..height_us {
-        for x in 0..width_us {
-            let px = y * src_stride + x * 4;
-            let b = bgra[px];
-            let g = bgra[px + 1];
-            let r = bgra[px + 2];
-            let (yp, u, v) = rgb_to_yuv_bt601_limited(r, g, b);
-            nv12[y * width_us + x] = yp;
-            if y % 2 == 0 && x % 2 == 0 {
-                let uv = luma + (y / 2) * width_us + (x / 2) * 2;
-                nv12[uv] = u;
-                nv12[uv + 1] = v;
-            }
+    // Merged 2×2 block: no per-pixel `y%2`/`x%2` branch, uses shift for `y/2`.
+    for y in (0..height_us).step_by(2) {
+        let y0 = y;
+        let y1 = y + 1;
+        let src_row0 = y0 * src_stride;
+        let src_row1 = y1 * src_stride;
+        let dst_row0 = y0 * width_us;
+        let dst_row1 = y1 * width_us;
+        let uv_row = luma + (y >> 1) * width_us;
+        for x in (0..width_us).step_by(2) {
+            let x0 = x;
+            let x1 = x + 1;
+            let px00 = src_row0 + x0 * 4;
+            let b00 = bgra[px00];
+            let g00 = bgra[px00 + 1];
+            let r00 = bgra[px00 + 2];
+            let (y00, u00, v00) = rgb_to_yuv_bt601_limited(r00, g00, b00);
+            nv12[dst_row0 + x0] = y00;
+            nv12[uv_row + x0] = u00;
+            nv12[uv_row + x0 + 1] = v00;
+            let px01 = src_row0 + x1 * 4;
+            let b01 = bgra[px01];
+            let g01 = bgra[px01 + 1];
+            let r01 = bgra[px01 + 2];
+            let (y01, _, _) = rgb_to_yuv_bt601_limited(r01, g01, b01);
+            nv12[dst_row0 + x1] = y01;
+            let px10 = src_row1 + x0 * 4;
+            let b10 = bgra[px10];
+            let g10 = bgra[px10 + 1];
+            let r10 = bgra[px10 + 2];
+            let (y10, _, _) = rgb_to_yuv_bt601_limited(r10, g10, b10);
+            nv12[dst_row1 + x0] = y10;
+            let px11 = src_row1 + x1 * 4;
+            let b11 = bgra[px11];
+            let g11 = bgra[px11 + 1];
+            let r11 = bgra[px11 + 2];
+            let (y11, _, _) = rgb_to_yuv_bt601_limited(r11, g11, b11);
+            nv12[dst_row1 + x1] = y11;
         }
     }
     Ok(())
@@ -305,6 +433,7 @@ pub fn letterbox_geom(
     })
 }
 
+#[allow(clippy::slow_vector_initialization)]
 pub fn letterbox_scale_bgra<'a>(
     src: &'a [u8],
     src_width: u32,
@@ -320,7 +449,9 @@ pub fn letterbox_scale_bgra<'a>(
         if src_stride == min_stride {
             return Ok((geom, Cow::Borrowed(&src[..required])));
         }
-        let mut packed = vec![0u8; min_stride.saturating_mul(src_h)];
+        let needed = min_stride.saturating_mul(src_h);
+        let mut packed = Vec::with_capacity(needed);
+        packed.resize(needed, 0);
         for y in 0..src_h {
             let dst = y * min_stride;
             let src_row = y * src_stride;
@@ -337,7 +468,81 @@ pub fn letterbox_scale_bgra<'a>(
     Ok((geom, Cow::Owned(out)))
 }
 
-pub fn letterbox_scale_bgra_into(
+/// Reusable scratch to eliminate per-frame tmp allocations in box-filter scaling.
+#[derive(Debug, Default)]
+pub struct LetterboxScratch {
+    x0: Vec<usize>,
+    x1: Vec<usize>,
+    y0: Vec<usize>,
+    y1: Vec<usize>,
+}
+
+#[allow(dead_code)]
+impl LetterboxScratch {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            x0: Vec::new(),
+            x1: Vec::new(),
+            y0: Vec::new(),
+            y1: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_capacity(width: usize, height: usize) -> Self {
+        Self {
+            x0: Vec::with_capacity(width),
+            x1: Vec::with_capacity(width),
+            y0: Vec::with_capacity(height),
+            y1: Vec::with_capacity(height),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.x0.clear();
+        self.x1.clear();
+        self.y0.clear();
+        self.y1.clear();
+    }
+}
+
+#[inline(always)]
+fn box_filter_pixel(
+    src: &[u8],
+    src_stride: usize,
+    x0: usize,
+    x1: usize,
+    y0: usize,
+    y1: usize,
+    out: &mut [u8; 4],
+) {
+    let mut blue = 0u32;
+    let mut green = 0u32;
+    let mut red = 0u32;
+    let mut alpha = 0u32;
+    let mut count = 0u32;
+    for sy in y0..y1 {
+        let row = sy * src_stride;
+        for sx in x0..x1 {
+            let src_px = row + sx * 4;
+            blue += u32::from(src[src_px]);
+            green += u32::from(src[src_px + 1]);
+            red += u32::from(src[src_px + 2]);
+            alpha += u32::from(src[src_px + 3]);
+            count += 1;
+        }
+    }
+    if count != 0 {
+        out[0] = (blue / count) as u8;
+        out[1] = (green / count) as u8;
+        out[2] = (red / count) as u8;
+        out[3] = (alpha / count) as u8;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn letterbox_scale_bgra_into_with_scratch(
     src: &[u8],
     src_width: u32,
     src_height: u32,
@@ -345,6 +550,7 @@ pub fn letterbox_scale_bgra_into(
     max_width: u32,
     max_height: u32,
     out: &mut Vec<u8>,
+    scratch: &mut LetterboxScratch,
 ) -> Result<LetterboxGeom, ConvertError> {
     let (src_w, src_h, _min_stride) = validate_bgra_buffer(src, src_width, src_height, src_stride)?;
     if letterbox_can_skip_scale(src_width, src_height, max_width, max_height) {
@@ -354,46 +560,96 @@ pub fn letterbox_scale_bgra_into(
     let out_w = geom.out_width as usize;
     let out_h = geom.out_height as usize;
     let needed = out_w.saturating_mul(out_h).saturating_mul(4);
+    if out.capacity() < needed {
+        out.reserve(needed - out.capacity());
+    }
     out.clear();
     out.resize(needed, 0);
     if out_w == 0 || out_h == 0 {
         return Ok(geom);
     }
+    // Precompute mappings to reduce O(W*H) divisions to O(W+H).
+    if scratch.x0.capacity() < out_w {
+        scratch.x0.reserve(out_w - scratch.x0.capacity());
+        scratch.x1.reserve(out_w - scratch.x1.capacity());
+    }
+    if scratch.y0.capacity() < out_h {
+        scratch.y0.reserve(out_h - scratch.y0.capacity());
+        scratch.y1.reserve(out_h - scratch.y1.capacity());
+    }
+    scratch.x0.clear();
+    scratch.x1.clear();
+    scratch.y0.clear();
+    scratch.y1.clear();
+    scratch.x0.resize(out_w, 0);
+    scratch.x1.resize(out_w, 0);
+    scratch.y0.resize(out_h, 0);
+    scratch.y1.resize(out_h, 0);
+    for x in 0..out_w {
+        let mut x0 = (x * src_w) / out_w;
+        let mut x1 = ((x + 1) * src_w) / out_w;
+        if x1 <= x0 {
+            x1 = (x0 + 1).min(src_w);
+        }
+        if x1 > src_w {
+            x1 = src_w;
+        }
+        if x0 >= src_w {
+            x0 = src_w.saturating_sub(1);
+        }
+        scratch.x0[x] = x0;
+        scratch.x1[x] = x1;
+    }
     for y in 0..out_h {
-        let y0 = (y * src_h) / out_h;
-        let y1 = ((y + 1) * src_h) / out_h;
-        let y1 = y1.max(y0 + 1).min(src_h);
+        let mut y0 = (y * src_h) / out_h;
+        let mut y1 = ((y + 1) * src_h) / out_h;
+        if y1 <= y0 {
+            y1 = (y0 + 1).min(src_h);
+        }
+        if y1 > src_h {
+            y1 = src_h;
+        }
+        if y0 >= src_h {
+            y0 = src_h.saturating_sub(1);
+        }
+        scratch.y0[y] = y0;
+        scratch.y1[y] = y1;
+    }
+    for y in 0..out_h {
+        let y0 = scratch.y0[y];
+        let y1 = scratch.y1[y];
         for x in 0..out_w {
-            let x0 = (x * src_w) / out_w;
-            let x1 = ((x + 1) * src_w) / out_w;
-            let x1 = x1.max(x0 + 1).min(src_w);
-            let mut blue = 0_u32;
-            let mut green = 0_u32;
-            let mut red = 0_u32;
-            let mut alpha = 0_u32;
-            let mut count = 0_u32;
-            for sy in y0..y1 {
-                let row = sy * src_stride;
-                for sx in x0..x1 {
-                    let src_px = row + sx * 4;
-                    blue += u32::from(src[src_px]);
-                    green += u32::from(src[src_px + 1]);
-                    red += u32::from(src[src_px + 2]);
-                    alpha += u32::from(src[src_px + 3]);
-                    count += 1;
-                }
-            }
+            let x0 = scratch.x0[x];
+            let x1 = scratch.x1[x];
             let dst = (y * out_w + x) * 4;
-            if count == 0 {
-                continue;
-            }
-            out[dst] = (blue / count) as u8;
-            out[dst + 1] = (green / count) as u8;
-            out[dst + 2] = (red / count) as u8;
-            out[dst + 3] = (alpha / count) as u8;
+            let mut px = [0u8; 4];
+            box_filter_pixel(src, src_stride, x0, x1, y0, y1, &mut px);
+            out[dst..dst + 4].copy_from_slice(&px);
         }
     }
     Ok(geom)
+}
+
+pub fn letterbox_scale_bgra_into(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    src_stride: usize,
+    max_width: u32,
+    max_height: u32,
+    out: &mut Vec<u8>,
+) -> Result<LetterboxGeom, ConvertError> {
+    let mut scratch = LetterboxScratch::new();
+    letterbox_scale_bgra_into_with_scratch(
+        src,
+        src_width,
+        src_height,
+        src_stride,
+        max_width,
+        max_height,
+        out,
+        &mut scratch,
+    )
 }
 
 pub fn map_letterboxed_pointer(

@@ -8,6 +8,24 @@
 //! use latencydesk_socket_transport::SecureSessionRuntime;
 //! let _ = SecureSessionRuntime::new();
 //! ```
+//!
+//! # Runtime threading model
+//!
+//! This crate is synchronous and owns **no** Tokio runtime. The
+//! `tokio::runtime::Builder::new_multi_thread(worker_threads = 2)` configuration
+//! lives only in `latencydesk-socket-transport` tests and in the `host`/`client`
+//! binaries. `worker_threads = 2` is intentional there:
+//!
+//! * Keeps the blocking pool and thread footprint minimal for CI and low-end
+//!   devices; media and QUIC already bound concurrency via explicit queues and
+//!   semaphores.
+//! * Guarantees deterministic `#[tokio::test(flavor = "multi_thread",
+//!   worker_threads = 2)]` execution without oversubscribing the 12-core dev
+//!   host.
+//! * No function in this crate uses `tokio::task::spawn_blocking`; all native
+//!   work is polled synchronously through the provider traits (`CaptureBackend`,
+//!   `EncodeBackend`, `RenderBackend`). Adding `spawn_blocking` would circumvent
+//!   the bounded queues and is explicitly avoided.
 
 use latencydesk_input::{AppliedInput, InputMessage, ReconcileOutcome};
 use latencydesk_media::{ContinuityAction, DecoderContinuity, EncodedFrameMeta};
@@ -28,6 +46,7 @@ use latencydesk_socket_transport::quic::MediaSendOutcome;
 use latencydesk_transport::{
     IngestOutcome, ReassembledFrame, Reassembler, ReassemblyConfig, TransportError,
 };
+use std::borrow::Cow;
 use std::fmt;
 
 /// Observable lifecycle state of a runtime role.
@@ -68,6 +87,7 @@ pub struct RuntimeDiagnostics {
 }
 
 impl Default for RuntimeDiagnostics {
+    #[inline]
     fn default() -> Self {
         Self {
             progress: RuntimeProgress::PairingPending,
@@ -85,6 +105,7 @@ impl Default for RuntimeDiagnostics {
 }
 
 impl RuntimeDiagnostics {
+    #[inline]
     fn observe_stamp(&mut self, stamp: DispatchStamp) {
         self.generation = Some(stamp.generation());
         self.authorization_epoch = Some(stamp.authorization_epoch());
@@ -92,8 +113,16 @@ impl RuntimeDiagnostics {
         self.codec_epoch = Some(stamp.codec_epoch());
     }
 
+    #[inline]
     fn set_progress(&mut self, progress: RuntimeProgress) {
         self.progress = progress;
+    }
+
+    /// Borrowed view for diagnostics without cloning.
+    #[inline]
+    #[must_use]
+    pub fn as_cow(&self) -> Cow<'_, Self> {
+        Cow::Borrowed(self)
     }
 }
 
@@ -112,6 +141,7 @@ pub enum RuntimeError {
 }
 
 impl fmt::Display for RuntimeError {
+    #[inline]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{self:?}")
     }
@@ -134,30 +164,35 @@ impl std::error::Error for RuntimeError {
 }
 
 impl From<AuthorityError> for RuntimeError {
+    #[inline]
     fn from(error: AuthorityError) -> Self {
         Self::Authority(error)
     }
 }
 
 impl From<SessionInputError> for RuntimeError {
+    #[inline]
     fn from(error: SessionInputError) -> Self {
         Self::SessionInput(error)
     }
 }
 
 impl From<PlatformError> for RuntimeError {
+    #[inline]
     fn from(error: PlatformError) -> Self {
         Self::Platform(error)
     }
 }
 
 impl From<TransportError> for RuntimeError {
+    #[inline]
     fn from(error: TransportError) -> Self {
         Self::Transport(error)
     }
 }
 
 impl From<ProtocolError> for RuntimeError {
+    #[inline]
     fn from(error: ProtocolError) -> Self {
         Self::Protocol(error)
     }
@@ -254,6 +289,7 @@ pub struct HostRuntime<C, E, I, S> {
 }
 
 impl<C, E, I, S> HostRuntime<C, E, I, S> {
+    #[inline]
     #[must_use]
     pub fn new(capture: C, encoder: E, input: I, session: S) -> Self {
         Self {
@@ -267,17 +303,20 @@ impl<C, E, I, S> HostRuntime<C, E, I, S> {
         }
     }
 
+    #[inline]
     #[must_use]
     pub const fn progress(&self) -> RuntimeProgress {
         self.progress
     }
 
+    #[inline]
     #[must_use]
     pub const fn diagnostics(&self) -> RuntimeDiagnostics {
         self.diagnostics
     }
 
     /// Records that pairing has reached its local confirmation UI.
+    #[inline]
     pub fn await_local_approval(&mut self) -> Result<(), RuntimeError> {
         if self.progress != RuntimeProgress::PairingPending {
             return Err(RuntimeError::InvalidProgress(self.progress));
@@ -298,6 +337,7 @@ where
 {
     /// Starts native work only after the authority produces and rechecks an
     /// active dispatch permit.
+    #[inline]
     pub fn activate(&mut self, now_ns: u64) -> Result<DispatchStamp, RuntimeError> {
         if !matches!(
             self.progress,
@@ -439,6 +479,10 @@ where
 
     /// Admits a bounded ordered input record, reconciles it inside the session
     /// authority, and rechecks the permit immediately before every injection.
+    ///
+    /// Iterates `actions` by value via `into_iter` to avoid an extra
+    /// `&`-dereference; `AppliedInput` is `Copy` so this is a single `memcpy`
+    /// per element with no `collect` inside the loop.
     pub fn ingest_input(
         &mut self,
         transport_stamp: SessionStamp,
@@ -460,16 +504,17 @@ where
         let ReconcileOutcome::Applied(actions) = outcome else {
             return Ok(HostAction::InputApplied(0));
         };
-        for action in &actions {
+        let count = actions.len();
+        for action in actions {
             if let Err(error) = self.session.recheck(&permit, now_ns) {
                 return self.recover_after(now_ns, error.into());
             }
-            if let Err(error) = self.input.inject(*action) {
+            if let Err(error) = self.input.inject(action) {
                 return self.recover_after(now_ns, error.into());
             }
         }
         self.diagnostics.observe_stamp(stamp);
-        Ok(HostAction::InputApplied(actions.len()))
+        Ok(HostAction::InputApplied(count))
     }
 
     /// Releases all held input before quiescing capture or encoding.
@@ -489,6 +534,7 @@ where
         Ok(HostAction::Closed)
     }
 
+    #[inline]
     fn active_permit(&mut self, now_ns: u64) -> Result<DispatchPermit, RuntimeError> {
         let permit = self.session.acquire_dispatch(now_ns)?;
         let stamp = self.session.recheck(&permit, now_ns)?;
@@ -496,6 +542,7 @@ where
         Ok(permit)
     }
 
+    #[inline]
     fn recover_after<T>(&mut self, now_ns: u64, error: RuntimeError) -> Result<T, RuntimeError> {
         match self.enter_recovery(now_ns) {
             Ok(()) => Err(error),
@@ -503,6 +550,7 @@ where
         }
     }
 
+    #[inline]
     fn enter_recovery(&mut self, now_ns: u64) -> Result<(), RuntimeError> {
         self.close_inner(
             now_ns,
@@ -521,6 +569,8 @@ where
         let closed = self.session.close()?;
         let release_deadline_ns = closed.release_deadline_ns();
         let mut ledger = closed.into_input_ledger();
+        // Hot path: single Vec allocation with capacity hint, borrowed slice
+        // without cloning. `release_plan` is at most dozens of Copy items.
         let releases = ledger.release_plan();
 
         let input_result = self
@@ -545,6 +595,7 @@ where
         Ok(())
     }
 
+    #[inline]
     fn drain_encoder(&mut self) -> Result<(), RuntimeError> {
         self.encoder.quiesce_encoding()?;
         if let Some(in_flight) = self.in_flight_encode.take() {
@@ -553,6 +604,7 @@ where
         Ok(())
     }
 
+    #[inline]
     fn set_progress(&mut self, progress: RuntimeProgress) {
         self.progress = progress;
         self.diagnostics.set_progress(progress);
@@ -573,6 +625,7 @@ pub struct ClientRuntime<D, R, I, S> {
 }
 
 impl<D, R: RenderBackend, I, S> ClientRuntime<D, R, I, S> {
+    #[inline]
     pub fn new(
         decoder: D,
         renderer: R,
@@ -592,17 +645,20 @@ impl<D, R: RenderBackend, I, S> ClientRuntime<D, R, I, S> {
         })
     }
 
+    #[inline]
     #[must_use]
     pub const fn progress(&self) -> RuntimeProgress {
         self.progress
     }
 
+    #[inline]
     #[must_use]
     pub const fn diagnostics(&self) -> RuntimeDiagnostics {
         self.diagnostics
     }
 
     /// Records that pairing has reached its local confirmation UI.
+    #[inline]
     pub fn await_local_approval(&mut self) -> Result<(), RuntimeError> {
         if self.progress != RuntimeProgress::PairingPending {
             return Err(RuntimeError::InvalidProgress(self.progress));
@@ -623,6 +679,7 @@ where
 {
     /// Starts decode and presentation only after an exact active dispatch permit
     /// has been acquired and rechecked.
+    #[inline]
     pub fn activate(&mut self, now_ns: u64) -> Result<DispatchStamp, RuntimeError> {
         if !matches!(
             self.progress,
@@ -705,6 +762,7 @@ where
 
     /// Performs the non-native control admission that is independent from media
     /// reassembly and therefore remains available after stale or expired media.
+    #[inline]
     pub fn admit_control(
         &mut self,
         transport_stamp: SessionStamp,
@@ -728,6 +786,7 @@ where
 
     /// Submits the newest valid decoded frame only after the authority's final
     /// recheck. The presentation coordinator owns the guard through completion.
+    #[inline]
     pub fn present_next(&mut self, now_ns: u64) -> Result<PresentationAction, RuntimeError> {
         if self.progress != RuntimeProgress::Streaming {
             return Ok(PresentationAction::Idle);
@@ -747,6 +806,7 @@ where
 
     /// Polls the renderer's exact completion primitive before its guarded
     /// presentation surface can be released.
+    #[inline]
     pub fn poll_present_completion(
         &mut self,
         now_ns: u64,
@@ -768,6 +828,7 @@ where
     }
 
     /// Releases local input before decoder and renderer teardown.
+    #[inline]
     pub fn close(&mut self, now_ns: u64) -> Result<(), RuntimeError> {
         if self.progress == RuntimeProgress::Closed {
             return Ok(());
@@ -783,6 +844,7 @@ where
         )
     }
 
+    #[inline]
     fn active_permit(&mut self, now_ns: u64) -> Result<DispatchPermit, RuntimeError> {
         let permit = self.session.acquire_dispatch(now_ns)?;
         let stamp = self.session.recheck(&permit, now_ns)?;
@@ -790,6 +852,7 @@ where
         Ok(permit)
     }
 
+    #[inline]
     fn recover_after<T>(&mut self, now_ns: u64, error: RuntimeError) -> Result<T, RuntimeError> {
         match self.enter_recovery(now_ns) {
             Ok(()) => Err(error),
@@ -797,6 +860,7 @@ where
         }
     }
 
+    #[inline]
     fn enter_recovery(&mut self, now_ns: u64) -> Result<(), RuntimeError> {
         self.close_inner(
             now_ns,
@@ -815,6 +879,7 @@ where
         let closed = self.session.close()?;
         let release_deadline_ns = closed.release_deadline_ns();
         let mut ledger = closed.into_input_ledger();
+        // Single borrowed Vec: capacity hint via `release_plan` size, no clone.
         let releases = ledger.release_plan();
 
         let input_result = self.local_input.release_all(&releases);
@@ -836,12 +901,14 @@ where
         Ok(())
     }
 
+    #[inline]
     fn set_progress(&mut self, progress: RuntimeProgress) {
         self.progress = progress;
         self.diagnostics.set_progress(progress);
     }
 }
 
+#[inline]
 fn matches_transport_stamp(dispatch: DispatchStamp, transport: SessionStamp) -> bool {
     dispatch.session_id().value() == transport.session_id
         && dispatch.generation() == transport.generation
@@ -850,6 +917,7 @@ fn matches_transport_stamp(dispatch: DispatchStamp, transport: SessionStamp) -> 
         && dispatch.codec_epoch() == transport.codec_epoch
 }
 
+#[inline]
 fn encoded_meta(header: MediaHeader) -> EncodedFrameMeta {
     EncodedFrameMeta {
         codec_epoch: header.codec_epoch,
@@ -860,6 +928,7 @@ fn encoded_meta(header: MediaHeader) -> EncodedFrameMeta {
     }
 }
 
+#[inline]
 fn matches_presentable(
     frame: &PresentableFrame,
     stamp: DispatchStamp,

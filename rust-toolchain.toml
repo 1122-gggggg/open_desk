@@ -1,3 +1,9 @@
+# rust-toolchain：固定 1.88.0 與 minimal profile 以確保 CI 快取一致
+# - channel = "1.88.0" 與 workspace.package.rust-version 對齊，避免隱式升級導致快取失效
+# - profile = "minimal" 僅安裝 rustc/cargo/rust-std 必要組件，顯著縮小 CI 下載體積與快取鍵變動；
+#   clippy/rustfmt 以 components 按需增量安裝，與 .github/workflows/ci.yml 的 dtolnay/rust-toolchain@1.88.0
+#   的 components 保持一致，確保快取鍵（toolchain + profile + components）穩定命中
+# - 若需完整工具鏈（如 miri/llvm-tools），應新增獨立 job 而非改回 default profile，以免污染主快取
 [toolchain]
 channel = "1.88.0"
 profile = "minimal"

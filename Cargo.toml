@@ -41,7 +41,21 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/1122-gggggg/open_desk"
 authors = ["LatencyDesk contributors"]
 
-
+# ── workspace.dependencies 特性精簡審核 ──
+# getrandom 0.2：保留 "=0.2" 係因 ring 0.17 固定依賴 getrandom 0.2.x，quinn-proto → rand
+#   依賴 getrandom 0.4.x 屬上游分叉，雙版本並存屬預期；workspace 層面維持 0.2 可與 ring
+#   對齊，避免引入第三版本。特性無可再裁：預設 std 已為最小可用集，移除 std 會導致
+#   Windows/ring 建構失敗（依賴 libc/windows-sys）。
+# quinn：default-features=false 僅啟 ["log", "runtime-tokio", "rustls-ring"]，已剔除
+#   platform-verifier/預設 TLS 實作；log 保留用於傳輸層可觀測性（telemetry），若追求極
+#   致體積可移除 log；runtime-tokio 與 rustls-ring 為 QUIC 必要。
+# rustls：default-features=false 僅啟 ["ring", "std"]，已剔除 tls12（程式碼以
+#   with_protocol_versions(&[TLS13]) 限定 TLS1.3）；std 為 RootCertStore/憑證檔案 IO
+#   必要，ring 為 QUIC 唯一 crypto provider（與 quinn rustls-ring 對齊）。
+# rcgen：default-features=false 僅啟 ["ring"]，與 rustls/quinn 的 ring 選型一致，避免
+#   引入 aws-lc-rs 造成雙 crypto 後端。
+# tokio：僅啟 ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"]，
+#   為 quinn Endpoint 與 protocol 排程所需最小集。
 [workspace.dependencies]
 bytes = "=1.12.1"
 ice-core = { package = "is", version = "=0.11.0", default-features = false, features = ["sha1"] }
@@ -54,8 +68,47 @@ hmac = "0.12.1"
 subtle = "2.6.1"
 tokio = { version = "=1.44.2", default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 zeroize = "1.8.2"
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = "warn"
+
+# ── 增量快取註解 ──
+# Cargo 增量編譯由 profile.<env>.incremental 控制（見下方 dev/test），CI 應快取 target/ 與
+# ~/.cargo/registry、~/.cargo/git 以命中增量；release 關閉增量並啟 thin LTO +
+# 單一 codegen 單元以換取執行效能。原 [build] 鍵屬 cargo config（.cargo/config.toml），
+# 置於 Cargo.toml 會產生 unused manifest key 警告，故此處僅保留文件化註解。
+
+[profile.dev]
+opt-level = 0
+debug = 1
+codegen-units = 16
+incremental = true
+overflow-checks = true
+debug-assertions = true
+
+[profile.dev.package."*"]
+opt-level = 2
+# 依賴以 O2 編譯：顯著提速運行時熱路徑（QUIC/編解碼/加密）且 Codegen 單元保持 16
+# 以維持並行編譯速度；增量快取命中率不受影響，理論上 cargo build 試驗性提速顯著。
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort" # 僅對最終 bin 產物生效：workspace 內 library 在連結至 bin 時收斂為 abort，縮減體積與展開開銷
+strip = "debuginfo" # 去除 debuginfo 保留符號；需更小體積可改 "symbols" 或 true
+incremental = false
+overflow-checks = false
+debug = 0
+
+[profile.test]
+opt-level = 0
+debug = 1
+codegen-units = 16
+incremental = true
+overflow-checks = true
+debug-assertions = true
+# 測試沿用 dev 策略保持快速增量編譯與除錯資訊；若需更貼近 release 行為可覆寫 opt-level=2。
